@@ -1,0 +1,16 @@
+# 环境与密钥
+.env
+
+# 运行期数据（业务场景、上传文件、技能库、对话记录）
+/data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/

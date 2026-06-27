@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>业务流逆向工程平台</title>
+<style>
+  /* ===== 设计令牌 ===== */
+  :root {
+    --bg-deep:#0d1117; --bg-panel:#161b22; --bg-card:#1c2230; --bg-hover:#21293a;
+    --border:#2a3548; --border-lit:#3d5280;
+    --cyan:#58c8e3; --cyan-dk:#2a8ca3; --violet:#8b6ef5; --green:#39d683;
+    --amber:#f5a623; --rose:#f06a6a; --muted:#8b99b0;
+    --text-primary:#e6edf3; --text-secondary:#8b99b0; --text-accent:#58c8e3;
+    --radius:8px; --radius-lg:14px; --shadow:0 4px 20px rgba(0,0,0,.4);
+    --font-mono:'SF Mono','Fira Code',Consolas,monospace;
+    --font-ui:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:var(--font-ui); background:var(--bg-deep); color:var(--text-primary);
+    min-height:100vh; display:flex; overflow:hidden; }
+
+  /* ===== 侧边栏 ===== */
+  .sidebar { width:260px; flex-shrink:0; background:var(--bg-panel); border-right:1px solid var(--border);
+    display:flex; flex-direction:column; height:100vh; }
+  .sidebar-logo { padding:20px 16px 14px; border-bottom:1px solid var(--border); }
+  .logo-title { font-size:13px; font-weight:700; letter-spacing:.08em; color:var(--cyan); text-transform:uppercase; }
+  .logo-sub { font-size:11px; color:var(--muted); margin-top:2px; font-family:var(--font-mono); }
+  .sidebar-section { padding:12px 10px 6px; flex:1; overflow-y:auto; }
+  .sidebar-label { font-size:10px; text-transform:uppercase; letter-spacing:.12em; color:var(--muted); padding:0 6px; margin-bottom:4px; }
+  .scenario-item { display:flex; align-items:center; gap:8px; padding:8px 10px; border-radius:var(--radius);
+    cursor:pointer; transition:background .15s; font-size:13px; }
+  .scenario-item:hover { background:var(--bg-hover); }
+  .scenario-item.active { background:rgba(88,200,227,.12); border:1px solid rgba(88,200,227,.25); }
+  .scenario-dot { width:7px; height:7px; border-radius:50%; background:var(--muted); flex-shrink:0; }
+  .scenario-dot.active-dot { background:var(--green); box-shadow:0 0 6px var(--green); }
+  .scenario-dot.deducing { background:var(--amber); }
+  .scenario-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--text-primary); }
+  .scenario-del { opacity:0; color:var(--muted); font-size:14px; padding:0 2px; }
+  .scenario-item:hover .scenario-del { opacity:.6; }
+  .scenario-del:hover { opacity:1; color:var(--rose); }
+  .btn-new-scenario { margin:6px 10px; padding:8px 12px; background:rgba(88,200,227,.1);
+    border:1px dashed rgba(88,200,227,.3); border-radius:var(--radius); color:var(--cyan);
+    font-size:12px; cursor:pointer; text-align:center; transition:all .15s; }
+  .btn-new-scenario:hover { background:rgba(88,200,227,.18); }
+  .sidebar-footer { padding:12px; border-top:1px solid var(--border); font-size:11px; color:var(--muted); font-family:var(--font-mono); }
+  .llm-badge { display:inline-block; padding:1px 6px; border-radius:10px; font-size:10px; margin-top:6px; }
+  .llm-on { background:rgba(57,214,131,.15); color:var(--green); }
+  .llm-off { background:rgba(245,166,35,.15); color:var(--amber); }
+
+  /* ===== 主区 ===== */
+  .main { flex:1; display:flex; flex-direction:column; height:100vh; overflow:hidden; }
+  .topbar { height:52px; border-bottom:1px solid var(--border); display:flex; align-items:center;
+    padding:0 20px; gap:12px; background:var(--bg-panel); flex-shrink:0; }
+  .topbar-scenario-name { font-size:14px; font-weight:600; }
+  .status-badge { font-size:10px; padding:3px 8px; border-radius:20px; font-family:var(--font-mono);
+    font-weight:600; text-transform:uppercase; letter-spacing:.05em; }
+  .status-created { background:rgba(139,153,176,.15); color:var(--muted); border:1px solid rgba(139,153,176,.3); }
+  .status-tables_uploaded { background:rgba(245,166,35,.12); color:var(--amber); border:1px solid rgba(245,166,35,.3); }
+  .status-relations_deduced { background:rgba(139,110,245,.12); color:var(--violet); border:1px solid rgba(139,110,245,.3); }
+  .status-flow_deduced { background:rgba(88,200,227,.12); color:var(--cyan); border:1px solid rgba(88,200,227,.3); }
+  .status-skills_generated { background:rgba(57,214,131,.12); color:var(--green); border:1px solid rgba(57,214,131,.3); }
+  .status-active { background:rgba(57,214,131,.18); color:var(--green); border:1px solid var(--green); }
+  .topbar-actions { margin-left:auto; display:flex; gap:8px; }
+  .btn { padding:6px 14px; border-radius:var(--radius); font-size:12px; font-weight:600; cursor:pointer;
+    border:none; transition:all .15s; display:flex; align-items:center; gap:5px; }
+  .btn-primary { background:var(--cyan); color:var(--bg-deep); }
+  .btn-primary:hover { filter:brightness(1.1); }
+  .btn-ghost { background:transparent; border:1px solid var(--border); color:var(--text-secondary); }
+  .btn-ghost:hover { border-color:var(--border-lit); color:var(--text-primary); }
+  .btn-violet { background:var(--violet); color:#fff; } .btn-violet:hover { filter:brightness(1.1); }
+  .btn-danger { background:transparent; border:1px solid rgba(240,106,106,.4); color:var(--rose); }
+  .btn-danger:hover { background:rgba(240,106,106,.12); }
+
+  .workspace { flex:1; display:flex; overflow:hidden; }
+  .graph-panel { flex:1; overflow:hidden; position:relative; background:var(--bg-deep); }
+  .graph-toolbar { position:absolute; top:12px; left:12px; z-index:5; display:flex; gap:6px; }
+  .graph-toggle { padding:4px 10px; font-size:11px; border-radius:14px; background:var(--bg-card);
+    border:1px solid var(--border); color:var(--text-secondary); cursor:pointer; }
+  .graph-toggle.active { border-color:var(--cyan); color:var(--cyan); }
+  .graph-canvas { width:100%; height:100%; }
+  .empty-graph { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:14px; color:var(--text-secondary); }
+  .empty-icon { font-size:48px; opacity:.3; } .empty-title { font-size:16px; font-weight:600; }
+  .empty-sub { font-size:13px; color:var(--muted); }
+
+  /* ===== 聊天面板 ===== */
+  .chat-panel { width:420px; flex-shrink:0; border-left:1px solid var(--border);
+    display:flex; flex-direction:column; background:var(--bg-panel); }
+  .chat-tabs { display:flex; border-bottom:1px solid var(--border); padding:0 4px; }
+  .chat-tab { padding:10px 12px; font-size:12px; font-weight:600; color:var(--muted); cursor:pointer;
+    border-bottom:2px solid transparent; transition:all .15s; white-space:nowrap; }
+  .chat-tab.active { color:var(--cyan); border-bottom-color:var(--cyan); }
+  .chat-tab:hover:not(.active) { color:var(--text-primary); }
+  .chat-messages { flex:1; overflow-y:auto; padding:14px; display:flex; flex-direction:column; gap:12px; }
+  .msg { display:flex; gap:8px; animation:msg-in .2s ease; }
+  @keyframes msg-in { from{opacity:0;transform:translateY(6px);} to{opacity:1;transform:translateY(0);} }
+  .msg.user { flex-direction:row-reverse; }
+  .msg-avatar { width:28px; height:28px; border-radius:50%; flex-shrink:0; display:flex; align-items:center;
+    justify-content:center; font-size:13px; font-weight:700; }
+  .msg-avatar.ai-avatar { background:linear-gradient(135deg,var(--cyan-dk),var(--violet)); color:#fff; }
+  .msg-avatar.user-avatar { background:rgba(88,200,227,.15); color:var(--cyan); }
+  .msg-body { max-width:84%; display:flex; flex-direction:column; gap:6px; }
+  .msg-bubble { padding:9px 12px; border-radius:var(--radius-lg); font-size:13px; line-height:1.6; word-break:break-word; }
+  .msg.ai .msg-bubble { background:var(--bg-card); border:1px solid var(--border); border-bottom-left-radius:4px; }
+  .msg.user .msg-bubble { background:rgba(88,200,227,.15); border:1px solid rgba(88,200,227,.25); border-bottom-right-radius:4px; }
+  .msg-bubble code { font-family:var(--font-mono); background:var(--bg-deep); padding:1px 5px; border-radius:4px; font-size:12px; color:var(--cyan); }
+  .msg-bubble pre { background:var(--bg-deep); padding:8px 10px; border-radius:6px; overflow-x:auto; margin:6px 0; }
+  .msg-bubble pre code { background:none; padding:0; color:var(--text-secondary); }
+
+  /* 思考块 */
+  .think-block { background:rgba(139,110,245,.06); border:1px solid rgba(139,110,245,.22); border-radius:var(--radius);
+    font-size:12px; overflow:hidden; }
+  .think-head { display:flex; align-items:center; gap:6px; padding:6px 10px; cursor:pointer; color:var(--violet); font-weight:600; }
+  .think-head .chev { margin-left:auto; transition:transform .2s; font-size:10px; }
+  .think-block.collapsed .think-body { display:none; }
+  .think-block.collapsed .chev { transform:rotate(-90deg); }
+  .think-body { padding:0 10px 8px; color:var(--text-secondary); line-height:1.55; white-space:pre-wrap;
+    max-height:240px; overflow-y:auto; font-family:var(--font-mono); font-size:11px; }
+
+  /* 工具调用 */
+  .tool-trace { display:flex; flex-direction:column; gap:2px; background:rgba(57,214,131,.05);
+    border:1px solid rgba(57,214,131,.2); border-radius:var(--radius); padding:6px 10px; font-size:11px; }
+  .tool-trace-head { display:flex; align-items:center; gap:6px; color:var(--green); font-weight:600; }
+  .tool-trace-args { color:var(--muted); font-family:var(--font-mono); font-size:10px; word-break:break-all; }
+  .tool-trace-result { color:var(--text-secondary); font-family:var(--font-mono); font-size:10px;
+    border-top:1px dashed rgba(57,214,131,.2); padding-top:3px; margin-top:2px; white-space:pre-wrap; }
+  .tool-spinner { width:9px; height:9px; border:2px solid rgba(57,214,131,.3); border-top-color:var(--green);
+    border-radius:50%; animation:spin .7s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+
+  /* 输入区 */
+  .chat-input-area { padding:12px; border-top:1px solid var(--border); display:flex; flex-direction:column; gap:8px; }
+  .quick-cmds { display:flex; flex-wrap:wrap; gap:4px; }
+  .quick-cmd { padding:3px 8px; border-radius:12px; font-size:11px; background:var(--bg-card);
+    border:1px solid var(--border); color:var(--text-secondary); cursor:pointer; transition:all .12s; white-space:nowrap; }
+  .quick-cmd:hover { border-color:var(--cyan); color:var(--cyan); }
+  .upload-zone { border:1px dashed var(--border-lit); border-radius:var(--radius); padding:10px; text-align:center;
+    font-size:11px; color:var(--muted); cursor:pointer; transition:all .15s; position:relative; }
+  .upload-zone:hover { border-color:var(--cyan); color:var(--cyan); background:rgba(88,200,227,.04); }
+  .upload-zone input { position:absolute; inset:0; opacity:0; cursor:pointer; }
+  .chat-input-row { display:flex; gap:6px; align-items:flex-end; }
+  .chat-input { flex:1; background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius);
+    padding:9px 12px; font-size:13px; color:var(--text-primary); resize:none; min-height:38px; max-height:120px;
+    font-family:var(--font-ui); outline:none; transition:border-color .15s; line-height:1.4; }
+  .chat-input:focus { border-color:var(--cyan); }
+  .chat-input::placeholder { color:var(--muted); }
+  .btn-send { width:38px; height:38px; border-radius:var(--radius); background:var(--cyan); color:var(--bg-deep);
+    border:none; cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:16px;
+    flex-shrink:0; transition:all .15s; }
+  .btn-send:hover { filter:brightness(1.1); }
+  .btn-send:disabled { opacity:.4; cursor:not-allowed; }
+
+  /* 详情面板 */
+  .detail-panel { flex:1; overflow-y:auto; padding:14px; }
+  .detail-section { margin-bottom:16px; }
+  .detail-section-title { font-size:11px; text-transform:uppercase; letter-spacing:.1em; color:var(--muted);
+    margin-bottom:8px; display:flex; align-items:center; gap:6px; }
+  .detail-section-title::after { content:''; flex:1; height:1px; background:var(--border); }
+  .table-card,.relation-card,.flow-step-card,.skill-card { background:var(--bg-card); border:1px solid var(--border);
+    border-radius:var(--radius); padding:10px 12px; margin-bottom:6px; font-size:12px; }
+  .table-card-header { display:flex; align-items:center; gap:6px; margin-bottom:6px; }
+  .table-card-name { font-weight:700; color:var(--cyan); }
+  .table-card-meta { color:var(--muted); font-family:var(--font-mono); font-size:11px; }
+  .col-chips { display:flex; flex-wrap:wrap; gap:3px; }
+  .col-chip { padding:2px 6px; border-radius:4px; font-size:10px; font-family:var(--font-mono);
+    background:rgba(88,200,227,.08); border:1px solid rgba(88,200,227,.15); color:var(--cyan); }
+  .relation-card { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .rel-from { color:var(--amber); font-family:var(--font-mono); }
+  .rel-arrow { color:var(--muted); } .rel-to { color:var(--cyan); font-family:var(--font-mono); }
+  .rel-conf { margin-left:auto; font-size:10px; color:var(--green); }
+  .flow-step-card { border-left:3px solid var(--violet); }
+  .flow-step-header { display:flex; align-items:center; gap:6px; margin-bottom:5px; }
+  .flow-step-num { width:20px; height:20px; background:var(--violet); color:#fff; border-radius:50%;
+    display:flex; align-items:center; justify-content:center; font-size:10px; font-weight:700; }
+  .flow-step-name { font-weight:700; } .flow-step-op { font-size:10px; padding:1px 6px;
+    background:rgba(139,110,245,.15); color:var(--violet); border-radius:3px; font-family:var(--font-mono); }
+  .flow-step-desc { color:var(--text-secondary); line-height:1.5; }
+  .flow-sql { margin-top:6px; font-family:var(--font-mono); font-size:10px; color:var(--muted);
+    background:var(--bg-deep); padding:6px 8px; border-radius:4px; overflow-x:auto; }
+  .skill-card { border-left:3px solid var(--green); }
+  .skill-card.evolved { border-left-color:var(--amber); }
+  .skill-card-header { display:flex; align-items:center; gap:6px; margin-bottom:4px; }
+  .skill-name { font-weight:700; flex:1; } .skill-op { font-size:10px; padding:1px 5px;
+    background:rgba(57,214,131,.12); color:var(--green); border-radius:3px; font-family:var(--font-mono); }
+  .skill-desc { color:var(--text-secondary); line-height:1.4; }
+  .muted-tip { color:var(--muted); font-size:12px; }
+
+  /* 模态 */
+  .modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,.6); backdrop-filter:blur(4px); display:flex;
+    align-items:center; justify-content:center; z-index:100; opacity:0; pointer-events:none; transition:opacity .2s; }
+  .modal-overlay.show { opacity:1; pointer-events:all; }
+  .modal { background:var(--bg-panel); border:1px solid var(--border-lit); border-radius:var(--radius-lg);
+    padding:24px; width:440px; max-width:90vw; box-shadow:var(--shadow); transform:translateY(10px); transition:transform .2s; }
+  .modal-overlay.show .modal { transform:translateY(0); }
+  .modal-title { font-size:16px; font-weight:700; margin-bottom:16px; }
+  .form-group { margin-bottom:14px; } .form-label { font-size:12px; color:var(--text-secondary); margin-bottom:5px; display:block; }
+  .form-input { width:100%; background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius);
+    padding:9px 12px; font-size:13px; color:var(--text-primary); outline:none; transition:border-color .15s; }
+  .form-input:focus { border-color:var(--cyan); }
+  .modal-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:20px; }
+
+  .typing-dots { display:inline-flex; gap:3px; align-items:center; }
+  .typing-dots span { width:5px; height:5px; background:var(--muted); border-radius:50%; animation:dot-bounce 1.2s infinite; }
+  .typing-dots span:nth-child(2){animation-delay:.2s;} .typing-dots span:nth-child(3){animation-delay:.4s;}
+  @keyframes dot-bounce { 0%,80%,100%{transform:translateY(0);opacity:.4;} 40%{transform:translateY(-4px);opacity:1;} }
+
+  ::-webkit-scrollbar { width:5px; height:5px; }
+  ::-webkit-scrollbar-track { background:transparent; }
+  ::-webkit-scrollbar-thumb { background:var(--border); border-radius:4px; }
+  @media (max-width:900px){ .chat-panel{width:100%;} .sidebar{display:none;} }
+</style>
+</head>
+<body>
+
+<aside class="sidebar">
+  <div class="sidebar-logo">
+    <div class="logo-title">业务流逆向平台</div>
+    <div class="logo-sub">v1.0.0 · BizFlow Reverser</div>
+  </div>
+  <div class="sidebar-section">
+    <div class="sidebar-label">业务场景</div>
+    <div id="scenario-list"></div>
+    <div class="btn-new-scenario" onclick="openNewScenarioModal()">＋ 新建业务场景</div>
+  </div>
+  <div class="sidebar-footer">
+    Skills: <span id="skills-count" style="color:var(--cyan)">0</span> &nbsp;|&nbsp;
+    表格: <span id="tables-count" style="color:var(--amber)">0</span>
+    <div id="llm-badge" class="llm-badge llm-off">LLM: 检测中…</div>
+  </div>
+</aside>
+
+<main class="main">
+  <div class="topbar">
+    <span class="topbar-scenario-name" id="topbar-name">请选择或创建业务场景</span>
+    <span class="status-badge status-created" id="topbar-status">未开始</span>
+    <div class="topbar-actions">
+      <button class="btn btn-danger" id="btn-delete" onclick="deleteCurrentScenario()" style="display:none">🗑 删除</button>
+    </div>
+  </div>
+
+  <div class="workspace">
+    <div class="graph-panel">
+      <div class="graph-toolbar" id="graph-toolbar" style="display:none">
+        <div class="graph-toggle active" id="toggle-relations" onclick="setGraphMode('relations')">🔗 关系图谱</div>
+        <div class="graph-toggle" id="toggle-flow" onclick="setGraphMode('flow')">🔄 流程图谱</div>
+      </div>
+      <div id="graph-canvas" class="graph-canvas">
+        <div class="empty-graph" id="empty-graph">
+          <div class="empty-icon">⬡</div>
+          <div class="empty-title">选择或创建一个业务场景</div>
+          <div class="empty-sub">上传业务表格，对 AI 说「推导关联关系」即可开始</div>
+        </div>
+        <svg id="graph-svg" width="100%" height="100%" style="display:none"></svg>
+      </div>
+    </div>
+
+    <div class="chat-panel">
+      <div class="chat-tabs">
+        <div class="chat-tab active" data-tab="chat" onclick="switchTab('chat')">💬 对话</div>
+        <div class="chat-tab" data-tab="tables" onclick="switchTab('tables')">📊 表格</div>
+        <div class="chat-tab" data-tab="flow" onclick="switchTab('flow')">🔄 流程</div>
+        <div class="chat-tab" data-tab="skills" onclick="switchTab('skills')">⚡ 技能</div>
+      </div>
+
+      <div id="tab-chat" class="tab-content" style="display:flex;flex-direction:column;flex:1;overflow:hidden">
+        <div class="chat-messages" id="chat-messages"></div>
+        <div class="chat-input-area">
+          <div class="quick-cmds">
+            <div class="quick-cmd" onclick="sendQuick('开始推导表关联关系')">🔗 推导关系</div>
+            <div class="quick-cmd" onclick="sendQuick('开始推导业务流程')">🔄 推导流程</div>
+            <div class="quick-cmd" onclick="sendQuick('生成技能库')">⚡ 生成技能</div>
+          </div>
+          <div class="upload-zone" id="upload-zone">
+            <input type="file" id="file-input" multiple accept=".csv,.xlsx,.xls,.tsv" onchange="handleFileSelect(this.files)">
+            📎 拖拽或点击上传业务表格（CSV/Excel）
+          </div>
+          <div class="chat-input-row">
+            <textarea class="chat-input" id="chat-input" rows="1"
+              placeholder="向 AI 下达指令，例如「开始推导关联关系」…"
+              onkeydown="handleKeydown(event)" oninput="autoResize(this)"></textarea>
+            <button class="btn-send" id="btn-send" onclick="sendMessage()">➤</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="tab-tables" class="tab-content detail-panel" style="display:none">
+        <div class="detail-section">
+          <div class="detail-section-title">已上传表格</div>
+          <div id="tables-detail"></div>
+        </div>
+        <div class="detail-section">
+          <div class="detail-section-title">关联关系</div>
+          <div id="relations-detail"></div>
+        </div>
+      </div>
+
+      <div id="tab-flow" class="tab-content detail-panel" style="display:none">
+        <div class="detail-section">
+          <div class="detail-section-title">业务流程步骤</div>
+          <div id="flow-detail"></div>
+        </div>
+      </div>
+
+      <div id="tab-skills" class="tab-content detail-panel" style="display:none">
+        <div class="detail-section">
+          <div class="detail-section-title">已生成 Skills</div>
+          <div id="skills-detail"></div>
+        </div>
+        <button class="btn btn-primary" style="width:100%;justify-content:center;margin-top:8px" onclick="openEvolveModal()">
+          🧬 添加进化技能
+        </button>
+      </div>
+    </div>
+  </div>
+</main>
+
+<!-- 新建场景 -->
+<div class="modal-overlay" id="modal-new-scenario">
+  <div class="modal">
+    <div class="modal-title">🌐 新建业务场景</div>
+    <div class="form-group"><label class="form-label">场景名称</label>
+      <input class="form-input" id="new-scenario-name" placeholder="例：销售订单结算流程"></div>
+    <div class="form-group"><label class="form-label">场景描述（可选）</label>
+      <input class="form-input" id="new-scenario-desc" placeholder="描述业务场景的背景和目标"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal('modal-new-scenario')">取消</button>
+      <button class="btn btn-primary" onclick="createScenario()">创建</button>
+    </div>
+  </div>
+</div>
+
+<!-- 进化技能 -->
+<div class="modal-overlay" id="modal-evolve">
+  <div class="modal">
+    <div class="modal-title">🧬 添加进化技能</div>
+    <div class="form-group"><label class="form-label">技能名称</label>
+      <input class="form-input" id="evolve-skill-name" placeholder="例：异常数据检测"></div>
+    <div class="form-group"><label class="form-label">技能描述</label>
+      <input class="form-input" id="evolve-skill-desc" placeholder="描述该技能能做什么、解决什么问题"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal('modal-evolve')">取消</button>
+      <button class="btn btn-violet" onclick="evolveSkill()">加入技能库</button>
+    </div>
+  </div>
+</div>
+
+<script src="/web/app.js"></script>
+</body>
+</html>
