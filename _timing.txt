@@ -1,0 +1,4 @@
+结算表                rows=113913 cols= 99 load= 56.3s
+就诊表                rows=113912 cols=105 load= 41.7s
+项目明细表              rows=738160 cols= 81 load=224.3s
+重复收费-开髓引流术重复收取局部   rows=    25 cols= 60 load=  0.4s

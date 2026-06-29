@@ -51,6 +51,25 @@ class ScenarioStore:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def business_process_file(self, scenario_id: str) -> Path:
+        """Phase 0 产物 business_process.md 的落盘路径。"""
+        return self.scenario_dir(scenario_id) / "business_process.md"
+
+    def write_business_process(self, scenario_id: str, markdown: str) -> Path:
+        """写入（覆盖）business_process.md，返回文件路径。"""
+        with self._lock:
+            path = self.business_process_file(scenario_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(markdown, encoding="utf-8")
+            return path
+
+    def read_business_process(self, scenario_id: str) -> Optional[str]:
+        """读取 business_process.md（不存在则 None）。"""
+        path = self.business_process_file(scenario_id)
+        if not path.exists():
+            return None
+        return path.read_text(encoding="utf-8")
+
     def _meta_file(self, scenario_id: str) -> Path:
         return self.scenario_dir(scenario_id) / "meta.json"
 

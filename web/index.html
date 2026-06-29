@@ -57,7 +57,11 @@
     font-weight:600; text-transform:uppercase; letter-spacing:.05em; }
   .status-created { background:rgba(139,153,176,.15); color:var(--muted); border:1px solid rgba(139,153,176,.3); }
   .status-tables_uploaded { background:rgba(245,166,35,.12); color:var(--amber); border:1px solid rgba(245,166,35,.3); }
+  .status-process_drafted { background:rgba(245,166,35,.12); color:var(--amber); border:1px solid rgba(245,166,35,.3); }
+  .status-process_approved { background:rgba(57,214,131,.12); color:var(--green); border:1px solid rgba(57,214,131,.3); }
   .status-relations_deduced { background:rgba(139,110,245,.12); color:var(--violet); border:1px solid rgba(139,110,245,.3); }
+  .status-rules_parsed { background:rgba(139,110,245,.12); color:var(--violet); border:1px solid rgba(139,110,245,.3); }
+  .status-validated { background:rgba(57,214,131,.12); color:var(--green); border:1px solid rgba(57,214,131,.3); }
   .status-flow_deduced { background:rgba(88,200,227,.12); color:var(--cyan); border:1px solid rgba(88,200,227,.3); }
   .status-skills_generated { background:rgba(57,214,131,.12); color:var(--green); border:1px solid rgba(57,214,131,.3); }
   .status-active { background:rgba(57,214,131,.18); color:var(--green); border:1px solid var(--green); }
@@ -84,14 +88,40 @@
   .empty-icon { font-size:48px; opacity:.3; } .empty-title { font-size:16px; font-weight:600; }
   .empty-sub { font-size:13px; color:var(--muted); }
 
+  /* ===== 中央面板（标签 + 内容 + 图谱） ===== */
+  .center-panel { flex:1; display:flex; flex-direction:column; overflow:hidden; background:var(--bg-deep); min-width:0; }
+  .center-tabs { display:flex; border-bottom:1px solid var(--border); background:var(--bg-panel); padding:0 6px; flex-shrink:0; }
+  .center-tab { padding:11px 14px; font-size:13px; font-weight:600; color:var(--muted); cursor:pointer;
+    border-bottom:2px solid transparent; transition:all .15s; white-space:nowrap; }
+  .center-tab.active { color:var(--cyan); border-bottom-color:var(--cyan); }
+  .center-tab:hover:not(.active) { color:var(--text-primary); }
+  .center-content { flex:1; overflow-y:auto; }
+  .center-content.detail-panel { padding:16px 18px; }
+
+  /* 图谱舞台（缩放/拖拽） */
+  .diagram-toolbar { display:flex; align-items:center; gap:6px; padding:8px 12px; border-bottom:1px solid var(--border); flex-shrink:0; }
+  .diagram-toggle { padding:5px 12px; font-size:12px; border-radius:14px; background:var(--bg-card);
+    border:1px solid var(--border); color:var(--text-secondary); cursor:pointer; }
+  .diagram-toggle.active { border-color:var(--cyan); color:var(--cyan); }
+  .diagram-hint { margin-left:auto; font-size:11px; color:var(--muted); }
+  .diagram-hint span { color:var(--cyan); cursor:pointer; } .diagram-hint span:hover { text-decoration:underline; }
+  .diagram-stage { flex:1; position:relative; overflow:hidden; background:
+      radial-gradient(circle at 1px 1px, rgba(255,255,255,.04) 1px, transparent 0) 0 0/22px 22px, var(--bg-deep);
+    cursor:grab; min-height:200px; }
+  .diagram-stage.grabbing { cursor:grabbing; }
+  .diagram-pan { position:absolute; left:0; top:0; transform-origin:0 0; }
+  .mermaid-host { padding:8px; } .mermaid-host svg { max-width:none; height:auto; }
+  .diagram-empty { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:12px; color:var(--text-secondary); pointer-events:none; }
+  .flow-steps-strip { max-height:32%; overflow-y:auto; border-top:1px solid var(--border); flex-shrink:0; background:var(--bg-panel); }
+
+  /* 聊天面板标题（不再含标签） */
+  .chat-panel-title { padding:13px 16px; font-size:13px; font-weight:700; color:var(--cyan);
+    border-bottom:1px solid var(--border); flex-shrink:0; letter-spacing:.03em; }
+
   /* ===== 聊天面板 ===== */
   .chat-panel { width:420px; flex-shrink:0; border-left:1px solid var(--border);
     display:flex; flex-direction:column; background:var(--bg-panel); }
-  .chat-tabs { display:flex; border-bottom:1px solid var(--border); padding:0 4px; }
-  .chat-tab { padding:10px 12px; font-size:12px; font-weight:600; color:var(--muted); cursor:pointer;
-    border-bottom:2px solid transparent; transition:all .15s; white-space:nowrap; }
-  .chat-tab.active { color:var(--cyan); border-bottom-color:var(--cyan); }
-  .chat-tab:hover:not(.active) { color:var(--text-primary); }
   .chat-messages { flex:1; overflow-y:auto; padding:14px; display:flex; flex-direction:column; gap:12px; }
   .msg { display:flex; gap:8px; animation:msg-in .2s ease; }
   @keyframes msg-in { from{opacity:0;transform:translateY(6px);} to{opacity:1;transform:translateY(0);} }
@@ -186,6 +216,49 @@
   .skill-desc { color:var(--text-secondary); line-height:1.4; }
   .muted-tip { color:var(--muted); font-size:12px; }
 
+  /* 审核能力 */
+  .audit-card { background:var(--bg-card); border:1px solid var(--border); border-left:3px solid var(--cyan);
+    border-radius:var(--radius); padding:9px 11px; margin-bottom:6px; font-size:12px; }
+  .audit-card-head { display:flex; align-items:center; gap:8px; }
+  .audit-vt { font-weight:700; flex:1; word-break:break-all; }
+  .audit-state { font-size:9px; padding:1px 6px; border-radius:10px; font-family:var(--font-mono); white-space:nowrap; }
+  .st-verified { background:rgba(57,214,131,.15); color:var(--green); }
+  .st-unverified { background:rgba(88,200,227,.15); color:var(--cyan); }
+  .st-blocked { background:rgba(245,166,35,.15); color:var(--amber); }
+  .st-parsed { background:rgba(139,153,176,.15); color:var(--muted); }
+  .audit-meta { color:var(--muted); font-size:10px; margin-top:3px; font-family:var(--font-mono); }
+  .btn-run-audit { padding:3px 9px; font-size:10px; border-radius:12px; background:rgba(88,200,227,.12);
+    border:1px solid rgba(88,200,227,.3); color:var(--cyan); cursor:pointer; white-space:nowrap; }
+  .btn-run-audit:hover { background:rgba(88,200,227,.22); }
+  .valid-card { background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius);
+    padding:9px 11px; margin-bottom:6px; font-size:11px; }
+  .valid-card.pass { border-left:3px solid var(--green); } .valid-card.fail { border-left:3px solid var(--amber); }
+  .valid-stat { font-family:var(--font-mono); color:var(--text-secondary); margin-top:4px; }
+
+  /* 流程引导 */
+  .workflow-guide { border-bottom:1px solid var(--border); padding:10px 12px 8px; background:var(--bg-panel); flex-shrink:0; }
+  .wf-steps { display:flex; align-items:stretch; gap:0; }
+  .wf-step { flex:1; display:flex; flex-direction:column; align-items:center; gap:4px; position:relative;
+    cursor:pointer; padding:2px 0; }
+  .wf-step .wf-dot { width:24px; height:24px; border-radius:50%; display:flex; align-items:center; justify-content:center;
+    font-size:11px; font-weight:700; border:1.5px solid var(--border); background:var(--bg-card); color:var(--muted);
+    z-index:2; transition:all .2s; }
+  .wf-step .wf-label { font-size:10px; color:var(--muted); white-space:nowrap; transition:color .2s; }
+  /* 连接线 */
+  .wf-step:not(:first-child)::before { content:''; position:absolute; top:13px; left:-50%; width:100%; height:2px;
+    background:var(--border); z-index:1; }
+  .wf-step.done .wf-dot { background:var(--green); border-color:var(--green); color:var(--bg-deep); }
+  .wf-step.done:not(:first-child)::before { background:var(--green); }
+  .wf-step.current .wf-dot { border-color:var(--cyan); color:var(--cyan); box-shadow:0 0 0 3px rgba(88,200,227,.18);
+    animation:wf-pulse 1.6s infinite; }
+  .wf-step.current .wf-label { color:var(--cyan); font-weight:700; }
+  @keyframes wf-pulse { 0%,100%{box-shadow:0 0 0 3px rgba(88,200,227,.18);} 50%{box-shadow:0 0 0 5px rgba(88,200,227,.06);} }
+  .wf-step:hover .wf-label { color:var(--text-primary); }
+  .wf-hint { margin-top:8px; font-size:11px; color:var(--text-secondary); display:flex; align-items:center; gap:6px;
+    background:rgba(88,200,227,.06); border:1px solid rgba(88,200,227,.16); border-radius:var(--radius); padding:6px 9px; }
+  .wf-hint b { color:var(--cyan); } .wf-hint .wf-go { margin-left:auto; color:var(--cyan); cursor:pointer; font-weight:700; white-space:nowrap; }
+  .wf-hint .wf-go:hover { text-decoration:underline; }
+
   /* 模态 */
   .modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,.6); backdrop-filter:blur(4px); display:flex;
     align-items:center; justify-content:center; z-index:100; opacity:0; pointer-events:none; transition:opacity .2s; }
@@ -199,6 +272,39 @@
     padding:9px 12px; font-size:13px; color:var(--text-primary); outline:none; transition:border-color .15s; }
   .form-input:focus { border-color:var(--cyan); }
   .modal-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:20px; }
+
+  /* 结构化交互（Section 5）—— 渲染为表单 */
+  .interaction-block { background:rgba(139,110,245,.07); border:1px solid rgba(139,110,245,.32);
+    border-radius:var(--radius); padding:10px 12px; margin-top:8px; font-size:12px; }
+  .interaction-q { font-weight:600; color:var(--violet); margin-bottom:8px; display:flex; align-items:center; gap:6px; }
+  .interaction-opts { display:flex; flex-direction:column; gap:6px; }
+  .interaction-opt { padding:7px 10px; border-radius:var(--radius); background:var(--bg-card);
+    border:1px solid var(--border); color:var(--text-primary); cursor:pointer; transition:all .15s; text-align:left; }
+  .interaction-opt:hover { border-color:var(--violet); background:var(--bg-hover); }
+  .interaction-custom { display:flex; gap:6px; margin-top:8px; }
+  .interaction-custom input { flex:1; background:var(--bg-card); border:1px solid var(--border);
+    border-radius:var(--radius); padding:6px 10px; font-size:12px; color:var(--text-primary); outline:none; }
+  .interaction-custom input:focus { border-color:var(--violet); }
+  .interaction-block.answered { opacity:.55; pointer-events:none; }
+
+  /* Phase 0 业务流程文档面板 */
+  .bp-approval { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:12px;
+    background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius); padding:9px 11px; }
+  .bp-badge { font-size:10px; padding:2px 8px; border-radius:10px; font-family:var(--font-mono); }
+  .bp-badge.pending { background:rgba(245,166,35,.15); color:var(--amber); }
+  .bp-badge.approved { background:rgba(57,214,131,.15); color:var(--green); }
+  .bp-doc { font-size:13px; line-height:1.7; color:var(--text-primary); }
+  .bp-doc h1,.bp-doc h2,.bp-doc h3 { color:var(--cyan); margin:12px 0 6px; line-height:1.4; }
+  .bp-doc h1 { font-size:16px; } .bp-doc h2 { font-size:14px; } .bp-doc h3 { font-size:13px; }
+  .bp-doc ul,.bp-doc ol { margin:4px 0 8px 18px; } .bp-doc li { margin:2px 0; }
+  .bp-doc code { font-family:var(--font-mono); background:var(--bg-deep); padding:1px 5px; border-radius:4px; color:var(--cyan); font-size:12px; }
+  .bp-doc pre { background:var(--bg-deep); padding:10px; border-radius:6px; overflow-x:auto; margin:8px 0;
+    border:1px solid var(--border); }
+  .bp-doc pre code { background:none; padding:0; color:var(--text-secondary); font-size:11px; }
+  /* 通用 Markdown（聊天气泡内）*/
+  .msg-bubble h1,.msg-bubble h2,.msg-bubble h3 { color:var(--cyan); margin:8px 0 4px; line-height:1.4; }
+  .msg-bubble h1 { font-size:15px; } .msg-bubble h2 { font-size:14px; } .msg-bubble h3 { font-size:13px; }
+  .msg-bubble ul,.msg-bubble ol { margin:4px 0 6px 18px; } .msg-bubble li { margin:2px 0; }
 
   .typing-dots { display:inline-flex; gap:3px; align-items:center; }
   .typing-dots span { width:5px; height:5px; background:var(--muted); border-radius:50%; animation:dot-bounce 1.2s infinite; }
@@ -216,7 +322,7 @@
 <aside class="sidebar">
   <div class="sidebar-logo">
     <div class="logo-title">业务流逆向平台</div>
-    <div class="logo-sub">v1.0.0 · BizFlow Reverser</div>
+    <div class="logo-sub">v1.0.2 · 业务能力逆向引擎</div>
   </div>
   <div class="sidebar-section">
     <div class="sidebar-label">业务场景</div>
@@ -240,51 +346,26 @@
   </div>
 
   <div class="workspace">
-    <div class="graph-panel">
-      <div class="graph-toolbar" id="graph-toolbar" style="display:none">
-        <div class="graph-toggle active" id="toggle-relations" onclick="setGraphMode('relations')">🔗 关系图谱</div>
-        <div class="graph-toggle" id="toggle-flow" onclick="setGraphMode('flow')">🔄 流程图谱</div>
-      </div>
-      <div id="graph-canvas" class="graph-canvas">
-        <div class="empty-graph" id="empty-graph">
-          <div class="empty-icon">⬡</div>
-          <div class="empty-title">选择或创建一个业务场景</div>
-          <div class="empty-sub">上传业务表格，对 AI 说「推导关联关系」即可开始</div>
-        </div>
-        <svg id="graph-svg" width="100%" height="100%" style="display:none"></svg>
-      </div>
-    </div>
-
-    <div class="chat-panel">
-      <div class="chat-tabs">
-        <div class="chat-tab active" data-tab="chat" onclick="switchTab('chat')">💬 对话</div>
-        <div class="chat-tab" data-tab="tables" onclick="switchTab('tables')">📊 表格</div>
-        <div class="chat-tab" data-tab="flow" onclick="switchTab('flow')">🔄 流程</div>
-        <div class="chat-tab" data-tab="skills" onclick="switchTab('skills')">⚡ 技能</div>
+    <!-- ===== 中央：标签 + 内容（图谱也在此） ===== -->
+    <div class="center-panel">
+      <div class="center-tabs">
+        <div class="center-tab active" data-tab="process" onclick="switchTab('process')">🧭 业务说明</div>
+        <div class="center-tab" data-tab="tables" onclick="switchTab('tables')">📊 表格</div>
+        <div class="center-tab" data-tab="audit" onclick="switchTab('audit')">🛡 审核能力</div>
+        <div class="center-tab" data-tab="flow" onclick="switchTab('flow')">🔄 流程 / 图谱</div>
+        <div class="center-tab" data-tab="skills" onclick="switchTab('skills')">⚡ 技能</div>
       </div>
 
-      <div id="tab-chat" class="tab-content" style="display:flex;flex-direction:column;flex:1;overflow:hidden">
-        <div class="chat-messages" id="chat-messages"></div>
-        <div class="chat-input-area">
-          <div class="quick-cmds">
-            <div class="quick-cmd" onclick="sendQuick('开始推导表关联关系')">🔗 推导关系</div>
-            <div class="quick-cmd" onclick="sendQuick('开始推导业务流程')">🔄 推导流程</div>
-            <div class="quick-cmd" onclick="sendQuick('生成技能库')">⚡ 生成技能</div>
-          </div>
-          <div class="upload-zone" id="upload-zone">
-            <input type="file" id="file-input" multiple accept=".csv,.xlsx,.xls,.tsv" onchange="handleFileSelect(this.files)">
-            📎 拖拽或点击上传业务表格（CSV/Excel）
-          </div>
-          <div class="chat-input-row">
-            <textarea class="chat-input" id="chat-input" rows="1"
-              placeholder="向 AI 下达指令，例如「开始推导关联关系」…"
-              onkeydown="handleKeydown(event)" oninput="autoResize(this)"></textarea>
-            <button class="btn-send" id="btn-send" onclick="sendMessage()">➤</button>
+      <div id="tab-process" class="center-content detail-panel">
+        <div class="detail-section">
+          <div class="detail-section-title">业务流程文档 · Phase 0</div>
+          <div id="business-process-detail">
+            <div class="muted-tip">梳理业务流程后显示。对 AI 说「梳理业务流程」生成文档。</div>
           </div>
         </div>
       </div>
 
-      <div id="tab-tables" class="tab-content detail-panel" style="display:none">
+      <div id="tab-tables" class="center-content detail-panel" style="display:none">
         <div class="detail-section">
           <div class="detail-section-title">已上传表格</div>
           <div id="tables-detail"></div>
@@ -295,21 +376,77 @@
         </div>
       </div>
 
-      <div id="tab-flow" class="tab-content detail-panel" style="display:none">
+      <div id="tab-audit" class="center-content detail-panel" style="display:none">
         <div class="detail-section">
-          <div class="detail-section-title">业务流程步骤</div>
-          <div id="flow-detail"></div>
+          <div class="detail-section-title">规则库 · 可审核的违规类型</div>
+          <div id="audit-types-detail"><div class="muted-tip">解析规则库后显示。对 AI 说「解析规则库」。</div></div>
+        </div>
+        <div class="detail-section">
+          <div class="detail-section-title">校验报告（对照历史结果）</div>
+          <div id="validations-detail"><div class="muted-tip">执行审核校验后显示。</div></div>
         </div>
       </div>
 
-      <div id="tab-skills" class="tab-content detail-panel" style="display:none">
+      <!-- 流程 / 图谱：业务流程图(Mermaid) + ER关系图 + 处理流程图，可缩放拖拽 -->
+      <div id="tab-flow" class="center-content" style="display:none;flex-direction:column;flex:1;overflow:hidden">
+        <div class="diagram-toolbar" id="diagram-toolbar">
+          <div class="diagram-toggle active" id="dg-business" onclick="setDiagram('business')">🧭 业务流程图</div>
+          <div class="diagram-toggle" id="dg-relations" onclick="setDiagram('relations')">🔗 ER 关系图</div>
+          <div class="diagram-toggle" id="dg-flow" onclick="setDiagram('flow')">🔄 处理流程图</div>
+          <div class="diagram-hint">滚轮缩放 · 拖拽平移 · <span id="dg-reset" onclick="resetView()">复位</span></div>
+        </div>
+        <div class="diagram-stage" id="diagram-stage">
+          <div class="diagram-empty" id="diagram-empty">
+            <div class="empty-icon">⬡</div>
+            <div class="empty-title">暂无图谱</div>
+            <div class="empty-sub">完成 Phase 0（业务流程图）/ 推导关联关系（ER 图）后在此查看</div>
+          </div>
+          <div class="diagram-pan" id="diagram-pan">
+            <div id="mermaid-host" class="mermaid-host" style="display:none"></div>
+            <svg id="graph-svg" style="display:none"></svg>
+          </div>
+        </div>
+        <div class="flow-steps-strip">
+          <div class="detail-section-title" style="margin:8px 12px 4px">业务流程步骤</div>
+          <div id="flow-detail" style="padding:0 12px 10px"></div>
+        </div>
+      </div>
+
+      <div id="tab-skills" class="center-content detail-panel" style="display:none">
         <div class="detail-section">
-          <div class="detail-section-title">已生成 Skills</div>
+          <div class="detail-section-title">已生成 Skills（Engineer's Toolbox）</div>
           <div id="skills-detail"></div>
         </div>
         <button class="btn btn-primary" style="width:100%;justify-content:center;margin-top:8px" onclick="openEvolveModal()">
           🧬 添加进化技能
         </button>
+      </div>
+    </div>
+
+    <!-- ===== 右侧：仅对话 ===== -->
+    <div class="chat-panel">
+      <div class="chat-panel-title">💬 AI 协作对话</div>
+      <div class="workflow-guide" id="workflow-guide" style="display:none"></div>
+      <div class="chat-messages" id="chat-messages"></div>
+      <div class="chat-input-area">
+        <div class="quick-cmds">
+          <div class="quick-cmd" onclick="sendQuick('梳理业务流程')">🧭 梳理流程</div>
+          <div class="quick-cmd" onclick="sendQuick('推导表关联关系')">🔗 推导关系</div>
+          <div class="quick-cmd" onclick="sendQuick('解析规则库')">📋 解析规则</div>
+          <div class="quick-cmd" onclick="sendQuick('执行审核（重复收费）并与历史结果对照校验')">🛡 执行审核</div>
+          <div class="quick-cmd" onclick="sendQuick('泛化所有规则')">🧩 泛化规则</div>
+          <div class="quick-cmd" onclick="sendQuick('生成技能库')">⚡ 生成技能</div>
+        </div>
+        <div class="upload-zone" id="upload-zone">
+          <input type="file" id="file-input" multiple accept=".csv,.xlsx,.xls,.tsv" onchange="handleFileSelect(this.files)">
+          📎 拖拽或点击上传业务表格（CSV/Excel）
+        </div>
+        <div class="chat-input-row">
+          <textarea class="chat-input" id="chat-input" rows="1"
+            placeholder="向 AI 下达指令，例如「开始推导关联关系」…"
+            onkeydown="handleKeydown(event)" oninput="autoResize(this)"></textarea>
+          <button class="btn-send" id="btn-send" onclick="sendMessage()">➤</button>
+        </div>
       </div>
     </div>
   </div>
@@ -345,6 +482,7 @@
   </div>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
 <script src="/web/app.js"></script>
 </body>
 </html>
