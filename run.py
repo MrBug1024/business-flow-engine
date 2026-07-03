@@ -3,14 +3,14 @@
 用法：
     python run.py
 或：
-    uvicorn backend.app:app --reload
+    uvicorn app.main:app --reload
 """
 
 from __future__ import annotations
 
 import uvicorn
 
-from backend.config import settings
+from app.config import settings
 
 if __name__ == "__main__":
-    uvicorn.run("backend.app:app", host=settings.host, port=settings.port, reload=True)
+    uvicorn.run("app.main:app", host=settings.host, port=settings.port)

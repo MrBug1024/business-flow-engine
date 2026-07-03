@@ -37,6 +37,15 @@ class Settings(BaseSettings):
     # ===== 数据存储 =====
     data_dir: str = "data"
 
+    # ===== 验证通道执行保护 =====
+    # 单轮对话的总时长上限（秒）：超过后强制终止本轮并明确告知用户，
+    # 避免"长时间无反馈、也无结果"的静默挂死
+    verify_turn_timeout: int = 600
+    # 心跳间隔（秒）：Agent 超过该时长无任何事件产出时，向前端推送执行状态
+    verify_heartbeat_interval: int = 60
+    # Agent 工具调用循环的步数上限（langgraph recursion_limit）
+    verify_recursion_limit: int = 100
+
     # ===== 服务监听 =====
     host: str = "127.0.0.1"
     port: int = 8000

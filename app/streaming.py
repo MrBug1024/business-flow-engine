@@ -9,9 +9,9 @@ SSE 事件协议（每帧一个 JSON，含 `type` 字段）：
     content   {delta}      正式回答增量
     tool_call {name,args}  开始调用工具/技能
     tool_result {name,result} 工具返回
-    refresh   {resource}   某资源已更新（business_process/relations/flow/skills），前端据此刷新
+    refresh   {resource}   某资源已更新（tables/relations/flow/outputs/validations/skills），前端据此刷新
     status    {status}     业务场景状态变更
-    interaction {interaction} 结构化交互块（规范 Section 5），前端渲染为表单（Phase 0 审批等）
+    interaction {interaction} 结构化交互块，前端渲染为表单（如关联确认）
     error     {message}    出错
     done      {}           本轮结束
 """

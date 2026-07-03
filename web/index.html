@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>业务流逆向工程平台</title>
+<title>业务流逆向工程平台 · v1.0.3</title>
 <style>
   /* ===== 设计令牌 ===== */
   :root {
@@ -57,11 +57,7 @@
     font-weight:600; text-transform:uppercase; letter-spacing:.05em; }
   .status-created { background:rgba(139,153,176,.15); color:var(--muted); border:1px solid rgba(139,153,176,.3); }
   .status-tables_uploaded { background:rgba(245,166,35,.12); color:var(--amber); border:1px solid rgba(245,166,35,.3); }
-  .status-process_drafted { background:rgba(245,166,35,.12); color:var(--amber); border:1px solid rgba(245,166,35,.3); }
-  .status-process_approved { background:rgba(57,214,131,.12); color:var(--green); border:1px solid rgba(57,214,131,.3); }
   .status-relations_deduced { background:rgba(139,110,245,.12); color:var(--violet); border:1px solid rgba(139,110,245,.3); }
-  .status-rules_parsed { background:rgba(139,110,245,.12); color:var(--violet); border:1px solid rgba(139,110,245,.3); }
-  .status-validated { background:rgba(57,214,131,.12); color:var(--green); border:1px solid rgba(57,214,131,.3); }
   .status-flow_deduced { background:rgba(88,200,227,.12); color:var(--cyan); border:1px solid rgba(88,200,227,.3); }
   .status-skills_generated { background:rgba(57,214,131,.12); color:var(--green); border:1px solid rgba(57,214,131,.3); }
   .status-active { background:rgba(57,214,131,.18); color:var(--green); border:1px solid var(--green); }
@@ -77,18 +73,8 @@
   .btn-danger:hover { background:rgba(240,106,106,.12); }
 
   .workspace { flex:1; display:flex; overflow:hidden; }
-  .graph-panel { flex:1; overflow:hidden; position:relative; background:var(--bg-deep); }
-  .graph-toolbar { position:absolute; top:12px; left:12px; z-index:5; display:flex; gap:6px; }
-  .graph-toggle { padding:4px 10px; font-size:11px; border-radius:14px; background:var(--bg-card);
-    border:1px solid var(--border); color:var(--text-secondary); cursor:pointer; }
-  .graph-toggle.active { border-color:var(--cyan); color:var(--cyan); }
-  .graph-canvas { width:100%; height:100%; }
-  .empty-graph { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center;
-    justify-content:center; gap:14px; color:var(--text-secondary); }
-  .empty-icon { font-size:48px; opacity:.3; } .empty-title { font-size:16px; font-weight:600; }
-  .empty-sub { font-size:13px; color:var(--muted); }
 
-  /* ===== 中央面板（标签 + 内容 + 图谱） ===== */
+  /* ===== 中央面板 ===== */
   .center-panel { flex:1; display:flex; flex-direction:column; overflow:hidden; background:var(--bg-deep); min-width:0; }
   .center-tabs { display:flex; border-bottom:1px solid var(--border); background:var(--bg-panel); padding:0 6px; flex-shrink:0; }
   .center-tab { padding:11px 14px; font-size:13px; font-weight:600; color:var(--muted); cursor:pointer;
@@ -98,7 +84,7 @@
   .center-content { flex:1; overflow-y:auto; }
   .center-content.detail-panel { padding:16px 18px; }
 
-  /* 图谱舞台（缩放/拖拽） */
+  /* 图谱舞台 */
   .diagram-toolbar { display:flex; align-items:center; gap:6px; padding:8px 12px; border-bottom:1px solid var(--border); flex-shrink:0; }
   .diagram-toggle { padding:5px 12px; font-size:12px; border-radius:14px; background:var(--bg-card);
     border:1px solid var(--border); color:var(--text-secondary); cursor:pointer; }
@@ -113,15 +99,15 @@
   .mermaid-host { padding:8px; } .mermaid-host svg { max-width:none; height:auto; }
   .diagram-empty { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center;
     justify-content:center; gap:12px; color:var(--text-secondary); pointer-events:none; }
-  .flow-steps-strip { max-height:32%; overflow-y:auto; border-top:1px solid var(--border); flex-shrink:0; background:var(--bg-panel); }
+  .empty-icon { font-size:48px; opacity:.3; } .empty-title { font-size:16px; font-weight:600; }
+  .empty-sub { font-size:13px; color:var(--muted); }
+  .flow-steps-strip { max-height:42%; overflow-y:auto; border-top:1px solid var(--border); flex-shrink:0; background:var(--bg-panel); }
 
-  /* 聊天面板标题（不再含标签） */
-  .chat-panel-title { padding:13px 16px; font-size:13px; font-weight:700; color:var(--cyan);
-    border-bottom:1px solid var(--border); flex-shrink:0; letter-spacing:.03em; }
-
-  /* ===== 聊天面板 ===== */
+  /* 聊天面板 */
   .chat-panel { width:420px; flex-shrink:0; border-left:1px solid var(--border);
     display:flex; flex-direction:column; background:var(--bg-panel); }
+  .chat-panel-title { padding:13px 16px; font-size:13px; font-weight:700; color:var(--cyan);
+    border-bottom:1px solid var(--border); flex-shrink:0; letter-spacing:.03em; }
   .chat-messages { flex:1; overflow-y:auto; padding:14px; display:flex; flex-direction:column; gap:12px; }
   .msg { display:flex; gap:8px; animation:msg-in .2s ease; }
   @keyframes msg-in { from{opacity:0;transform:translateY(6px);} to{opacity:1;transform:translateY(0);} }
@@ -138,7 +124,7 @@
   .msg-bubble pre { background:var(--bg-deep); padding:8px 10px; border-radius:6px; overflow-x:auto; margin:6px 0; }
   .msg-bubble pre code { background:none; padding:0; color:var(--text-secondary); }
 
-  /* 思考块 */
+  /* 思考 / 工具 */
   .think-block { background:rgba(139,110,245,.06); border:1px solid rgba(139,110,245,.22); border-radius:var(--radius);
     font-size:12px; overflow:hidden; }
   .think-head { display:flex; align-items:center; gap:6px; padding:6px 10px; cursor:pointer; color:var(--violet); font-weight:600; }
@@ -147,8 +133,6 @@
   .think-block.collapsed .chev { transform:rotate(-90deg); }
   .think-body { padding:0 10px 8px; color:var(--text-secondary); line-height:1.55; white-space:pre-wrap;
     max-height:240px; overflow-y:auto; font-family:var(--font-mono); font-size:11px; }
-
-  /* 工具调用 */
   .tool-trace { display:flex; flex-direction:column; gap:2px; background:rgba(57,214,131,.05);
     border:1px solid rgba(57,214,131,.2); border-radius:var(--radius); padding:6px 10px; font-size:11px; }
   .tool-trace-head { display:flex; align-items:center; gap:6px; color:var(--green); font-weight:600; }
@@ -182,7 +166,6 @@
   .btn-send:disabled { opacity:.4; cursor:not-allowed; }
 
   /* 详情面板 */
-  .detail-panel { flex:1; overflow-y:auto; padding:14px; }
   .detail-section { margin-bottom:16px; }
   .detail-section-title { font-size:11px; text-transform:uppercase; letter-spacing:.1em; color:var(--muted);
     margin-bottom:8px; display:flex; align-items:center; gap:6px; }
@@ -195,47 +178,97 @@
   .col-chips { display:flex; flex-wrap:wrap; gap:3px; }
   .col-chip { padding:2px 6px; border-radius:4px; font-size:10px; font-family:var(--font-mono);
     background:rgba(88,200,227,.08); border:1px solid rgba(88,200,227,.15); color:var(--cyan); }
+  .col-chip.role-PK { background:rgba(245,166,35,.12); border-color:rgba(245,166,35,.3); color:var(--amber); }
+  .col-chip.role-FK { background:rgba(245,166,35,.06); border-color:rgba(245,166,35,.2); color:var(--amber); }
+  .col-chip.role-METRIC { background:rgba(57,214,131,.1); border-color:rgba(57,214,131,.25); color:var(--green); }
+  .col-chip.role-NL_TEXT { background:rgba(139,110,245,.12); border-color:rgba(139,110,245,.3); color:var(--violet); }
+  .col-chip.role-CATEGORY { background:rgba(240,106,106,.1); border-color:rgba(240,106,106,.25); color:var(--rose); }
+  .col-chip-sem { color:var(--muted); margin-left:3px; font-size:9px; }
   .relation-card { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .relation-card.confirmed { border-left:3px solid var(--green); }
   .rel-from { color:var(--amber); font-family:var(--font-mono); }
   .rel-arrow { color:var(--muted); } .rel-to { color:var(--cyan); font-family:var(--font-mono); }
   .rel-conf { margin-left:auto; font-size:10px; color:var(--green); }
-  .flow-step-card { border-left:3px solid var(--violet); }
-  .flow-step-header { display:flex; align-items:center; gap:6px; margin-bottom:5px; }
-  .flow-step-num { width:20px; height:20px; background:var(--violet); color:#fff; border-radius:50%;
+  .rel-confirmed-badge { font-size:9px; padding:1px 7px; border-radius:10px; background:rgba(57,214,131,.15); color:var(--green); white-space:nowrap; }
+  .rel-confirm-btn { font-size:9px; padding:1px 8px; border-radius:10px; background:var(--bg-panel);
+    border:1px solid var(--border); color:var(--text-secondary); cursor:pointer; white-space:nowrap; }
+  .rel-confirm-btn:hover { border-color:var(--violet); color:var(--violet); }
+
+  /* 流程节点详情卡（v1.0.3 增强：展示能力描述） */
+  .flow-step-card { border-left:3px solid var(--violet); padding:11px 13px; }
+  .flow-step-header { display:flex; align-items:center; gap:6px; margin-bottom:6px; flex-wrap:wrap; }
+  .flow-step-num { width:22px; height:22px; background:var(--violet); color:#fff; border-radius:50%;
     display:flex; align-items:center; justify-content:center; font-size:10px; font-weight:700; }
-  .flow-step-name { font-weight:700; } .flow-step-op { font-size:10px; padding:1px 6px;
+  .flow-step-name { font-weight:700; color:var(--text-primary); }
+  .flow-step-op { font-size:10px; padding:1px 6px;
     background:rgba(139,110,245,.15); color:var(--violet); border-radius:3px; font-family:var(--font-mono); }
-  .flow-step-desc { color:var(--text-secondary); line-height:1.5; }
+  .flow-step-tpl { font-size:10px; padding:1px 6px; background:rgba(88,200,227,.12);
+    color:var(--cyan); border-radius:3px; font-family:var(--font-mono); }
+  .flow-step-status { font-size:9px; padding:1px 5px; border-radius:8px; font-family:var(--font-mono);
+    background:rgba(57,214,131,.15); color:var(--green); margin-left:auto; }
+  .flow-step-status.blocked { background:rgba(245,166,35,.15); color:var(--amber); }
+  .flow-step-status.draft { background:rgba(139,153,176,.15); color:var(--muted); }
+  .flow-cap-grid { display:grid; grid-template-columns:80px 1fr; gap:4px 10px; font-size:11px; margin-top:6px; }
+  .flow-cap-key { color:var(--muted); font-weight:600; }
+  .flow-cap-val { color:var(--text-secondary); line-height:1.5; }
   .flow-sql { margin-top:6px; font-family:var(--font-mono); font-size:10px; color:var(--muted);
-    background:var(--bg-deep); padding:6px 8px; border-radius:4px; overflow-x:auto; }
+    background:var(--bg-deep); padding:6px 8px; border-radius:4px; overflow-x:auto; max-height:120px; overflow-y:auto; }
+
   .skill-card { border-left:3px solid var(--green); }
   .skill-card.evolved { border-left-color:var(--amber); }
+  .skill-card.main { border-left-color:var(--cyan); }
   .skill-card-header { display:flex; align-items:center; gap:6px; margin-bottom:4px; }
   .skill-name { font-weight:700; flex:1; } .skill-op { font-size:10px; padding:1px 5px;
     background:rgba(57,214,131,.12); color:var(--green); border-radius:3px; font-family:var(--font-mono); }
   .skill-desc { color:var(--text-secondary); line-height:1.4; }
+  .skill-cap { color:var(--cyan); font-size:11px; margin-top:3px; }
   .muted-tip { color:var(--muted); font-size:12px; }
 
-  /* 审核能力 */
+  /* 产出 */
   .audit-card { background:var(--bg-card); border:1px solid var(--border); border-left:3px solid var(--cyan);
     border-radius:var(--radius); padding:9px 11px; margin-bottom:6px; font-size:12px; }
   .audit-card-head { display:flex; align-items:center; gap:8px; }
   .audit-vt { font-weight:700; flex:1; word-break:break-all; }
   .audit-state { font-size:9px; padding:1px 6px; border-radius:10px; font-family:var(--font-mono); white-space:nowrap; }
   .st-verified { background:rgba(57,214,131,.15); color:var(--green); }
-  .st-unverified { background:rgba(88,200,227,.15); color:var(--cyan); }
+  .st-executable { background:rgba(88,200,227,.15); color:var(--cyan); }
   .st-blocked { background:rgba(245,166,35,.15); color:var(--amber); }
-  .st-parsed { background:rgba(139,153,176,.15); color:var(--muted); }
+  .st-draft { background:rgba(139,153,176,.15); color:var(--muted); }
   .audit-meta { color:var(--muted); font-size:10px; margin-top:3px; font-family:var(--font-mono); }
   .btn-run-audit { padding:3px 9px; font-size:10px; border-radius:12px; background:rgba(88,200,227,.12);
     border:1px solid rgba(88,200,227,.3); color:var(--cyan); cursor:pointer; white-space:nowrap; }
   .btn-run-audit:hover { background:rgba(88,200,227,.22); }
+  .role-select { font-size:10px; background:var(--bg-panel); color:var(--text-primary);
+    border:1px solid var(--border); border-radius:8px; padding:1px 4px; margin-left:6px; cursor:pointer; }
+  .role-result { border-color:rgba(57,214,131,.5); color:var(--green); }
+  .role-rule { border-color:rgba(245,166,35,.5); color:var(--amber); }
+
+  /* 追踪驱动采样 */
+  .trace-card { background:var(--bg-card); border:1px solid var(--border); border-left:3px solid var(--violet);
+    border-radius:var(--radius); padding:9px 11px; margin-bottom:8px; font-size:12px; }
+  .trace-card.random { border-left-color:var(--rose); }
+  .trace-card-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .trace-name { font-weight:700; color:var(--cyan); }
+  .trace-badge { font-size:9px; padding:1px 7px; border-radius:10px; font-family:var(--font-mono); white-space:nowrap; }
+  .trace-badge.high { background:rgba(57,214,131,.15); color:var(--green); }
+  .trace-badge.medium { background:rgba(245,166,35,.15); color:var(--amber); }
+  .trace-badge.low, .trace-badge.random { background:rgba(240,106,106,.15); color:var(--rose); }
+  .trace-by { color:var(--muted); font-family:var(--font-mono); font-size:11px; }
+  .trace-rows { margin-top:6px; font-family:var(--font-mono); font-size:11px; color:var(--text-secondary);
+    background:var(--bg-panel); border-radius:6px; padding:6px 8px; max-height:140px; overflow:auto; white-space:pre-wrap; }
+  .trace-warning { color:var(--rose); font-size:11px; margin-top:4px; }
+  .trace-summary-bar { font-size:11px; color:var(--muted); margin-bottom:8px; padding:6px 8px;
+    background:var(--bg-panel); border-radius:6px; }
+  .role-input { border-color:rgba(88,200,227,.4); color:var(--cyan); }
+  .dl-link { color:var(--cyan); text-decoration:none; font-size:10px; margin-left:6px; }
+  .dl-link:hover { text-decoration:underline; }
   .valid-card { background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius);
     padding:9px 11px; margin-bottom:6px; font-size:11px; }
   .valid-card.pass { border-left:3px solid var(--green); } .valid-card.fail { border-left:3px solid var(--amber); }
   .valid-stat { font-family:var(--font-mono); color:var(--text-secondary); margin-top:4px; }
+  .valid-count { color:var(--text-secondary); font-size:10px; margin:0 6px; }
 
-  /* 流程引导 */
+  /* 5 步流程引导（v1.0.3：仅 5 步） */
   .workflow-guide { border-bottom:1px solid var(--border); padding:10px 12px 8px; background:var(--bg-panel); flex-shrink:0; }
   .wf-steps { display:flex; align-items:stretch; gap:0; }
   .wf-step { flex:1; display:flex; flex-direction:column; align-items:center; gap:4px; position:relative;
@@ -244,7 +277,6 @@
     font-size:11px; font-weight:700; border:1.5px solid var(--border); background:var(--bg-card); color:var(--muted);
     z-index:2; transition:all .2s; }
   .wf-step .wf-label { font-size:10px; color:var(--muted); white-space:nowrap; transition:color .2s; }
-  /* 连接线 */
   .wf-step:not(:first-child)::before { content:''; position:absolute; top:13px; left:-50%; width:100%; height:2px;
     background:var(--border); z-index:1; }
   .wf-step.done .wf-dot { background:var(--green); border-color:var(--green); color:var(--bg-deep); }
@@ -264,16 +296,25 @@
     align-items:center; justify-content:center; z-index:100; opacity:0; pointer-events:none; transition:opacity .2s; }
   .modal-overlay.show { opacity:1; pointer-events:all; }
   .modal { background:var(--bg-panel); border:1px solid var(--border-lit); border-radius:var(--radius-lg);
-    padding:24px; width:440px; max-width:90vw; box-shadow:var(--shadow); transform:translateY(10px); transition:transform .2s; }
+    padding:24px; width:520px; max-width:90vw; max-height:80vh; overflow-y:auto; box-shadow:var(--shadow); transform:translateY(10px); transition:transform .2s; }
   .modal-overlay.show .modal { transform:translateY(0); }
-  .modal-title { font-size:16px; font-weight:700; margin-bottom:16px; }
+  .modal-title { font-size:16px; font-weight:700; margin-bottom:14px; }
   .form-group { margin-bottom:14px; } .form-label { font-size:12px; color:var(--text-secondary); margin-bottom:5px; display:block; }
   .form-input { width:100%; background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius);
     padding:9px 12px; font-size:13px; color:var(--text-primary); outline:none; transition:border-color .15s; }
   .form-input:focus { border-color:var(--cyan); }
-  .modal-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:20px; }
+  .modal-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:18px; }
 
-  /* 结构化交互（Section 5）—— 渲染为表单 */
+  /* 上传时角色选择对话 */
+  .role-pick-row { display:flex; align-items:center; gap:8px; padding:7px 10px; margin-bottom:6px;
+    background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius); }
+  .role-pick-name { flex:1; font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    color:var(--text-primary); font-family:var(--font-mono); }
+  .role-pick-select { font-size:11px; background:var(--bg-deep); color:var(--text-primary);
+    border:1px solid var(--border); border-radius:6px; padding:3px 8px; cursor:pointer; }
+  .role-hint { font-size:11px; color:var(--muted); margin-bottom:10px; }
+
+  /* 结构化交互 */
   .interaction-block { background:rgba(139,110,245,.07); border:1px solid rgba(139,110,245,.32);
     border-radius:var(--radius); padding:10px 12px; margin-top:8px; font-size:12px; }
   .interaction-q { font-weight:600; color:var(--violet); margin-bottom:8px; display:flex; align-items:center; gap:6px; }
@@ -287,21 +328,7 @@
   .interaction-custom input:focus { border-color:var(--violet); }
   .interaction-block.answered { opacity:.55; pointer-events:none; }
 
-  /* Phase 0 业务流程文档面板 */
-  .bp-approval { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:12px;
-    background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius); padding:9px 11px; }
-  .bp-badge { font-size:10px; padding:2px 8px; border-radius:10px; font-family:var(--font-mono); }
-  .bp-badge.pending { background:rgba(245,166,35,.15); color:var(--amber); }
-  .bp-badge.approved { background:rgba(57,214,131,.15); color:var(--green); }
-  .bp-doc { font-size:13px; line-height:1.7; color:var(--text-primary); }
-  .bp-doc h1,.bp-doc h2,.bp-doc h3 { color:var(--cyan); margin:12px 0 6px; line-height:1.4; }
-  .bp-doc h1 { font-size:16px; } .bp-doc h2 { font-size:14px; } .bp-doc h3 { font-size:13px; }
-  .bp-doc ul,.bp-doc ol { margin:4px 0 8px 18px; } .bp-doc li { margin:2px 0; }
-  .bp-doc code { font-family:var(--font-mono); background:var(--bg-deep); padding:1px 5px; border-radius:4px; color:var(--cyan); font-size:12px; }
-  .bp-doc pre { background:var(--bg-deep); padding:10px; border-radius:6px; overflow-x:auto; margin:8px 0;
-    border:1px solid var(--border); }
-  .bp-doc pre code { background:none; padding:0; color:var(--text-secondary); font-size:11px; }
-  /* 通用 Markdown（聊天气泡内）*/
+  /* 通用 Markdown */
   .msg-bubble h1,.msg-bubble h2,.msg-bubble h3 { color:var(--cyan); margin:8px 0 4px; line-height:1.4; }
   .msg-bubble h1 { font-size:15px; } .msg-bubble h2 { font-size:14px; } .msg-bubble h3 { font-size:13px; }
   .msg-bubble ul,.msg-bubble ol { margin:4px 0 6px 18px; } .msg-bubble li { margin:2px 0; }
@@ -322,7 +349,7 @@
 <aside class="sidebar">
   <div class="sidebar-logo">
     <div class="logo-title">业务流逆向平台</div>
-    <div class="logo-sub">v1.0.2 · 业务能力逆向引擎</div>
+    <div class="logo-sub">v1.0.3 · 5 步蒸馏</div>
   </div>
   <div class="sidebar-section">
     <div class="sidebar-label">业务场景</div>
@@ -346,60 +373,56 @@
   </div>
 
   <div class="workspace">
-    <!-- ===== 中央：标签 + 内容（图谱也在此） ===== -->
+    <!-- 中央：标签 -->
     <div class="center-panel">
       <div class="center-tabs">
-        <div class="center-tab active" data-tab="process" onclick="switchTab('process')">🧭 业务说明</div>
-        <div class="center-tab" data-tab="tables" onclick="switchTab('tables')">📊 表格</div>
-        <div class="center-tab" data-tab="audit" onclick="switchTab('audit')">🛡 审核能力</div>
-        <div class="center-tab" data-tab="flow" onclick="switchTab('flow')">🔄 流程 / 图谱</div>
+        <div class="center-tab active" data-tab="tables" onclick="switchTab('tables')">📊 表格 & 字段语义</div>
+        <div class="center-tab" data-tab="flow" onclick="switchTab('flow')">🔄 业务流程 & 图谱</div>
         <div class="center-tab" data-tab="skills" onclick="switchTab('skills')">⚡ 技能</div>
+        <div class="center-tab" data-tab="outputs" onclick="switchTab('outputs')">📤 产出 & 执行</div>
       </div>
 
-      <div id="tab-process" class="center-content detail-panel">
+      <div id="tab-tables" class="center-content detail-panel">
         <div class="detail-section">
-          <div class="detail-section-title">业务流程文档 · Phase 0</div>
-          <div id="business-process-detail">
-            <div class="muted-tip">梳理业务流程后显示。对 AI 说「梳理业务流程」生成文档。</div>
-          </div>
-        </div>
-      </div>
-
-      <div id="tab-tables" class="center-content detail-panel" style="display:none">
-        <div class="detail-section">
-          <div class="detail-section-title">已上传表格</div>
+          <div class="detail-section-title">已上传表格（含字段语义角色）</div>
           <div id="tables-detail"></div>
         </div>
         <div class="detail-section">
-          <div class="detail-section-title">关联关系</div>
+          <div class="detail-section-title">关联关系（ER）</div>
           <div id="relations-detail"></div>
         </div>
-      </div>
-
-      <div id="tab-audit" class="center-content detail-panel" style="display:none">
         <div class="detail-section">
-          <div class="detail-section-title">规则库 · 可审核的违规类型</div>
-          <div id="audit-types-detail"><div class="muted-tip">解析规则库后显示。对 AI 说「解析规则库」。</div></div>
-        </div>
-        <div class="detail-section">
-          <div class="detail-section-title">校验报告（对照历史结果）</div>
-          <div id="validations-detail"><div class="muted-tip">执行审核校验后显示。</div></div>
+          <div class="detail-section-title">
+            追踪驱动采样（AI 推导关联/流程时实际用的样本，逐表核对因果链）
+            <span class="btn btn-ghost" style="font-size:11px;padding:3px 10px;margin-left:8px" onclick="loadTraceSample()">🔍 查看/刷新</span>
+          </div>
+          <div id="trace-sample-detail"><div class="muted-tip">点击「查看/刷新」以结果表为入口，逆向核对每张表实际追踪到的关联行——不是各表各自随机抽的、互不相干的行。</div></div>
         </div>
       </div>
 
-      <!-- 流程 / 图谱：业务流程图(Mermaid) + ER关系图 + 处理流程图，可缩放拖拽 -->
+      <div id="tab-outputs" class="center-content detail-panel" style="display:none">
+        <div class="detail-section">
+          <div class="detail-section-title">产出规格（可复刻的最终产出）</div>
+          <div id="outputs-detail"><div class="muted-tip">推导业务流程并生成技能后显示。</div></div>
+        </div>
+        <div class="detail-section">
+          <div class="detail-section-title">执行 / 校验报告（含产出文件下载）</div>
+          <div id="validations-detail"><div class="muted-tip">执行产出后显示。</div></div>
+        </div>
+      </div>
+
+      <!-- 业务流程 & 图谱 -->
       <div id="tab-flow" class="center-content" style="display:none;flex-direction:column;flex:1;overflow:hidden">
         <div class="diagram-toolbar" id="diagram-toolbar">
-          <div class="diagram-toggle active" id="dg-business" onclick="setDiagram('business')">🧭 业务流程图</div>
           <div class="diagram-toggle" id="dg-relations" onclick="setDiagram('relations')">🔗 ER 关系图</div>
-          <div class="diagram-toggle" id="dg-flow" onclick="setDiagram('flow')">🔄 处理流程图</div>
+          <div class="diagram-toggle active" id="dg-flow" onclick="setDiagram('flow')">🔄 业务流程图</div>
           <div class="diagram-hint">滚轮缩放 · 拖拽平移 · <span id="dg-reset" onclick="resetView()">复位</span></div>
         </div>
         <div class="diagram-stage" id="diagram-stage">
           <div class="diagram-empty" id="diagram-empty">
             <div class="empty-icon">⬡</div>
             <div class="empty-title">暂无图谱</div>
-            <div class="empty-sub">完成 Phase 0（业务流程图）/ 推导关联关系（ER 图）后在此查看</div>
+            <div class="empty-sub">推导关联（ER 图）/ 推导流程（业务流程图）后在此查看</div>
           </div>
           <div class="diagram-pan" id="diagram-pan">
             <div id="mermaid-host" class="mermaid-host" style="display:none"></div>
@@ -407,14 +430,14 @@
           </div>
         </div>
         <div class="flow-steps-strip">
-          <div class="detail-section-title" style="margin:8px 12px 4px">业务流程步骤</div>
+          <div class="detail-section-title" style="margin:8px 12px 4px">业务流程节点（含能力描述）</div>
           <div id="flow-detail" style="padding:0 12px 10px"></div>
         </div>
       </div>
 
       <div id="tab-skills" class="center-content detail-panel" style="display:none">
         <div class="detail-section">
-          <div class="detail-section-title">已生成 Skills（Engineer's Toolbox）</div>
+          <div class="detail-section-title">已生成 Skills（主技能 + 节点子技能）</div>
           <div id="skills-detail"></div>
         </div>
         <button class="btn btn-primary" style="width:100%;justify-content:center;margin-top:8px" onclick="openEvolveModal()">
@@ -423,27 +446,25 @@
       </div>
     </div>
 
-    <!-- ===== 右侧：仅对话 ===== -->
+    <!-- 右侧：对话 -->
     <div class="chat-panel">
       <div class="chat-panel-title">💬 AI 协作对话</div>
       <div class="workflow-guide" id="workflow-guide" style="display:none"></div>
       <div class="chat-messages" id="chat-messages"></div>
       <div class="chat-input-area">
         <div class="quick-cmds">
-          <div class="quick-cmd" onclick="sendQuick('梳理业务流程')">🧭 梳理流程</div>
-          <div class="quick-cmd" onclick="sendQuick('推导表关联关系')">🔗 推导关系</div>
-          <div class="quick-cmd" onclick="sendQuick('解析规则库')">📋 解析规则</div>
-          <div class="quick-cmd" onclick="sendQuick('执行审核（重复收费）并与历史结果对照校验')">🛡 执行审核</div>
-          <div class="quick-cmd" onclick="sendQuick('泛化所有规则')">🧩 泛化规则</div>
-          <div class="quick-cmd" onclick="sendQuick('生成技能库')">⚡ 生成技能</div>
+          <div class="quick-cmd" onclick="sendQuick('只推导关联关系（含字段语义），不要再继续下一步')">🔗 ② 推导关联</div>
+          <div class="quick-cmd" onclick="sendQuick('只推导业务流程节点，不要继续生成技能或执行')">🔄 ③ 推导流程</div>
+          <div class="quick-cmd" onclick="sendQuick('只生成技能库，不要立即执行产出')">⚡ ④ 生成技能</div>
+          <div class="quick-cmd" onclick="sendQuick('执行产出并对照历史结果')">▶ ⑤ 执行</div>
         </div>
         <div class="upload-zone" id="upload-zone">
           <input type="file" id="file-input" multiple accept=".csv,.xlsx,.xls,.tsv" onchange="handleFileSelect(this.files)">
-          📎 拖拽或点击上传业务表格（CSV/Excel）
+          📎 ① 拖拽或点击上传业务表格（上传时选择角色）
         </div>
         <div class="chat-input-row">
           <textarea class="chat-input" id="chat-input" rows="1"
-            placeholder="向 AI 下达指令，例如「开始推导关联关系」…"
+            placeholder="向 AI 下达指令，例如「推导关联关系」…"
             onkeydown="handleKeydown(event)" oninput="autoResize(this)"></textarea>
           <button class="btn-send" id="btn-send" onclick="sendMessage()">➤</button>
         </div>
@@ -478,6 +499,20 @@
     <div class="modal-actions">
       <button class="btn btn-ghost" onclick="closeModal('modal-evolve')">取消</button>
       <button class="btn btn-violet" onclick="evolveSkill()">加入技能库</button>
+    </div>
+  </div>
+</div>
+
+<!-- 上传时选择角色 -->
+<div class="modal-overlay" id="modal-upload-roles">
+  <div class="modal">
+    <div class="modal-title">📎 选择文件角色再上传</div>
+    <div class="role-hint">为每个文件选择业务角色：<b style="color:var(--cyan)">输入</b>（业务数据） /
+      <b style="color:var(--amber)">规则</b>（领域知识库） / <b style="color:var(--green)">结果</b>（历史产出样例）。</div>
+    <div id="upload-role-list"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="cancelUpload()">取消</button>
+      <button class="btn btn-primary" onclick="confirmUpload()">上传</button>
     </div>
   </div>
 </div>

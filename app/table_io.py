@@ -13,6 +13,7 @@ from __future__ import annotations
 import csv
 import functools
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -21,12 +22,34 @@ import pandas as pd
 from .models import ColumnMeta, TableMeta
 
 # 为估算行数 / 抽样而最多读取的行数上限：足够代表分布，又不至于拖垮内存
+# ⚠️ 仅用于「描述这张表长什么样」（字段类型、少量样本值）——绝不能用于「这个具体值
+# 在这张表里存不存在」这类判断关联的场景：真实业务表动辄几十万行，命中的具体行
+# 大概率不落在前 2000 行内，用这个 cap 去判断"有没有关联"，等于系统性地看不到证据、
+# 把"没搜到"错判成"不存在"。关联推导相关代码一律走下面的 load_full_frame_cached。
 _SCAN_CAP = 2000
 # 随机抽样条数
 _SAMPLE_N = 3
 # 表头识别时最多探查的行数（标题区一般不会很长）
 _DETECT_SCAN = 20
 _EXCEL_SUFFIX = {".xlsx", ".xls"}
+_JSON_SUFFIX = {".json"}
+_MD_SUFFIX = {".md", ".markdown"}
+
+# Excel 读取引擎：calamine（Rust 实现）比默认 openpyxl 快一个数量级以上
+# （实测 74 万行 x 81 列：openpyxl 313s vs calamine 58s），大表全量加载必须用它，
+# 否则关联推导时为了"搜有没有这个值"去读大表会直接卡到不可用。未安装时静默退回 openpyxl。
+_EXCEL_ENGINE: str | None = None
+
+
+def _excel_engine() -> str | None:
+    global _EXCEL_ENGINE
+    if _EXCEL_ENGINE is None:
+        try:
+            import python_calamine  # noqa: F401,PLC0415
+            _EXCEL_ENGINE = "calamine"
+        except ImportError:
+            _EXCEL_ENGINE = "openpyxl"
+    return _EXCEL_ENGINE
 
 
 # ===========================================================================
@@ -51,6 +74,7 @@ def _csv_sep(path: Path) -> str:
 def _read_detection_grid(path: Path) -> list[list[Any]]:
     """读取前若干行的「原始二维网格」（不指定表头），用于识别表头位置。"""
     if path.suffix.lower() in _EXCEL_SUFFIX:
+        # 只读 20 行，openpyxl 能提前停止读取，比先整表读完的 calamine 快
         raw = pd.read_excel(path, header=None, nrows=_DETECT_SCAN)
         return [list(raw.iloc[i]) for i in range(len(raw))]
     rows: list[list[Any]] = []
@@ -169,29 +193,110 @@ def resolve_header_row(file_path: str | Path) -> int:
 # ===========================================================================
 # 数据帧读取（自动跳过表头上方的标题/空行）
 # ===========================================================================
+def _read_json(path: Path) -> pd.DataFrame:
+    """读取 JSON 结果文件（records / 列式 / 单对象皆兼容）。"""
+    import json as _json
+
+    data = _json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        # 兼容 {"data": [...]} / {"records": [...]} 包裹
+        for key in ("data", "records", "rows", "items"):
+            if isinstance(data.get(key), list):
+                data = data[key]
+                break
+    if isinstance(data, list):
+        return pd.json_normalize(data)
+    return pd.json_normalize([data])
+
+
+def _read_md_table(path: Path) -> pd.DataFrame:
+    """从 Markdown 文本中解析第一张表格（best-effort；无表格则返回空帧）。"""
+    rows: list[list[str]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if s.startswith("|") and s.endswith("|"):
+            cells = [c.strip() for c in s.strip("|").split("|")]
+            if set("".join(cells)) <= set("-: "):  # 分隔行
+                continue
+            rows.append(cells)
+    if len(rows) < 1:
+        return pd.DataFrame()
+    header, *body = rows
+    width = len(header)
+    body = [r + [""] * (width - len(r)) for r in body if r]
+    return pd.DataFrame([r[:width] for r in body], columns=header)
+
+
+def _dispatch_read(path: Path, header_row: int | None, nrows: int | None) -> pd.DataFrame:
+    suffix = path.suffix.lower()
+    if suffix in _JSON_SUFFIX:
+        df = _read_json(path)
+        return df.head(nrows) if nrows else df
+    if suffix in _MD_SUFFIX:
+        df = _read_md_table(path)
+        return df.head(nrows) if nrows else df
+    hr = resolve_header_row(path) if header_row is None else header_row
+    if suffix in _EXCEL_SUFFIX:
+        # calamine 不支持 nrows 提前停止读取（会先读完整个 sheet 再截断，等于白读），
+        # 只有整表加载（nrows=None）时才值得切到 calamine；有行数上限时 openpyxl 更快。
+        engine = _excel_engine() if nrows is None else None
+        return pd.read_excel(path, skiprows=hr or None, nrows=nrows, engine=engine)
+    return pd.read_csv(
+        path, skiprows=hr or None, nrows=nrows,
+        sep=_csv_sep(path), encoding=_csv_encoding(path),
+    )
+
+
 def _load_scan_frame(path: Path, header_row: int | None = None) -> pd.DataFrame:
     """读取用于结构分析的「采样数据帧」，最多 `_SCAN_CAP` 行，自动定位表头。"""
-    hr = resolve_header_row(path) if header_row is None else header_row
-    if path.suffix.lower() in _EXCEL_SUFFIX:
-        return pd.read_excel(path, skiprows=hr or None, nrows=_SCAN_CAP)
-    return pd.read_csv(
-        path,
-        skiprows=hr or None,
-        nrows=_SCAN_CAP,
-        sep=_csv_sep(path),
-        encoding=_csv_encoding(path),
-    )
+    return _dispatch_read(path, header_row, _SCAN_CAP)
 
 
 def load_full_frame(file_path: str) -> pd.DataFrame:
     """加载整表（仅供「执行业务/查询数据」这类确需全量计算的场景使用），自动定位表头。"""
-    path = Path(file_path)
-    hr = resolve_header_row(path)
-    if path.suffix.lower() in _EXCEL_SUFFIX:
-        return pd.read_excel(path, skiprows=hr or None)
-    return pd.read_csv(
-        path, skiprows=hr or None, sep=_csv_sep(path), encoding=_csv_encoding(path)
-    )
+    return _dispatch_read(Path(file_path), None, None)
+
+
+# ===========================================================================
+# 整表加载缓存（供关联/追踪采样等"要判断某个具体值存不存在"的场景使用）
+# ===========================================================================
+# 按 (路径, mtime) 失效；简单 LRU 上限防止长跑进程内存无限增长（业务表可能几十万行）。
+_FULL_FRAME_CACHE: "dict[str, tuple[float, pd.DataFrame]]" = {}
+_FULL_FRAME_CACHE_MAX = 8
+
+
+def load_full_frame_cached(file_path: str) -> pd.DataFrame:
+    """整表加载 + 进程内缓存。
+
+    关联推导（`heuristics.candidate_relations` 的真实值重叠计算）与追踪采样
+    （`trace_sampling`）在同一次「推导关联关系」/「推导业务流程」调用里，往往会对
+    同一张大表反复问"这个值在不在"——不缓存的话，一张 74 万行的 Excel 表可能被
+    整表重读五六次，几分钟的等待完全是可避免的重复劳动。
+    """
+    p = Path(file_path)
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        return load_full_frame(file_path)
+
+    key = str(p)
+    cached = _FULL_FRAME_CACHE.get(key)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+
+    t0 = time.time()
+    df = load_full_frame(file_path)
+    elapsed = time.time() - t0
+    if elapsed > 5:
+        import logging  # noqa: PLC0415
+        logging.getLogger("table_io").info(
+            "整表加载「%s」（%d 行）耗时 %.1fs，已缓存本进程内复用", p.name, len(df), elapsed,
+        )
+
+    if len(_FULL_FRAME_CACHE) >= _FULL_FRAME_CACHE_MAX and key not in _FULL_FRAME_CACHE:
+        _FULL_FRAME_CACHE.pop(next(iter(_FULL_FRAME_CACHE)))
+    _FULL_FRAME_CACHE[key] = (mtime, df)
+    return df
 
 
 # ===========================================================================
@@ -233,19 +338,65 @@ def _estimate_row_count(path: Path, header_row: int) -> int:
 # 工具函数
 # ===========================================================================
 def _jsonable(value: Any) -> Any:
-    """将 pandas/numpy 标量转换为可 JSON 序列化的原生类型。"""
-    if value is None or (isinstance(value, float) and pd.isna(value)):
+    """将 pandas/numpy 标量转换为可 JSON 序列化的原生类型。
+
+    覆盖类型：None / NaN / NaT / Timestamp / datetime / numpy 标量 / 基本类型。
+    """
+    import datetime
+
+    if value is None:
         return None
-    if pd.api.types.is_scalar(value) and pd.isna(value):
+
+    # pandas NaT（Not a Time）
+    if value is pd.NaT:
         return None
-    if hasattr(value, "item"):  # numpy 标量
+
+    # pandas Timestamp → ISO 字符串
+    if isinstance(value, pd.Timestamp):
+        try:
+            return value.isoformat()
+        except Exception:  # noqa: BLE001
+            return str(value)
+
+    # Python datetime / date / time
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return value.isoformat()
+
+    # numpy datetime64
+    try:
+        import numpy as np
+        if isinstance(value, np.datetime64):
+            if pd.isna(value):
+                return None
+            return pd.Timestamp(value).isoformat()
+    except ImportError:
+        pass
+
+    # float NaN / scalar NaN（pd.isna 对 Timestamp 也安全，放在 Timestamp 检查之后）
+    try:
+        if isinstance(value, float) and pd.isna(value):
+            return None
+        if pd.api.types.is_scalar(value) and pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+
+    # numpy 标量（int64 / float64 / bool_…）
+    if hasattr(value, "item"):
         try:
             return value.item()
         except Exception:  # noqa: BLE001
             return str(value)
+
     if isinstance(value, (int, float, str, bool)):
         return value
+
     return str(value)
+
+
+def _sanitize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """对 df.to_dict('records') 的输出做全量 JSON 安全转换。"""
+    return [{k: _jsonable(v) for k, v in row.items()} for row in rows]
 
 
 # ===========================================================================

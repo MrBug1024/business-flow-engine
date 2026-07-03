@@ -13,24 +13,21 @@ from __future__ import annotations
 
 import re
 from difflib import SequenceMatcher
+from pathlib import Path
+
+import pandas as pd
 
 from . import table_io
 from .models import (
-    FlowResult,
-    FlowStep,
     GraphData,
     GraphEdge,
     GraphNode,
     Relation,
     RelationResult,
     Scenario,
-    Skill,
     TableMeta,
 )
 
-# 结果表 / 规则表的命名特征（用于在流程推导中定位终点与规则节点）
-_RESULT_HINTS = ("result", "结果", "summary", "汇总", "output", "报表", "report")
-_RULE_HINTS = ("rule", "规则", "config", "配置", "policy", "策略", "dict", "字典")
 # 数值/可聚合类型
 _NUMERIC_HINTS = ("int", "float", "decimal", "double", "number")
 
@@ -65,44 +62,79 @@ def _is_keyish(col_name: str) -> bool:
 
 
 def _classify(table: TableMeta) -> str:
-    name = table.table_name.lower()
-    if any(h in name for h in _RESULT_HINTS):
-        return "result"
-    if any(h in name for h in _RULE_HINTS):
-        return "rule"
-    return "table"
+    """图谱节点类型：取表角色（用户标注/确认），未知归为 table。"""
+    role = table.role or "unknown"
+    return role if role in ("result", "rule", "input") else "table"
 
 
 # ===========================================================================
 # 关联关系推导
 # ===========================================================================
-def deduce_relations(scenario: Scenario) -> RelationResult:
-    tables = scenario.tables_meta
-    relations: list[Relation] = []
-    questions: list[str] = []
+_MAX_CANDIDATES_PER_TABLE_PAIR = 3  # 每对表最多保留几个独立候选列对（不止报最强的那一个）
 
+
+def candidate_relations(scenario: Scenario) -> list[Relation]:
+    """计算「真实样本值包含率 + 字段名相似度」双证据支持的候选关联。
+
+    这是关联推导的**唯一权威证据来源**：不管是无 LLM 的启发式兜底路径
+    (`deduce_relations`)，还是 LLM 推理路径 (`inference.infer_relations`)，
+    都必须用本函数算出的真实值重叠证据，而不是只凭字段名相似或几行随机/追踪样本
+    去猜——字段名相似但值不重叠（如「商品名称」vs「商品编码」值域完全不同）应判低分，
+    字段名不像但值高度重叠（如两表用不同列名存同一批业务单号）应判高分且**值证据优先于
+    字段名**：哪怕字段名完全不像，只要值真的对得上，也必须报出来。
+
+    v1.0.7 起每对表不再只报"最强的那一个"列对，而是保留最多
+    `_MAX_CANDIDATES_PER_TABLE_PAIR` 个独立候选——单字段关联可能存在多个都成立
+    （如同时通过「就诊ID」和「结算ID」关联），或者需要人工/`trace_sampling` 进一步
+    判断是否要组合成复合键才能唯一确定对应关系。
+
+    同一张表的同一列在一次调用内只从磁盘读取一次（frame_cache），
+    避免对每个候选列对都重新扫描整份文件。
+    """
+    tables = scenario.tables_meta
+    frame_cache: dict[str, pd.DataFrame] = {}
+    value_set_cache: dict[tuple[str, str], set] = {}
+    relations: list[Relation] = []
     for i, left in enumerate(tables):
         for right in tables[i + 1:]:
-            best = _best_column_match(left, right)
-            if best is None:
-                continue
-            lcol, rcol, score, evidence, rel_type = best
-            relations.append(
-                Relation(
-                    from_table=left.table_name,
-                    from_column=lcol,
-                    to_table=right.table_name,
-                    to_column=rcol,
-                    relation_type=rel_type,
-                    confidence=round(score, 2),
-                    evidence=evidence,
+            for lcol, rcol, score, evidence, rel_type in _best_column_matches(
+                left, right, frame_cache, value_set_cache,
+            ):
+                relations.append(
+                    Relation(
+                        from_table=left.table_name,
+                        from_column=lcol,
+                        to_table=right.table_name,
+                        to_column=rcol,
+                        relation_type=rel_type,
+                        confidence=round(score, 2),
+                        evidence=evidence,
+                    )
                 )
+    return relations
+
+
+def deduce_relations(scenario: Scenario) -> RelationResult:
+    tables = scenario.tables_meta
+    relations = candidate_relations(scenario)
+    questions: list[str] = []
+    for r in relations:
+        if r.confidence < 0.8:
+            questions.append(
+                f"{r.from_table}.{r.from_column} 与 {r.to_table}.{r.to_column} "
+                f"是否确为关联键？（置信度 {r.confidence:.0%}，请确认）"
             )
-            if score < 0.8:
-                questions.append(
-                    f"{left.table_name}.{lcol} 与 {right.table_name}.{rcol} "
-                    f"是否确为关联键？（置信度 {score:.0%}，请确认）"
-                )
+
+    # 唯一性提示：追踪采样如果发现"单字段匹配到多行、需要复合键才能收窄"，
+    # 即使没有 LLM 也要把这个信号带出来（问题反馈4），而不是只有走 LLM 路径才有。
+    try:
+        from .trace_sampling import trace_sampling as _trace  # noqa: PLC0415
+        trace_report = _trace(scenario)
+        for tbl, info in (trace_report.get("trace_map") or {}).items():
+            if info.get("composite_suggested") and info.get("warning"):
+                questions.append(f"【{tbl}】{info['warning']}")
+    except Exception:  # noqa: BLE001
+        pass
 
     graph = _build_relation_graph(tables, relations)
     confident = [r for r in relations if r.confidence >= 0.8]
@@ -115,40 +147,134 @@ def deduce_relations(scenario: Scenario) -> RelationResult:
     )
 
 
-def _best_column_match(left: TableMeta, right: TableMeta):
-    """在两张表之间寻找最佳关联列对。"""
-    best = None
+_PROBE_SIZE = 50  # 值探测阶段最多抽样比对的元素个数
+
+
+def _best_column_matches(
+    left: TableMeta,
+    right: TableMeta,
+    frame_cache: dict | None = None,
+    value_set_cache: dict | None = None,
+) -> list[tuple[str, str, float, str, str]]:
+    """在两张表之间寻找最多 `_MAX_CANDIDATES_PER_TABLE_PAIR` 个独立候选关联列对。
+
+    评分优先级：**真实值证据 > 字段名相似度**（问题反馈：旧版权重是
+    `0.6*name_sim + 0.3*overlap`，字段名占大头，导致"两列值完全相等但字段名
+    完全不像"的真实关联因为过不了字段名门槛而被剪枝掉、根本没机会算值重叠。
+    现在反过来：先探测值层面有没有交集，值证据够强时字段名像不像不重要；
+    只有值层面探测不到任何交集时，才退化成"仅凭字段名"的弱信号，且分数封顶，
+    不能让"名字像"单独顶到高置信度。
+
+    性能：不再用字段名相似度做剪枝（那样会漏判问题1里的场景），改成两级漏斗——
+    ① 每列的去重值集合按 (文件, 列名) 缓存，同一列参与多少次比较都只构建一次；
+    ② 比较前先用"较小集合里最多 `_PROBE_SIZE` 个值有没有命中较大集合"探测一下，
+       探测不到才跳过完整的精确 containment 计算——较小集合本身很小（本项目里
+       典型是"结果表/规则表"，通常几十行）时这个探测其实是穷举，不会漏判。
+    """
+    fcache = frame_cache if frame_cache is not None else {}
+    vcache = value_set_cache if value_set_cache is not None else {}
+    candidates: list[tuple[str, str, float, str, str]] = []
+
     for lc in left.columns:
+        lset = _get_value_set(left, lc.name, fcache, vcache)
+        if not lset:
+            continue
         for rc in right.columns:
             if not _dtype_compatible(lc.dtype, rc.dtype):
                 continue
+            rset = _get_value_set(right, rc.name, fcache, vcache)
+            if not rset:
+                continue
+
             name_sim = _name_similarity(lc.name, rc.name)
             key_bonus = 0.1 if (_is_keyish(lc.name) or _is_keyish(rc.name)) else 0.0
-            overlap = _value_overlap(left, lc.name, right, rc.name)
-            score = min(0.6 * name_sim + 0.3 * overlap + key_bonus, 0.99)
-            if score < 0.55:
-                continue
-            evidence = (
-                f"字段名相似度 {name_sim:.0%}、类型兼容、样本值重叠率 {overlap:.0%}"
-            )
+            probe_hit = _probe_overlap(lset, rset)
+
+            if not probe_hit:
+                # 值层面探测不到任何交集：只能退化为纯字段名信号，且必须封顶——
+                # 这是问题反馈的核心诉求："值全等检测应优先于字段名相似性检测"，
+                # 反过来说，没有值证据时，字段名再像也不能给出高置信度。
+                if name_sim < 0.6:
+                    continue
+                score = min(0.4 * name_sim + key_bonus, 0.5)
+                overlap = 0.0
+                evidence = f"字段名相似度 {name_sim:.0%}（无法确认值是否重叠，仅供参考）"
+            else:
+                overlap = len(lset & rset) / min(len(lset), len(rset))
+                score = min(0.75 * overlap + 0.2 * name_sim + key_bonus, 0.99)
+                if score < 0.5:
+                    continue
+                evidence = f"值包含率 {overlap:.0%}、字段名相似度 {name_sim:.0%}、类型兼容"
+
             rel_type = "foreign_key" if score >= 0.8 else "possible_link"
-            if best is None or score > best[2]:
-                best = (lc.name, rc.name, score, evidence, rel_type)
-    return best
+            candidates.append((lc.name, rc.name, score, evidence, rel_type))
+
+    candidates.sort(key=lambda x: -x[2])
+    # 同一个左列只保留其最高分的一次匹配，避免"最强那一列"独占全部候选名额，
+    # 让不同左列各自有机会入选（问题2：为复合键/多个独立关联留出发现空间）。
+    seen_left: set[str] = set()
+    deduped: list[tuple[str, str, float, str, str]] = []
+    for cand in candidates:
+        if cand[0] in seen_left:
+            continue
+        seen_left.add(cand[0])
+        deduped.append(cand)
+        if len(deduped) >= _MAX_CANDIDATES_PER_TABLE_PAIR:
+            break
+    return deduped
 
 
-def _value_overlap(left: TableMeta, lcol: str, right: TableMeta, rcol: str) -> float:
-    """计算两列样本值的 Jaccard 重叠率（基于限量样本，避免整表读取）。"""
+def _cached_frame(file_path: str, cache: dict) -> pd.DataFrame:
+    """读取某文件的**整表**数据帧（判断"两列值是否真的重叠"必须看全量，不能只看
+    前 2000 行的采样——业务表几十万行时，真正命中的行大概率不在前 2000 行里，
+    只用采样会把"没搜到"误判成"不存在"）。
+
+    `table_io.load_full_frame_cached` 已按 (路径, mtime) 做进程内缓存；这里的
+    `cache` 只是同一次 candidate_relations 调用内的本地记忆，避免重复走一次
+    mtime stat + dict 查找。
+    """
+    if file_path not in cache:
+        try:
+            cache[file_path] = table_io.load_full_frame_cached(file_path)
+        except Exception:  # noqa: BLE001
+            cache[file_path] = pd.DataFrame()
+    return cache[file_path]
+
+
+def _get_value_set(table: TableMeta, col: str, frame_cache: dict, value_set_cache: dict) -> set:
+    """取某表某列的全量去重值集合，按 (文件路径, 列名) 缓存。
+
+    不缓存的话，一列参与"和另一张表逐列比较"时会被反复重建几十上百次
+    （宽表两两比较是列数平方级的）；缓存后每列只构建一次，之后全是字典查找。
+    """
+    key = (table.file_path, col)
+    if key in value_set_cache:
+        return value_set_cache[key]
+    frame = _cached_frame(table.file_path, frame_cache)
+    if col not in frame.columns:
+        value_set_cache[key] = set()
+        return value_set_cache[key]
     try:
-        lset = table_io.column_value_set(left.file_path, lcol)
-        rset = table_io.column_value_set(right.file_path, rcol)
+        vset = {table_io._jsonable(v) for v in frame[col].dropna().tolist()}
     except Exception:  # noqa: BLE001
-        return 0.0
-    if not lset or not rset:
-        return 0.0
-    inter = len(lset & rset)
-    union = len(lset | rset)
-    return inter / union if union else 0.0
+        vset = set()
+    value_set_cache[key] = vset
+    return vset
+
+
+def _probe_overlap(lset: set, rset: set, probe_size: int = _PROBE_SIZE) -> bool:
+    """探测两个集合是否存在交集：取较小集合最多 `probe_size` 个值，看有没有命中
+    较大集合。较小集合本身不超过 `probe_size` 时是穷举（精确），只有较小集合本身
+    很大（几万+去重值）时才是抽样探测（可能漏判极稀疏的重叠，但这类情况本身
+    对关联判断的参考价值也低）。
+    """
+    smaller, larger = (lset, rset) if len(lset) <= len(rset) else (rset, lset)
+    if len(smaller) <= probe_size:
+        sample = smaller
+    else:
+        import random  # noqa: PLC0415
+        sample = random.sample(list(smaller), probe_size)
+    return any(v in larger for v in sample)
 
 
 def _build_relation_graph(tables: list[TableMeta], relations: list[Relation]) -> GraphData:
@@ -166,148 +292,5 @@ def _build_relation_graph(tables: list[TableMeta], relations: list[Relation]) ->
     return GraphData(nodes=nodes, edges=edges)
 
 
-# ===========================================================================
-# 业务流程推导
-# ===========================================================================
-def deduce_flow(scenario: Scenario) -> FlowResult:
-    tables = scenario.tables_meta
-    if not tables:
-        return FlowResult(summary="尚无业务表，无法推导流程。")
-
-    result_table = next((t for t in tables if _classify(t) == "result"), tables[-1])
-    rule_tables = [t for t in tables if _classify(t) == "rule"]
-    source_tables = [
-        t for t in tables if t.table_name != result_table.table_name and t not in rule_tables
-    ]
-    primary = source_tables[0] if source_tables else tables[0]
-
-    steps: list[FlowStep] = []
-    step_id = 1
-
-    # 步骤 1：从主业务表过滤有效数据
-    steps.append(
-        FlowStep(
-            step_id=step_id,
-            step_name="数据过滤",
-            operation="FILTER",
-            input_tables=[primary.table_name],
-            output="valid_rows",
-            logic="筛选有效状态/有效时间范围的记录",
-            description=f"从主业务表 {primary.table_name} 中筛选参与计算的有效记录。",
-            pseudo_sql=f"SELECT * FROM {primary.table_name} WHERE <有效条件>",
-        )
-    )
-    step_id += 1
-
-    # 步骤 2..n：逐一关联其他业务表
-    current = "valid_rows"
-    for other in source_tables[1:]:
-        steps.append(
-            FlowStep(
-                step_id=step_id,
-                step_name=f"关联 {other.table_name}",
-                operation="JOIN",
-                input_tables=[current, other.table_name],
-                output=f"joined_{step_id}",
-                logic=f"{current} JOIN {other.table_name} ON <关联键>",
-                description=f"将 {current} 与 {other.table_name} 按关联键连接，补充维度字段。",
-                pseudo_sql=f"SELECT * FROM {current} a JOIN {other.table_name} b ON a.<key> = b.<key>",
-            )
-        )
-        current = f"joined_{step_id}"
-        step_id += 1
-
-    # 规则表应用
-    if rule_tables:
-        rule = rule_tables[0]
-        steps.append(
-            FlowStep(
-                step_id=step_id,
-                step_name="应用业务规则",
-                operation="MAP",
-                input_tables=[current, rule.table_name],
-                output=f"ruled_{step_id}",
-                logic=f"依据 {rule.table_name} 中的规则映射/赋值",
-                description=f"按规则表 {rule.table_name} 对记录进行映射、赋值或校验。",
-                pseudo_sql=f"SELECT *, r.<value> FROM {current} c JOIN {rule.table_name} r ON c.<key> = r.<key>",
-            )
-        )
-        current = f"ruled_{step_id}"
-        step_id += 1
-
-    # 聚合
-    steps.append(
-        FlowStep(
-            step_id=step_id,
-            step_name="聚合汇总",
-            operation="AGGREGATE",
-            input_tables=[current],
-            output="summary",
-            logic="按维度分组并对数值字段求和/计数",
-            description="按业务维度分组聚合，得到汇总指标。",
-            pseudo_sql=f"SELECT <dims>, SUM(<metric>) FROM {current} GROUP BY <dims>",
-        )
-    )
-    step_id += 1
-
-    # 结果格式化
-    steps.append(
-        FlowStep(
-            step_id=step_id,
-            step_name="结果格式化",
-            operation="CALCULATE",
-            input_tables=["summary"],
-            output=result_table.table_name,
-            logic="计算占比/排名等衍生指标，对齐结果表结构",
-            description=f"对汇总数据计算衍生指标，并对齐目标结果表 {result_table.table_name} 的结构。",
-            pseudo_sql="SELECT *, metric / SUM(metric) OVER() AS ratio FROM summary ORDER BY metric DESC",
-        )
-    )
-
-    graph = _build_flow_graph(primary, steps, result_table)
-    summary = f"{len(steps)} 步业务流程：过滤 → 关联 → {'规则 → ' if rule_tables else ''}聚合 → 格式化。"
-    questions = ["上述步骤的关联键与聚合维度是否符合实际业务口径？请确认或修正。"]
-    return FlowResult(
-        flow_steps=steps, flow_graph=graph, ambiguous_questions=questions, summary=summary
-    )
-
-
-def _build_flow_graph(primary: TableMeta, steps: list[FlowStep], result: TableMeta) -> GraphData:
-    nodes = [GraphNode(id="input", label=primary.table_name, type="input")]
-    edges: list[GraphEdge] = []
-    prev = "input"
-    for step in steps:
-        nid = f"n{step.step_id}"
-        nodes.append(GraphNode(id=nid, label=step.step_name, type="process"))
-        edges.append(GraphEdge(source=prev, target=nid, label=step.operation))
-        prev = nid
-    nodes.append(GraphNode(id="output", label=result.table_name, type="output"))
-    edges.append(GraphEdge(source=prev, target="output", label="result"))
-    return GraphData(nodes=nodes, edges=edges)
-
-
-# ===========================================================================
-# 技能库生成（数据结构层面；落盘由 skill_builder 负责）
-# ===========================================================================
-def build_skill_specs(scenario: Scenario) -> list[Skill]:
-    steps = scenario.flow.flow_steps if scenario.flow else []
-    skills: list[Skill] = [
-        Skill(
-            skill_id="business_flow_executor",
-            name="业务流程总执行器",
-            operation="EXECUTE_ALL",
-            description="统一入口：对新传入的同结构数据，按序调用各子技能复刻完整业务流程并产出结果。",
-            is_main=True,
-        )
-    ]
-    for step in steps:
-        skills.append(
-            Skill(
-                skill_id=f"skill_{step.step_id}_{step.operation.lower()}",
-                name=step.step_name,
-                operation=step.operation,
-                description=step.description,
-                step_id=step.step_id,
-            )
-        )
-    return skills
+# 业务流程推导现已由 `inference.infer_flow` 负责（含字段语义 + 规则结构映射 + 节点能力描述）。
+# 本模块只保留关联推导启发式与公用图构建函数。

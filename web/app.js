@@ -1,9 +1,12 @@
 /* =========================================================================
- * 业务流逆向工程平台 —— 前端逻辑
+ * 业务流逆向工程平台 —— 前端逻辑（v1.0.3：5 步流程，上传时选角色）
  *
- * 交互原则（与后端接口划分一致）：
- *   - 与 AI 协作完成任务 → 走流式接口 POST /chat（SSE：思考/回答/工具调用实时呈现）
- *   - 对话记录、关系图谱、流程图谱、增删业务场景 → 走专用 REST 接口
+ * 工作流（5 步）：
+ *   ① 选文件 → 选角色 → 上传（合并为单个动作）
+ *   ② 推导关联（含字段语义）
+ *   ③ 推导业务流程（节点带能力描述 + 规则结构映射）
+ *   ④ 生成技能（按节点出技能 + 主技能）
+ *   ⑤ 执行（含校验）
  * ========================================================================= */
 
 'use strict';
@@ -12,12 +15,13 @@ const API = '/api';
 
 const STATE = {
   scenarios: [],
-  current: null,        // 当前业务场景对象
-  diagramMode: 'business', // business | relations | flow（流程/图谱标签）
+  current: null,
+  diagramMode: 'flow',          // relations | flow（v1.0.3：业务流程图替代旧 business 图）
   streaming: false,
-  auditTypes: null,     // 规则库违规类型（来自 /audit-types）
-  validations: [],      // 校验报告（来自 /validations）
-  businessProcess: null, // Phase 0 业务流程文档（来自 /business-process）
+  outputs: null,
+  validations: [],
+  pendingFiles: null,           // 上传待确认的文件列表
+  pendingRoles: {},             // {filename: role}
 };
 
 /* ----------------------------------------------------------------- 通用请求 */
@@ -37,7 +41,6 @@ async function http(method, path, body, isForm) {
   return res.json();
 }
 
-/* ----------------------------------------------------------------- 初始化 */
 document.addEventListener('DOMContentLoaded', async () => {
   setupDragDrop();
   setupDiagramPan();
@@ -77,7 +80,7 @@ function renderScenarioList() {
   const list = document.getElementById('scenario-list');
   list.innerHTML = STATE.scenarios.map(sc => {
     const dot = ['skills_generated', 'active'].includes(sc.status) ? 'active-dot'
-      : ['tables_uploaded', 'process_drafted', 'process_approved', 'relations_deduced', 'flow_deduced'].includes(sc.status) ? 'deducing' : '';
+      : ['tables_uploaded', 'relations_deduced', 'flow_deduced'].includes(sc.status) ? 'deducing' : '';
     const active = STATE.current && sc.id === STATE.current.id ? 'active' : '';
     return `<div class="scenario-item ${active}" onclick="selectScenario('${sc.id}')">
       <div class="scenario-dot ${dot}"></div>
@@ -98,37 +101,29 @@ async function selectScenario(id) {
   renderScenarioList();
   await loadHistory();
   renderDetails();
-  await loadAudit();
-  await loadBusinessProcess();
+  await loadOutputs();
   refreshDiagramToolbar();
   renderDiagram();
   renderGuide();
 }
 
-/* ----------------------------------------------------------------- 流程引导 */
-/* 6 步工作流（v1.0.1）：上传 → 关联 → 解析规则 → 执行审核 → 生成技能 → 使用 */
+/* ----------------------------------------------------------------- 5 步引导 */
 const WORKFLOW = [
-  { key: 'upload',   icon: '📎', label: '上传表格', done: sc => (sc.tables_meta || []).length > 0,
-    hint: '上传业务表 + 规则表 + 历史结果表（点下方上传区）。',
-    go: '上传表格', act: () => document.getElementById('file-input').click() },
-  { key: 'process', icon: '🧭', label: '梳理流程', done: sc => !!(sc.business_process && sc.business_process.approved),
-    hint: 'Phase 0：梳理业务流程并审批（识别输入/规则/结果表、生成流程图）。',
-    go: '梳理业务流程', act: () => sendQuick('梳理业务流程') },
-  { key: 'relations', icon: '🔗', label: '推导关联', done: sc => !!sc.relations,
-    hint: '让 AI 推导表间关联，生成 ER 关系图谱。',
-    go: '推导关联关系', act: () => sendQuick('推导表关联关系') },
-  { key: 'rules', icon: '📋', label: '解析规则', done: sc => !!(sc.rule_library && (sc.rule_library.templates || []).length),
-    hint: '把规则表解析成规则模板库（全部可审核的违规类型）。',
-    go: '解析规则库', act: () => sendQuick('解析规则库') },
-  { key: 'audit', icon: '🛡', label: '执行审核', done: sc => (sc.validations || []).some(v => v.passed),
-    hint: '选一条规则（如重复收费）在完整数据上执行，并与历史结果对照校验。',
-    go: '执行审核', act: () => sendQuick('执行审核（重复收费）并与历史结果对照校验') },
-  { key: 'skills', icon: '⚡', label: '生成技能', done: sc => (sc.skills || []).length > 0,
-    hint: '固化为参数化审核技能（list_audit_types / execute_audit）。',
-    go: '生成技能库', act: () => sendQuick('生成技能库') },
-  { key: 'use', icon: '✅', label: '已就绪', done: sc => sc.status === 'active',
-    hint: '技能已就绪：可对新数据动态执行任意违规类型的审核。',
-    go: '查看技能', act: () => switchTab('skills') },
+  { key: 'upload', icon: '📎', label: '① 上传(含角色)', done: sc => (sc.tables_meta || []).length > 0,
+    hint: '选择文件 → 为每个文件选角色（输入/规则/结果）→ 上传。',
+    go: '选择文件', act: () => document.getElementById('file-input').click() },
+  { key: 'relations', icon: '🔗', label: '② 推导关联+语义', done: sc => !!sc.relations,
+    hint: '推导表关联（ER）+ 每个字段的业务语义（PK/FK/DIM/METRIC/TIME/NL_TEXT/CATEGORY）。',
+    go: '推导关联', act: () => sendQuick('推导关联关系（含字段语义）') },
+  { key: 'flow', icon: '🔄', label: '③ 推导流程', done: sc => !!(sc.flow && (sc.flow.flow_steps || []).length),
+    hint: '每个节点带「该做什么/能做什么/数据怎么变化/模板算子」描述；若有规则表则附带规则结构映射。',
+    go: '推导业务流程', act: () => sendQuick('推导业务流程') },
+  { key: 'skills', icon: '⚡', label: '④ 生成技能', done: sc => (sc.skills || []).length > 0,
+    hint: '每个流程节点 → 一个节点子技能；外加主技能统一调度（list_outputs / produce）。',
+    go: '生成技能', act: () => sendQuick('生成技能库') },
+  { key: 'execute', icon: '▶', label: '⑤ 执行+校验', done: sc => (sc.validations || []).some(v => v.passed) || sc.status === 'active',
+    hint: '在完整数据上执行、复刻产出文件，并与历史结果对照校验。',
+    go: '执行产出', act: () => sendQuick('执行产出并对照历史结果') },
 ];
 
 function renderGuide() {
@@ -139,7 +134,6 @@ function renderGuide() {
   el.style.display = 'block';
 
   const states = WORKFLOW.map(s => s.done(sc));
-  // 当前步 = 第一个未完成的步骤
   let current = states.findIndex(d => !d);
   if (current === -1) current = WORKFLOW.length - 1;
 
@@ -153,7 +147,7 @@ function renderGuide() {
   const step = WORKFLOW[current];
   const allDone = states.every(Boolean);
   const hint = allDone
-    ? `<span>🎉 全部完成：可对新数据执行 <b>execute_audit(类型, 数据)</b>。</span>
+    ? `<span>🎉 全部完成：可对新数据 <b>produce(产出, 数据)</b> 复刻并输出文件。</span>
        <span class="wf-go" onclick="switchTab('skills')">查看技能 →</span>`
     : `<span>下一步：<b>${esc(step.label)}</b> —— ${esc(step.hint)}</span>
        <span class="wf-go" onclick="runGuideStep(${current})">${esc(step.go)} →</span>`;
@@ -166,71 +160,81 @@ function runGuideStep(i) {
   if (s && typeof s.act === 'function') s.act();
 }
 
-/* ----------------------------------------------------------------- 审核能力 */
-async function loadAudit() {
+/* ----------------------------------------------------------------- 产出 */
+async function loadOutputs() {
   if (!STATE.current) return;
   try {
-    const [at, vs] = await Promise.all([
-      http('GET', `/scenarios/${STATE.current.id}/audit-types`),
+    const [og, vs] = await Promise.all([
+      http('GET', `/scenarios/${STATE.current.id}/outputs`),
       http('GET', `/scenarios/${STATE.current.id}/validations`),
     ]);
-    STATE.auditTypes = at;
+    STATE.outputs = og;
     STATE.validations = vs || [];
-  } catch (_) { STATE.auditTypes = null; STATE.validations = []; }
-  renderAudit();
+  } catch (_) { STATE.outputs = null; STATE.validations = []; }
+  renderOutputs();
 }
 
 const STATE_LABEL = {
-  verified: '已校验✓', unverified: '可执行(未校验)', blocked: '缺数据/口径', parsed: '未细化',
+  verified: '已校验✓', executable: '可执行', blocked: '缺数据/口径', draft: '骨架(待细化)',
 };
-function renderAudit() {
-  const at = STATE.auditTypes;
-  const typesEl = document.getElementById('audit-types-detail');
+function renderOutputs() {
+  const og = STATE.outputs;
+  const typesEl = document.getElementById('outputs-detail');
   if (typesEl) {
-    const types = (at && at.violation_types) || [];
-    typesEl.innerHTML = types.length ? types.map(t => {
-      const vtSafe = esc(t.violation_type).replace(/'/g, "\\'");
-      const btn = t.has_sql
-        ? `<span class="btn-run-audit" onclick="runAudit('${vtSafe}')">▶ ${t.has_historical ? '校验' : '执行'}</span>`
+    const items = (og && og.outputs) || [];
+    typesEl.innerHTML = items.length ? items.map(o => {
+      const idSafe = esc(o.output_id).replace(/'/g, "\\'");
+      const btn = o.has_sql
+        ? `<span class="btn-run-audit" onclick="runProduce('${idSafe}')">▶ ${o.result_table ? '校验' : '执行'}</span>`
         : '';
+      const cols = (o.columns || []).slice(0, 8).join('、') + ((o.columns || []).length > 8 ? '…' : '');
       return `
       <div class="audit-card">
         <div class="audit-card-head">
-          <span class="audit-vt">${esc(t.violation_type)}</span>
-          <span class="audit-state st-${t.state}">${STATE_LABEL[t.state] || t.state}</span>
+          <span class="audit-vt">${esc(o.name)}</span>
+          <span class="audit-state st-${o.status}">${STATE_LABEL[o.status] || o.status}</span>
+          <span class="audit-state st-executable">📄 ${esc(o.fmt)}</span>
           ${btn}
         </div>
-        <div class="audit-meta">${t.rule_count} 条细则${t.has_sql ? ' · 有 SQL' : ''}${t.has_historical ? ' · 有历史结果表' : ''}</div>
+        <div class="audit-meta">策略 ${esc(o.strategy || '—')}${o.pipeline_steps ? ' · 管线 ' + o.pipeline_steps + ' 节点' : ''}${o.result_table ? ' · 历史：' + esc(o.result_table) : ''}</div>
+        <div class="audit-meta">输出列：${esc(cols) || '（未定）'}</div>
+        ${(o.external_data_needed || []).length ? `<div class="audit-meta" style="color:var(--amber)">缺：${esc(o.external_data_needed.join('、'))}</div>` : ''}
       </div>`;
-    }).join('') : '<div class="muted-tip">解析规则库后显示。对 AI 说「解析规则库」。</div>';
+    }).join('') : '<div class="muted-tip">推导业务流程并生成技能后显示。先把历史结果样例文件上传时选择「结果」角色。</div>';
   }
   const vEl = document.getElementById('validations-detail');
   if (vEl) {
-    vEl.innerHTML = (STATE.validations || []).length ? STATE.validations.map(v => `
-      <div class="valid-card ${v.passed ? 'pass' : 'fail'}">
-        <div><strong>${esc(v.violation_type)}</strong> ${v.passed ? '✅ 通过' : '⚠️ 未达标'}
-          <span style="color:var(--green)">命中率 ${Math.round((v.match_rate || 0) * 100)}%</span></div>
-        <div class="valid-stat">历史 ${v.historical_count} · 复刻 ${v.produced_count} · 命中 ${v.matched} · 缺失 ${v.missing} · 多出 ${v.extra}</div>
-        ${v.key_columns && v.key_columns.length ? `<div class="audit-meta">主键：${esc(v.key_columns.join(', '))}</div>` : ''}
-      </div>`).join('') : '<div class="muted-tip">执行审核校验后显示。</div>';
+    vEl.innerHTML = (STATE.validations || []).length ? STATE.validations.map(v => {
+      const statusText = v.error ? '❌ 执行失败' : (v.passed ? '✅ 已产出' : '⚠️ 结果为 0 行');
+      const dl = v.artifact_url
+        ? `<a class="dl-link" href="${esc(v.artifact_url)}" target="_blank" download>⬇ 下载产出文件</a>` : '';
+      return `
+      <div class="valid-card ${v.passed ? 'pass' : (v.error ? 'fail' : 'fail')}">
+        <div><strong>${esc(v.output_name || v.output_id)}</strong> ${statusText}
+          <span class="valid-count">${v.produced_count != null ? `共 ${v.produced_count} 行` : ''}</span>${dl}</div>
+        ${v.error ? `<div class="valid-stat">${esc(v.error)}</div>` : ''}
+      </div>`;
+    }).join('') : '<div class="muted-tip">执行产出后显示（含产出文件下载）。</div>';
   }
 }
 
-async function runAudit(violationType) {
+async function runProduce(outputId) {
   if (!STATE.current) return;
-  addUserBubble('执行审核校验：' + esc(violationType));
+  addUserBubble('执行产出：' + esc(outputId));
   const node = addAIStreaming();
   node.content.innerHTML = '<span class="typing-dots"><span></span><span></span><span></span></span>';
   try {
-    const rep = await http('POST', `/scenarios/${STATE.current.id}/audit`, { violation_type: violationType });
-    await loadAudit();
+    const rep = await http('POST', `/scenarios/${STATE.current.id}/produce`, { output_id: outputId });
+    await loadOutputs();
     STATE.current = await http('GET', '/scenarios/' + STATE.current.id);
     updateStatusBadge(STATE.current.status);
+    const dl = rep.artifact_url ? `\n\n[⬇ 下载产出文件](${rep.artifact_url})` : '';
+    const head = rep.error ? '❌ 执行失败' : (rep.passed ? '✅ 已产出' : '⚠️ 结果为 0 行');
     node.content.innerHTML = renderMarkdown(
-      `**${violationType}** 审核校验完成：${rep.passed ? '✅ 通过' : '⚠️ 未达标'}\n\n${rep.message}`);
-    switchTab('audit');
+      `**${esc(rep.output_name || outputId)}** 执行完成：${head}\n\n${rep.message}${dl}`);
+    switchTab('outputs');
   } catch (e) {
-    node.content.innerHTML = '❌ 校验失败：' + esc(e.message);
+    node.content.innerHTML = '❌ 执行失败：' + esc(e.message);
   }
   scrollChat();
 }
@@ -252,8 +256,8 @@ async function createScenario() {
   await selectScenario(sc.id);
   clearMessages();
   addAIBubble(`🎉 业务场景「<strong>${esc(name)}</strong>」创建成功！<br><br>
-    请上传业务数据表格（CSV/Excel），我会快速扫描结构（仅读表头+少量样本）。<br>
-    然后对我说「<strong>梳理业务流程</strong>」进入 Phase 0：先把业务讲清楚并经你批准，再开始逆向工程。`);
+    点击下方上传区，<strong>选择文件 → 为每个文件选角色（输入/规则/结果）→ 上传</strong>。<br>
+    上传完成后对我说「<strong>推导关联关系</strong>」开始第二步。`);
 }
 
 async function deleteScenario(id) {
@@ -264,6 +268,18 @@ async function deleteScenario(id) {
 }
 
 function deleteCurrentScenario() { if (STATE.current) deleteScenario(STATE.current.id); }
+
+/* 事后修正表角色（一般上传时已选） */
+async function setTableRole(tableName, role) {
+  if (!STATE.current) return;
+  try {
+    await http('PUT', `/scenarios/${STATE.current.id}/tables/${encodeURIComponent(tableName)}/role`, { role });
+    STATE.current = await http('GET', '/scenarios/' + STATE.current.id);
+    renderDetails();
+    await loadOutputs();
+    renderGuide();
+  } catch (e) { addAIBubble('❌ 设置角色失败：' + esc(e.message)); }
+}
 
 function resetWorkspace() {
   document.getElementById('topbar-name').textContent = '请选择或创建业务场景';
@@ -282,9 +298,8 @@ function resetWorkspace() {
 /* ----------------------------------------------------------------- 状态徽标 */
 const STATUS_LABEL = {
   created: '未开始', tables_uploaded: '表格已上传',
-  process_drafted: '流程待审批', process_approved: '流程已批准',
-  relations_deduced: '关系已推导',
-  rules_parsed: '规则已解析', flow_deduced: '流程已推导', validated: '已校验',
+  relations_deduced: '关联+语义已推导',
+  flow_deduced: '流程已推导',
   skills_generated: '技能已生成', active: '运行中'
 };
 function updateStatusBadge(status) {
@@ -294,24 +309,70 @@ function updateStatusBadge(status) {
   if (STATE.current) { STATE.current.status = status; renderGuide(); }
 }
 
-/* ----------------------------------------------------------------- 文件上传 */
-async function handleFileSelect(files) {
+/* ----------------------------------------------------------------- 文件上传（v1.0.3：选文件→选角色→上传） */
+function handleFileSelect(files) {
   if (!STATE.current) { addAIBubble('⚠️ 请先创建或选择一个业务场景，再上传表格。'); return; }
   if (!files || !files.length) return;
+  STATE.pendingFiles = Array.from(files);
+  STATE.pendingRoles = {};
+  const list = document.getElementById('upload-role-list');
+  list.innerHTML = STATE.pendingFiles.map((f, i) => {
+    const guess = guessRole(f.name);
+    STATE.pendingRoles[f.name] = guess;
+    const opt = (v, label) => `<option value="${v}" ${guess === v ? 'selected' : ''}>${label}</option>`;
+    return `<div class="role-pick-row">
+      <span class="role-pick-name">📄 ${esc(f.name)}</span>
+      <select class="role-pick-select" data-fname="${esc(f.name)}" onchange="onRolePick(this)">
+        ${opt('input', '业务输入')}${opt('rule', '规则/标准')}${opt('result', '历史结果')}
+      </select>
+    </div>`;
+  }).join('');
+  showModal('modal-upload-roles');
+}
+
+function guessRole(filename) {
+  const lower = filename.toLowerCase();
+  if (/(rule|规则|标准|清单|口径)/.test(filename) || /rule/.test(lower)) return 'rule';
+  if (/(result|结果|产出|违规|问题)/.test(filename) || /result/.test(lower)) return 'result';
+  return 'input';
+}
+
+function onRolePick(sel) {
+  const name = sel.dataset.fname;
+  STATE.pendingRoles[name] = sel.value;
+}
+
+function cancelUpload() {
+  closeModal('modal-upload-roles');
+  document.getElementById('file-input').value = '';
+  STATE.pendingFiles = null;
+  STATE.pendingRoles = {};
+}
+
+async function confirmUpload() {
+  if (!STATE.pendingFiles || !STATE.pendingFiles.length) { closeModal('modal-upload-roles'); return; }
+  closeModal('modal-upload-roles');
+  const files = STATE.pendingFiles;
+  const roleMap = {...STATE.pendingRoles};
+  STATE.pendingFiles = null;
+  STATE.pendingRoles = {};
+
   const form = new FormData();
-  Array.from(files).forEach(f => form.append('files', f));
-  addUserBubble('上传表格：' + Array.from(files).map(f => f.name).join('、'));
+  files.forEach(f => form.append('files', f));
+  form.append('roles', JSON.stringify(roleMap));
+
+  addUserBubble('上传表格：' + files.map(f => `${f.name}(${roleMap[f.name] || '?'})`).join('、'));
   const node = addAIStreaming();
   node.content.innerHTML = '<span class="typing-dots"><span></span><span></span><span></span></span>';
   try {
     const r = await http('POST', `/scenarios/${STATE.current.id}/uploads`, form, true);
     STATE.current = await http('GET', '/scenarios/' + STATE.current.id);
     updateStatusBadge(STATE.current.status);
-    renderDetails(); renderScenarioList(); await loadAudit(); renderGuide();
+    renderDetails(); renderScenarioList(); await loadOutputs(); renderGuide();
     const rows = (r.tables_meta || []).map(t =>
-      `📊 <strong>${esc(t.table_name)}</strong>：${t.row_count.toLocaleString()} 行 × ${t.col_count} 列`).join('<br>');
-    node.content.innerHTML = `✅ 已上传并扫描 ${r.tables_meta.length} 张表：<br><br>${rows}<br><br>
-      切到「表格」标签可看字段详情；接着对我说「<strong>梳理业务流程</strong>」开始 Phase 0（业务流程发现与审批）。`;
+      `📊 <strong>${esc(t.table_name)}</strong>[${esc(t.role)}]：${t.row_count.toLocaleString()} 行 × ${t.col_count} 列`).join('<br>');
+    node.content.innerHTML = `✅ 已上传 ${r.tables_meta.length} 张表（含角色）：<br><br>${rows}<br><br>
+      下一步：对我说「<strong>推导关联关系</strong>」（会一并推断字段的业务语义）。`;
   } catch (e) {
     node.content.innerHTML = '❌ 上传失败：' + esc(e.message);
   }
@@ -323,7 +384,7 @@ async function loadHistory() {
   clearMessages();
   const msgs = await http('GET', `/scenarios/${STATE.current.id}/messages`);
   if (!msgs.length) {
-    addAIBubble('👋 你好！我是业务流逆向工程助手。上传业务表格后，对我说「梳理业务流程」开始 Phase 0（业务流程发现与审批），随后再逐阶段推导。');
+    addAIBubble('👋 你好！业务流逆向工程助手就绪。<br>5 步流程：① 上传(选角色) → ② 推关联+字段语义 → ③ 推流程(节点带能力) → ④ 生成技能 → ⑤ 执行+校验。');
     return;
   }
   msgs.forEach(m => {
@@ -380,7 +441,6 @@ async function streamChat(message) {
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
-      // SSE 帧以空行分隔
       let idx;
       while ((idx = buffer.indexOf('\n\n')) !== -1) {
         const frame = buffer.slice(0, idx);
@@ -444,65 +504,27 @@ function handleEvent(ev, node, onContentStart, onContentDelta) {
   }
 }
 
-/* 资源更新：重新拉取并刷新对应视图（走专用 REST 接口） */
 async function onResourceRefresh(resource) {
   if (!STATE.current) return;
   STATE.current = await http('GET', '/scenarios/' + STATE.current.id);
   renderDetails();
   if (resource === 'relations') STATE.diagramMode = 'relations';
   if (resource === 'flow') STATE.diagramMode = 'flow';
-  if (resource === 'business_process') { STATE.diagramMode = 'business'; await loadBusinessProcess(); }
-  if (resource === 'rules' || resource === 'validations') { await loadAudit(); }
+  if (resource === 'tables') { renderDetails(); }
+  if (['outputs', 'validations'].includes(resource)) { await loadOutputs(); }
   refreshDiagramToolbar();
-  renderDiagram();
+  if (resource === 'flow') {
+    switchTab('flow');   // 自动切到流程图谱 tab，switchTab 内部已调用 renderDiagram()
+  } else if (resource === 'skills') {
+    switchTab('skills'); // 自动切到技能 tab
+  } else {
+    renderDiagram();
+  }
   renderScenarioList();
   renderGuide();
 }
 
-/* ----------------------------------------------------------------- Phase 0：业务流程文档 */
-async function loadBusinessProcess() {
-  if (!STATE.current) { STATE.businessProcess = null; renderBusinessProcess(); return; }
-  let bp = null;
-  try { bp = await http('GET', `/scenarios/${STATE.current.id}/business-process`); } catch (_) {}
-  STATE.businessProcess = (bp && bp.markdown) ? bp : null;
-  renderBusinessProcess();
-}
-
-function renderBusinessProcess() {
-  const el = document.getElementById('business-process-detail');
-  if (!el) return;
-  const bp = STATE.businessProcess;
-  if (!bp || !bp.markdown) {
-    el.innerHTML = '<div class="muted-tip">梳理业务流程后显示。对 AI 说「梳理业务流程」生成文档。</div>';
-    return;
-  }
-  const badge = bp.approved
-    ? '<span class="bp-badge approved">已批准 ✓</span>'
-    : '<span class="bp-badge pending">待审批</span>';
-  const actions = bp.approved
-    ? '<button class="btn btn-ghost" onclick="approveProcess(false)">撤销批准</button>'
-    : `<button class="btn btn-primary" onclick="approveProcess(true)">✅ 批准</button>
-       <button class="btn btn-ghost" onclick="sendQuick('梳理业务流程')">重新梳理</button>`;
-  el.innerHTML = `<div class="bp-approval">${badge}<span style="flex:1"></span>${actions}</div>
-    <div class="bp-doc">${renderMarkdown(bp.markdown)}</div>`;
-}
-
-async function approveProcess(approved, feedback) {
-  if (!STATE.current) return;
-  try {
-    await http('POST', `/scenarios/${STATE.current.id}/business-process/approve`,
-      { approved: !!approved, feedback: feedback || '' });
-    STATE.current = await http('GET', '/scenarios/' + STATE.current.id);
-    updateStatusBadge(STATE.current.status);
-    await loadBusinessProcess();
-    renderGuide(); renderScenarioList();
-    addAIBubble(approved
-      ? '✅ 业务流程文档已批准（Phase 0 完成）。下一步可说「<strong>推导关联关系</strong>」进入 Phase 1。'
-      : '↩️ 已撤销批准。可「重新梳理」业务流程，或补充修改意见。');
-  } catch (e) { addAIBubble('❌ 审批失败：' + esc(e.message)); }
-}
-
-/* 结构化交互（Section 5）：把 interaction 块渲染成表单 */
+/* 结构化交互：把 interaction 块渲染成表单 */
 function renderInteraction(node, it) {
   if (!it || !node) return;
   const box = document.createElement('div');
@@ -529,11 +551,6 @@ function renderInteraction(node, it) {
 
 async function answerInteraction(box, it, text, idx) {
   box.classList.add('answered');
-  // Phase 0 审批：首个选项＝批准（走 REST，不当作普通对话）
-  if (it.context === 'phase0_approval' && idx === 0) {
-    await approveProcess(true);
-    return;
-  }
   if (!text) return;
   addUserBubble(esc(text));
   await streamChat(text);
@@ -559,7 +576,6 @@ function addAIBubble(html) {
   c.appendChild(div); scrollChat();
 }
 
-/* 创建一个可流式更新的 AI 消息节点，返回操作句柄 */
 function addAIStreaming() {
   const c = document.getElementById('chat-messages');
   const wrap = document.createElement('div');
@@ -613,58 +629,179 @@ function addAIStreaming() {
   return node;
 }
 
-/* ----------------------------------------------------------------- 详情渲染 */
+/* ----------------------------------------------------------------- 详情渲染（v1.0.3：字段语义 + 节点能力） */
 function renderDetails() {
   const sc = STATE.current;
   if (!sc) return;
 
-  document.getElementById('tables-detail').innerHTML = (sc.tables_meta || []).map(t => `
+  document.getElementById('tables-detail').innerHTML = (sc.tables_meta || []).map(t => {
+    const nameSafe = esc(t.table_name).replace(/'/g, "\\'");
+    const role = t.role || 'unknown';
+    const opt = (v, label) => `<option value="${v}" ${role === v ? 'selected' : ''}>${label}</option>`;
+    const roleSel = `<select class="role-select role-${role}" title="表角色（上传时已选，事后修正用）"
+        onchange="setTableRole('${nameSafe}', this.value)">
+        ${opt('unknown', '· 未标注')}${opt('input', '输入表')}${opt('rule', '规则表')}${opt('result', '结果表')}
+      </select>`;
+    return `
     <div class="table-card">
       <div class="table-card-header">
         <span class="table-card-name">📊 ${esc(t.table_name)}</span>
+        ${roleSel}
         <span class="table-card-meta">${(t.row_count || 0).toLocaleString()} 行 · ${t.col_count} 列</span>
-        ${t.header_row > 0 ? `<span class="table-card-meta" style="color:var(--amber)" title="已自动跳过上方 ${t.header_row} 行标题/空行">表头@第${t.header_row + 1}行</span>` : ''}
+        ${t.header_row > 0 ? `<span class="table-card-meta" style="color:var(--amber)">表头@第${t.header_row + 1}行</span>` : ''}
       </div>
-      <div class="col-chips">${(t.columns || []).map(col =>
-        `<span class="col-chip">${esc(col.name)}<span style="color:var(--muted);margin-left:2px">${esc(col.dtype)}</span></span>`).join('')}</div>
-    </div>`).join('') || '<div class="muted-tip">暂无表格，请上传业务数据。</div>';
+      <div class="col-chips">${(t.columns || []).map(col => {
+        const role = col.semantic_role || 'UNKNOWN';
+        const sem = col.semantic && col.semantic !== col.name ? `<span class="col-chip-sem">· ${esc(col.semantic)}</span>` : '';
+        return `<span class="col-chip role-${role}" title="${esc(col.semantic || '')} (${role}, ${esc(col.dtype || '')})">${esc(col.name)}${sem}</span>`;
+      }).join('')}</div>
+    </div>`;
+  }).join('') || '<div class="muted-tip">暂无表格，请上传业务数据（上传时选择角色）。</div>';
 
   const rels = (sc.relations && sc.relations.relations) || [];
-  document.getElementById('relations-detail').innerHTML = rels.map(r => `
-    <div class="relation-card">
-      <span class="rel-from">${esc(r.from_table)}.${esc(r.from_column)}</span>
+  document.getElementById('relations-detail').innerHTML = rels.map(r => {
+    const fromCols = (r.from_columns && r.from_columns.length > 1) ? r.from_columns.join('+') : r.from_column;
+    const toCols = (r.to_columns && r.to_columns.length > 1) ? r.to_columns.join('+') : r.to_column;
+    const payload = JSON.stringify({
+      from_table: r.from_table, from_column: r.from_column, to_table: r.to_table, to_column: r.to_column,
+      from_columns: r.from_columns || [r.from_column], to_columns: r.to_columns || [r.to_column],
+      relation_type: r.relation_type,
+    }).replace(/'/g, '&#39;').replace(/"/g, '&quot;');
+    return `
+    <div class="relation-card ${r.confirmed ? 'confirmed' : ''}">
+      <span class="rel-from">${esc(r.from_table)}.${esc(fromCols)}</span>
       <span class="rel-arrow">→</span>
-      <span class="rel-to">${esc(r.to_table)}.${esc(r.to_column)}</span>
+      <span class="rel-to">${esc(r.to_table)}.${esc(toCols)}</span>
       <span style="font-size:10px;color:var(--muted)">${esc(r.relation_type)}</span>
       <span class="rel-conf">${Math.round((r.confidence || 0) * 100)}%</span>
-    </div>`).join('') || '<div class="muted-tip">推导关联关系后显示。</div>';
+      ${r.confirmed
+        ? `<span class="rel-confirmed-badge">✓ 已人工确认</span>
+           <span class="rel-confirm-btn" onclick='toggleRelationConfirm(${payload}, false)'>取消确认</span>`
+        : `<span class="rel-confirm-btn" onclick='toggleRelationConfirm(${payload}, true)'>✓ 确认此关联</span>`}
+    </div>`;
+  }).join('') || '<div class="muted-tip">推导关联关系后显示。</div>';
 
   const steps = (sc.flow && sc.flow.flow_steps) || [];
-  document.getElementById('flow-detail').innerHTML = steps.map(s => `
+  document.getElementById('flow-detail').innerHTML = steps.map(s => {
+    const statusCls = s.status === 'blocked' ? 'blocked' : (s.status === 'executable' ? '' : 'draft');
+    return `
     <div class="flow-step-card">
       <div class="flow-step-header">
         <div class="flow-step-num">${s.step_id}</div>
         <div class="flow-step-name">${esc(s.step_name)}</div>
-        <div class="flow-step-op">${esc(s.operation)}</div>
+        <div class="flow-step-op">${esc(s.operation || '')}</div>
+        ${s.template_kind ? `<div class="flow-step-tpl">${esc(s.template_kind)}</div>` : ''}
+        <div class="flow-step-status ${statusCls}">${esc(s.status || 'draft')}</div>
       </div>
-      <div class="flow-step-desc">${esc(s.description)}</div>
-      ${s.pseudo_sql ? `<div class="flow-sql">${esc(s.pseudo_sql)}</div>` : ''}
-    </div>`).join('') || '<div class="muted-tip">推导业务流程后显示。</div>';
+      <div class="flow-cap-grid">
+        ${s.purpose ? `<div class="flow-cap-key">该做什么</div><div class="flow-cap-val">${esc(s.purpose)}</div>` : ''}
+        ${s.capability ? `<div class="flow-cap-key">能做什么</div><div class="flow-cap-val">${esc(s.capability)}</div>` : ''}
+        ${(s.data_in || []).length ? `<div class="flow-cap-key">数据输入</div><div class="flow-cap-val">${(s.data_in || []).map(esc).join('<br>')}</div>` : ''}
+        ${(s.data_out || []).length ? `<div class="flow-cap-key">数据输出</div><div class="flow-cap-val">${(s.data_out || []).map(esc).join('<br>')}</div>` : ''}
+        ${(s.external_data_needed || []).length ? `<div class="flow-cap-key" style="color:var(--amber)">缺</div><div class="flow-cap-val" style="color:var(--amber)">${(s.external_data_needed || []).map(esc).join('；')}</div>` : ''}
+      </div>
+      ${s.sql ? `<div class="flow-sql">${esc(s.sql.slice(0, 500))}${s.sql.length > 500 ? '…' : ''}</div>` : ''}
+    </div>`;
+  }).join('') || '<div class="muted-tip">推导业务流程后显示（节点带能力描述）。</div>';
 
-  document.getElementById('skills-detail').innerHTML = (sc.skills || []).map(s => `
-    <div class="skill-card ${s.is_evolved ? 'evolved' : ''}">
+  document.getElementById('skills-detail').innerHTML = (sc.skills || []).map(s => {
+    // const cls = s.is_main ? 'main' : (s.is_evolved ? 'evolved' : '');
+    return `
+    <div class="skill-card">
       <div class="skill-card-header">
         <span>${s.is_main ? '⚙️' : s.is_evolved ? '🧬' : '🔧'}</span>
         <span class="skill-name">${esc(s.name)}</span>
-        <span class="skill-op">${esc(s.operation)}</span>
+        <span class="skill-op">${esc(s.operation || '')}</span>
       </div>
-      <div class="skill-desc">${esc(s.description)}</div>
-    </div>`).join('') || '<div class="muted-tip">生成技能库后显示。</div>';
+      <div class="skill-desc">${esc(s.description || '')}</div>
+      ${s.capability ? `<div class="skill-cap">→ ${esc(s.capability)}</div>` : ''}
+    </div>`;
+  }).join('') || '<div class="muted-tip">生成技能后显示。</div>';
 
   renderScenarioList();
 }
 
-/* ----------------------------------------------------------------- 图谱 / 图表 */
+/* ----------------------------------------------------------------- 关联关系人工确认 */
+async function toggleRelationConfirm(payload, confirm) {
+  if (!STATE.current) return;
+  try {
+    if (confirm) {
+      await http('POST', `/scenarios/${STATE.current.id}/relations/confirm`, payload);
+    } else {
+      await http('DELETE', `/scenarios/${STATE.current.id}/relations/confirm`, payload);
+    }
+    STATE.current = await http('GET', '/scenarios/' + STATE.current.id);
+    renderDetails();
+  } catch (e) {
+    alert('操作失败：' + e.message);
+  }
+}
+
+/* ----------------------------------------------------------------- 追踪驱动采样（因果链核对） */
+async function loadTraceSample() {
+  if (!STATE.current) return;
+  const el = document.getElementById('trace-sample-detail');
+  if (!el) return;
+  el.innerHTML = '<div class="muted-tip">正在以结果表为入口逆向追踪各表关联行…</div>';
+  try {
+    const r = await http('GET', `/scenarios/${STATE.current.id}/trace-sample`);
+    renderTraceSample(el, r);
+  } catch (e) {
+    el.innerHTML = `<div class="muted-tip">追踪采样失败：${esc(e.message)}</div>`;
+  }
+}
+
+function renderTraceSample(el, r) {
+  if (r.degraded) {
+    el.innerHTML = `<div class="trace-summary-bar" style="color:var(--rose)">⚠️ ${esc(r.trace_summary || '无结果表，已降级为各表独立随机采样，样本间无因果关联')}</div>`;
+    return;
+  }
+  const check = r.connectivity_check || {};
+  const checkColor = check.level === 'pass' ? 'var(--green)' : (check.level === 'warning' ? 'var(--amber)' : 'var(--rose)');
+  let html = `<div class="trace-summary-bar" style="color:${checkColor}">
+    ${check.level === 'pass' ? '✅' : check.level === 'warning' ? '⚠️' : '❌'} ${esc(check.message || r.trace_summary || '')}
+  </div>`;
+
+  if ((r.result_sample || []).length) {
+    html += `<div class="trace-card" style="border-left-color:var(--green)">
+      <div class="trace-card-head">
+        <span class="trace-name">🎯 ${esc(r.result_table || '结果表')}</span>
+        <span class="trace-badge high">追踪入口（结果行）</span>
+      </div>
+      <div class="trace-rows">${esc(JSON.stringify(r.result_sample[0], null, 2))}</div>
+    </div>`;
+  }
+
+  const map = r.trace_map || {};
+  const names = Object.keys(map);
+  if (!names.length) {
+    html += '<div class="muted-tip">没有其它表参与追踪。</div>';
+  }
+  names.forEach(name => {
+    const info = map[name] || {};
+    const isRandom = info.matched_by === 'random';
+    const rows = info.matched_rows || [];
+    html += `<div class="trace-card ${isRandom ? 'random' : ''}">
+      <div class="trace-card-head">
+        <span class="trace-name">${esc(name)}</span>
+        <span class="trace-badge ${isRandom ? 'random' : (info.trace_confidence || 'low')}">${isRandom ? '随机兜底（未追到关联）' : '置信度:' + esc(info.trace_confidence || '?')}</span>
+        ${!isRandom ? `<span class="trace-by">关联键：${esc(info.matched_by || '?')}</span>` : ''}
+        <span class="trace-by">共 ${rows.length} 行</span>
+      </div>
+      ${info.warning ? `<div class="trace-warning">${esc(info.warning)}</div>` : ''}
+      ${isRandom ? '<div class="trace-warning">这张表没有追到与结果行相关的真实数据，下面只是该表的随机前几行——AI 若据此推导关联/流程，可信度低，请留意结果里对应的待确认问题。</div>' : ''}
+      ${rows.length ? `<div class="trace-rows">${esc(JSON.stringify(rows.slice(0, 2), null, 2))}</div>` : ''}
+    </div>`;
+  });
+
+  const unmatched = r.unmatched_tables || [];
+  if (unmatched.length) {
+    html += `<div class="muted-tip">完全追不上的表：${esc(unmatched.join('、'))}</div>`;
+  }
+  el.innerHTML = html;
+}
+
+/* ----------------------------------------------------------------- 图谱 */
 let _mermaidReady = false;
 function initMermaid() {
   if (_mermaidReady || typeof mermaid === 'undefined') return;
@@ -677,22 +814,21 @@ function initMermaid() {
 function diagramAvailability() {
   const sc = STATE.current;
   return {
-    business: !!(sc && sc.business_process && sc.business_process.mermaid),
     relations: !!(sc && sc.relations && (sc.relations.graph_data.nodes || []).length),
-    flow: !!(sc && sc.flow && (sc.flow.flow_graph.nodes || []).length),
+    flow: !!(sc && sc.flow && ((sc.flow.mermaid && sc.flow.mermaid.trim()) || (sc.flow.flow_graph.nodes || []).length)),
   };
 }
 
 function refreshDiagramToolbar() {
   const av = diagramAvailability();
-  ['business', 'relations', 'flow'].forEach(m => {
+  ['relations', 'flow'].forEach(m => {
     const el = document.getElementById('dg-' + m);
     if (el) el.style.display = av[m] ? '' : 'none';
   });
   if (!av[STATE.diagramMode]) {
-    STATE.diagramMode = av.business ? 'business' : av.relations ? 'relations' : av.flow ? 'flow' : 'business';
+    STATE.diagramMode = av.flow ? 'flow' : av.relations ? 'relations' : 'flow';
   }
-  ['business', 'relations', 'flow'].forEach(m => {
+  ['relations', 'flow'].forEach(m => {
     const el = document.getElementById('dg-' + m);
     if (el) el.classList.toggle('active', STATE.diagramMode === m);
   });
@@ -712,8 +848,8 @@ async function renderDiagram() {
   const av = diagramAvailability();
   if (!sc || !av[STATE.diagramMode]) { empty.style.display = 'flex'; return; }
   empty.style.display = 'none';
-  if (STATE.diagramMode === 'business') {
-    await renderMermaidInto(host, sc.business_process.mermaid);
+  if (STATE.diagramMode === 'flow' && sc.flow && sc.flow.mermaid && sc.flow.mermaid.trim()) {
+    await renderMermaidInto(host, sc.flow.mermaid);
     host.style.display = 'block';
   } else {
     const graph = STATE.diagramMode === 'flow' ? sc.flow.flow_graph : sc.relations.graph_data;
@@ -725,7 +861,7 @@ async function renderDiagram() {
 async function renderMermaidInto(host, code) {
   initMermaid();
   if (typeof mermaid === 'undefined' || !_mermaidReady) {
-    host.innerHTML = '<pre style="color:var(--text-secondary);padding:10px">（Mermaid 库未加载，显示源码）\n\n' + esc(code) + '</pre>';
+    host.innerHTML = '<pre style="color:var(--text-secondary);padding:10px">' + esc(code) + '</pre>';
     return;
   }
   try {
@@ -736,7 +872,6 @@ async function renderMermaidInto(host, code) {
   }
 }
 
-/* 缩放 / 平移 */
 const VIEW = { scale: 1, x: 12, y: 12, drag: false, sx: 0, sy: 0 };
 function applyView() {
   const pan = document.getElementById('diagram-pan');
@@ -835,7 +970,7 @@ async function evolveSkill() {
   } catch (e) { alert('添加失败：' + e.message); }
 }
 
-/* ----------------------------------------------------------------- Tab 切换（中央面板） */
+/* ----------------------------------------------------------------- Tab 切换 */
 function switchTab(tab) {
   document.querySelectorAll('.center-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
   document.querySelectorAll('.center-content').forEach(c => c.style.display = 'none');
@@ -856,11 +991,12 @@ function esc(s) {
 }
 function escSvg(s) { return esc(s); }
 
-/* 轻量 Markdown：支持标题、有序/无序列表、代码块、引用、行内代码与粗体（全程转义，安全） */
 function mdInline(s) {
   let t = esc(s);
   t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
   t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  t = t.replace(/\[([^\]]+)\]\((\/[^)\s]+|https?:\/\/[^)\s]+)\)/g,
+    '<a href="$2" target="_blank" class="dl-link" download>$1</a>');
   return t;
 }
 function renderMarkdown(text) {

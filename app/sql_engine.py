@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import pandas as pd
 
@@ -25,36 +24,92 @@ from . import table_io
 def read_table(path: str) -> pd.DataFrame:
     """读取一张表为 DataFrame（自动识别表头，兼容 CSV/TSV/Excel）。
 
-    Excel 读取慢（openpyxl），首次读取后落一份 parquet 缓存；后续命中缓存秒级返回，
-    以满足「百万行级、10 秒内」的运行时目标（规范 Section 5）。
+    首次读取后落一份缓存（pickle 兼容混合 dtype），后续命中缓存秒级返回。
     """
     p = Path(path)
-    cache = p.with_suffix(p.suffix + ".cache.parquet")
+    cache_pkl = p.with_suffix(p.suffix + ".cache.pkl")
+    cache_pq = p.with_suffix(p.suffix + ".cache.parquet")
     try:
-        if cache.exists() and cache.stat().st_mtime >= p.stat().st_mtime:
-            return pd.read_parquet(cache)
-    except Exception:  # noqa: BLE001  缓存不可用则照常读源文件
+        if cache_pkl.exists() and cache_pkl.stat().st_mtime >= p.stat().st_mtime:
+            return pd.read_pickle(cache_pkl)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if cache_pq.exists() and cache_pq.stat().st_mtime >= p.stat().st_mtime:
+            return pd.read_parquet(cache_pq)
+    except Exception:  # noqa: BLE001
         pass
     df = table_io.load_full_frame(path)
     try:
-        df.to_parquet(cache, index=False)
-    except Exception:  # noqa: BLE001  无 parquet 引擎时跳过缓存，不影响正确性
+        df.to_pickle(cache_pkl)
+    except Exception:  # noqa: BLE001
         pass
     return df
 
 
-def run_sql(sql: str, tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """把 tables 注册为 DuckDB 视图并执行 SQL，返回结果 DataFrame。
+def _split_sql_statements(sql: str) -> list[str]:
+    """把多语句 SQL 按分号切分，**尊重单/双引号内的分号**。
 
-    任何执行错误都向上抛出（调用方负责连同 SQL 一起记录/上报）。
+    这是为了让 pipeline 的多个 `CREATE OR REPLACE VIEW ...; ... ; SELECT ...` 能在
+    同一 DuckDB 连接里依次执行 —— 上游节点的 VIEW 对下游节点可见。
+    """
+    out: list[str] = []
+    buf: list[str] = []
+    in_s = False    # 单引号内
+    in_d = False    # 双引号内
+    in_line_comment = False
+    for ch in sql:
+        if in_line_comment:
+            buf.append(ch)
+            if ch == "\n":
+                in_line_comment = False
+            continue
+        if ch == "'" and not in_d:
+            in_s = not in_s
+        elif ch == '"' and not in_s:
+            in_d = not in_d
+        elif ch == "-" and buf and buf[-1] == "-" and not in_s and not in_d:
+            in_line_comment = True
+        elif ch == ";" and not in_s and not in_d:
+            stmt = "".join(buf).strip()
+            if stmt:
+                out.append(stmt)
+            buf = []
+            continue
+        buf.append(ch)
+    tail = "".join(buf).strip()
+    if tail:
+        out.append(tail)
+    return out
+
+
+def run_sql(sql: str, tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """把 tables 注册为 DuckDB 视图并执行 SQL，返回**最后一个查询语句**的结果 DataFrame。
+
+    支持多语句 SQL（用 `;` 分隔）：例如 pipeline 模式下，前 N 个语句创建视图、最后一个
+    SELECT 返回结果。如果脚本中没有任何 SELECT 语句，则返回空 DataFrame。
+
+    任何执行错误都向上抛出（调用方负责连同实际执行的 SQL 一起上报）。
     """
     import duckdb
+
+    statements = _split_sql_statements(sql)
+    if not statements:
+        return pd.DataFrame()
 
     con = duckdb.connect()
     try:
         for name, df in tables.items():
             con.register(name, df)
-        return con.execute(sql).fetchdf()
+        last_result: pd.DataFrame = pd.DataFrame()
+        for stmt in statements:
+            cur = con.execute(stmt)
+            try:
+                # 只有 SELECT/RETURNING 等才有 fetchdf 结果；CREATE VIEW 等忽略
+                last_result = cur.fetchdf()
+            except Exception:  # noqa: BLE001
+                continue
+        return last_result
     finally:
         con.close()
 
@@ -82,22 +137,3 @@ def execute_template_sql(
     return result, sql
 
 
-def map_folder_to_tables(folder: str, table_names: list[str]) -> dict[str, str]:
-    """把一个数据文件夹映射为 {表名: 文件路径}：按文件名（去后缀）与表名匹配。"""
-    p = Path(folder)
-    files = {f.stem: str(f) for f in p.iterdir()
-             if f.suffix.lower() in (".csv", ".tsv", ".xlsx", ".xls")} if p.is_dir() else {}
-    mapping: dict[str, str] = {}
-    for name in table_names:
-        if name in files:
-            mapping[name] = files[name]
-    return mapping
-
-
-def jsonable_records(df: pd.DataFrame, limit: int | None = None) -> list[dict[str, Any]]:
-    """把 DataFrame 前若干行转为可 JSON 序列化的 records。"""
-    sub = df.head(limit) if limit else df
-    out: list[dict[str, Any]] = []
-    for _, row in sub.iterrows():
-        out.append({str(k): table_io._jsonable(v) for k, v in row.to_dict().items()})
-    return out

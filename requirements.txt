@@ -1,29 +1,20 @@
-# 业务能力蒸馏平台 —— 依赖
-
-# AI 推理层（OpenAI 兼容接口接入 MiniMax）
+# 业务流逆向工程引擎 —— 基础依赖（严格遵循文档指定版本）
 langchain>=1.3.0
+langgraph==1.2.4
 langchain-openai==1.2.1
+deepagents==0.6.8
 
-# Web 服务
+# Web 服务与流式响应（SSE）
 fastapi>=0.115.0
 uvicorn>=0.32.0
+sse-starlette>=2.3.0
 python-multipart>=0.0.9
 
-# 配置
+# 配置与数据处理
 pydantic>=2.10.0
 pydantic-settings>=2.7.0
 python-dotenv>=1.0.0
-
-# 数据处理 / 元数据采样 / 执行引擎
 pandas>=2.2.0
-numpy>=1.26.0
 openpyxl>=3.1.0
-
-# 反推逻辑：决策树/回归拟合（符号回归为内置轻量实现）
-scikit-learn>=1.4.0
-joblib>=1.3.0
-
-# 输出格式复刻
-python-docx>=1.1.0
-# reportlab>=4.0.0   # 可选：PDF 输出；缺失时降级为 Markdown
-# duckdb>=0.10.0     # 可选：动态 SQL 执行；缺失时使用 Pandas
+python-calamine>=0.7.0  # 大 Excel 表整表加载用（关联/追踪采样需要搜全表，实测比 openpyxl 快 5倍+）
+duckdb>=1.1.0  # 技能运行时：在新数据上跑 SQL 模板（规范 Section 7）
