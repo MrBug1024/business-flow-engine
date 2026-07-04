@@ -6,13 +6,13 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
 from ..chat_service import stream_chat
-from ..models import ChatMessage, ChatRequest
+from ..models import ChatMessage, ChatRequest, Scenario
 from ..storage import store
-from .deps import get_scenario_or_404
+from .deps import get_owned_scenario_or_404
 
 router = APIRouter(tags=["chat"])
 
@@ -25,9 +25,10 @@ _SSE_HEADERS = {
 
 
 @router.post("/scenarios/{scenario_id}/chat")
-async def chat(scenario_id: str, req: ChatRequest) -> StreamingResponse:
+async def chat(
+    req: ChatRequest, scenario: Scenario = Depends(get_owned_scenario_or_404)
+) -> StreamingResponse:
     """与 AI 流式对话。返回 SSE 事件流（thinking/content/tool_call/refresh/...）。"""
-    scenario = get_scenario_or_404(scenario_id)
     return StreamingResponse(
         stream_chat(scenario, req.message.strip()),
         media_type="text/event-stream",
@@ -36,7 +37,6 @@ async def chat(scenario_id: str, req: ChatRequest) -> StreamingResponse:
 
 
 @router.get("/scenarios/{scenario_id}/messages", response_model=list[ChatMessage])
-def get_messages(scenario_id: str) -> list[ChatMessage]:
+def get_messages(scenario: Scenario = Depends(get_owned_scenario_or_404)) -> list[ChatMessage]:
     """获取业务场景的历史对话记录。"""
-    get_scenario_or_404(scenario_id)
-    return store.get_messages(scenario_id)
+    return store.get_messages(scenario.id)

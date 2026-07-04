@@ -10,15 +10,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
 from ..models import ChatMessage, ChatRequest
 from ..storage import store
 from ..verify_service import stream_verify
-from .deps import get_scenario_or_404
+from .deps import get_owned_scenario_or_404, get_scenario_or_404
 
-router = APIRouter(tags=["verify"])
+# 所有端点均为 /scenarios/{scenario_id}/verify/...，路由级强制登录 + 归属校验。
+router = APIRouter(tags=["verify"], dependencies=[Depends(get_owned_scenario_or_404)])
 
 _ALLOWED_SUFFIX = {".csv", ".tsv", ".xlsx", ".xls", ".json"}
 

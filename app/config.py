@@ -36,6 +36,19 @@ class Settings(BaseSettings):
 
     # ===== 数据存储 =====
     data_dir: str = "data"
+    # 系统数据（用户/会话等）目录：SQLite 落盘于此，随项目走、不依赖外部数据库
+    system_dir: str = "system"
+
+    # ===== 鉴权（JWT + 可插拔 OAuth） =====
+    jwt_secret: str = "change-me-in-production-please"
+    jwt_expire_hours: int = 168
+    # 前端地址（OAuth 回跳目标）；后端对外基址（OAuth 回调拼接用）
+    frontend_base_url: str = "http://127.0.0.1:5173"
+    oauth_redirect_base: str = "http://127.0.0.1:8000"
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    github_client_id: str = ""
+    github_client_secret: str = ""
 
     # ===== 验证通道执行保护 =====
     # 单轮对话的总时长上限（秒）：超过后强制终止本轮并明确告知用户，
@@ -44,7 +57,7 @@ class Settings(BaseSettings):
     # 心跳间隔（秒）：Agent 超过该时长无任何事件产出时，向前端推送执行状态
     verify_heartbeat_interval: int = 60
     # Agent 工具调用循环的步数上限（langgraph recursion_limit）
-    verify_recursion_limit: int = 100
+    verify_recursion_limit: int = 200
 
     # ===== 服务监听 =====
     host: str = "127.0.0.1"
@@ -60,9 +73,26 @@ class Settings(BaseSettings):
         return path
 
     @property
+    def system_path(self) -> Path:
+        """系统数据根目录（SQLite 等），不存在时自动创建。"""
+        path = Path(self.system_dir)
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @property
     def llm_enabled(self) -> bool:
         """是否已正确配置 LLM。未配置则走启发式降级路径。"""
         return self.openai_api_key.strip() not in _PLACEHOLDER_KEYS
+
+    @property
+    def oauth_providers(self) -> dict[str, bool]:
+        """哪些 OAuth 提供方已配置（前端据此显示按钮）。"""
+        return {
+            "google": bool(self.google_client_id and self.google_client_secret),
+            "github": bool(self.github_client_id and self.github_client_secret),
+        }
 
 
 @lru_cache(maxsize=1)

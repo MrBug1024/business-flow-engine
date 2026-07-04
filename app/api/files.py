@@ -9,12 +9,12 @@ from __future__ import annotations
 import json
 from typing import Optional
 
-from fastapi import APIRouter, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
 
 from .. import table_io, transform_builder
-from ..models import ScenarioStatus, TableMeta, TableRoleRequest, TableRole
+from ..models import Scenario, ScenarioStatus, TableMeta, TableRoleRequest, TableRole
 from ..storage import store
-from .deps import get_scenario_or_404
+from .deps import get_owned_scenario_or_404
 
 router = APIRouter(tags=["files"])
 
@@ -24,9 +24,9 @@ _VALID_ROLES = {TableRole.INPUT.value, TableRole.RULE.value, TableRole.RESULT.va
 
 @router.post("/scenarios/{scenario_id}/uploads")
 async def upload_tables(
-    scenario_id: str,
     files: list[UploadFile],
     roles: Optional[str] = Form(default=None),
+    scenario: Scenario = Depends(get_owned_scenario_or_404),
 ) -> dict:
     """上传一个或多个文件，并按 roles（input/rule/result）即时标注角色。
 
@@ -36,8 +36,7 @@ async def upload_tables(
       * 逗号分隔：`input,rule,result`
     缺省时角色为 unknown，需在前端"表格"区补标。
     """
-    scenario = get_scenario_or_404(scenario_id)
-    uploads_dir = store.uploads_dir(scenario_id)
+    uploads_dir = store.uploads_dir(scenario.id)
     role_map = _parse_roles(roles, [f.filename for f in files])
 
     new_metas: list[TableMeta] = []
@@ -112,14 +111,16 @@ def _parse_roles(roles: str | None, file_names: list[str]) -> dict[str, str]:
 
 
 @router.get("/scenarios/{scenario_id}/tables", response_model=list[TableMeta])
-def list_tables(scenario_id: str) -> list[TableMeta]:
-    return get_scenario_or_404(scenario_id).tables_meta
+def list_tables(scenario: Scenario = Depends(get_owned_scenario_or_404)) -> list[TableMeta]:
+    return scenario.tables_meta
 
 
 @router.put("/scenarios/{scenario_id}/tables/{table_name}/role", response_model=TableMeta)
-def set_table_role(scenario_id: str, table_name: str, req: TableRoleRequest) -> TableMeta:
+def set_table_role(
+    table_name: str, req: TableRoleRequest,
+    scenario: Scenario = Depends(get_owned_scenario_or_404),
+) -> TableMeta:
     """事后修正某张表的角色（上传时已选，这里仅作修正用）。"""
-    scenario = get_scenario_or_404(scenario_id)
     meta = next((t for t in scenario.tables_meta if t.table_name == table_name), None)
     if meta is None:
         raise HTTPException(status_code=404, detail=f"未找到表：{table_name}")

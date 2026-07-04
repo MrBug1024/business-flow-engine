@@ -1,0 +1,265 @@
+/* =============================================================================
+   业务流逆向引擎 · 设计系统
+   Semantic design tokens with full light / dark support.
+   Theme is switched by setting `data-theme="light|dark"` (+ `.dark` for
+   Element-Plus) on <html>. See stores/theme.ts.
+   ========================================================================== */
+
+:root {
+  /* ---- Brand (theme-independent) -------------------------------------- */
+  --brand: #6d5efc;
+  --brand-strong: #5a49f0;
+  --brand-ink: #ffffff;
+
+  /* ---- Type ----------------------------------------------------------- */
+  --font-ui: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI',
+    'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', 'Cascadia Code',
+    Consolas, monospace;
+
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --text-xl: 19px;
+  --text-2xl: 24px;
+
+  /* ---- Radius --------------------------------------------------------- */
+  --r-xs: 6px;
+  --r-sm: 8px;
+  --r: 10px;
+  --r-lg: 14px;
+  --r-xl: 18px;
+  --r-full: 999px;
+
+  /* ---- Spacing (4pt) -------------------------------------------------- */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+
+  /* ---- Motion --------------------------------------------------------- */
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --dur: 0.16s;
+
+  color-scheme: light;
+}
+
+/* ============================================================================
+   LIGHT (default)
+   ========================================================================== */
+:root,
+:root[data-theme='light'] {
+  color-scheme: light;
+
+  --bg-app: #f4f5f8;
+  --bg-app-grad: radial-gradient(1200px 640px at 82% -12%, rgba(109, 94, 252, 0.08), transparent 60%);
+  --surface: #ffffff;
+  --surface-2: #fbfbfd;
+  --surface-sunken: #eef0f4;
+  --elevated: #ffffff;
+  --hover: #f1f2f6;
+  --active: #e9eaf1;
+  --code-bg: #f4f5f8;
+
+  --border: #e6e8ee;
+  --border-strong: #d3d7e0;
+  --border-lit: #c3b9fb;
+
+  --text-1: #1a1d27;
+  --text-2: #5a6273;
+  --text-3: #8b93a3;
+
+  --brand: #6d5efc;
+  --brand-strong: #5a49f0;
+  --brand-soft: rgba(109, 94, 252, 0.1);
+  --brand-soft-2: rgba(109, 94, 252, 0.16);
+
+  --success: #15a35c;
+  --success-soft: rgba(21, 163, 92, 0.12);
+  --warning: #d98209;
+  --warning-soft: rgba(217, 130, 9, 0.12);
+  --danger: #e0364e;
+  --danger-soft: rgba(224, 54, 78, 0.1);
+  --info: #0a97b8;
+  --info-soft: rgba(10, 151, 184, 0.1);
+
+  --shadow-sm: 0 1px 2px rgba(20, 24, 40, 0.06), 0 1px 3px rgba(20, 24, 40, 0.08);
+  --shadow: 0 4px 12px rgba(20, 24, 40, 0.08), 0 1px 3px rgba(20, 24, 40, 0.06);
+  --shadow-lg: 0 18px 48px rgba(20, 24, 40, 0.16), 0 4px 12px rgba(20, 24, 40, 0.08);
+  --ring: 0 0 0 3px rgba(109, 94, 252, 0.18);
+}
+
+/* ============================================================================
+   DARK
+   ========================================================================== */
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  --bg-app: #0c0f16;
+  --bg-app-grad: radial-gradient(1200px 640px at 82% -12%, rgba(139, 123, 255, 0.12), transparent 60%);
+  --surface: #12161f;
+  --surface-2: #171d29;
+  --surface-sunken: #0b0e15;
+  --elevated: #1a2130;
+  --hover: #1e2534;
+  --active: #232c3d;
+  --code-bg: #0a0d14;
+
+  --border: #242c3a;
+  --border-strong: #35405480;
+  --border-lit: #4b46a8;
+
+  --text-1: #e7edf5;
+  --text-2: #a4afc1;
+  --text-3: #737f92;
+
+  --brand: #8b7bff;
+  --brand-strong: #9c8dff;
+  --brand-soft: rgba(139, 123, 255, 0.14);
+  --brand-soft-2: rgba(139, 123, 255, 0.22);
+
+  --success: #3fd68a;
+  --success-soft: rgba(63, 214, 138, 0.14);
+  --warning: #f5b544;
+  --warning-soft: rgba(245, 181, 68, 0.14);
+  --danger: #f56a7c;
+  --danger-soft: rgba(245, 106, 124, 0.14);
+  --info: #56c8e3;
+  --info-soft: rgba(86, 200, 227, 0.12);
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow: 0 6px 20px rgba(0, 0, 0, 0.45), 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 24px 60px rgba(0, 0, 0, 0.6), 0 6px 18px rgba(0, 0, 0, 0.45);
+  --ring: 0 0 0 3px rgba(139, 123, 255, 0.26);
+}
+
+/* ============================================================================
+   Element-Plus variable mapping — bound to our semantic tokens so EP widgets
+   inherit the palette in both themes. The compound selector (0,2,0) outranks
+   Element-Plus's own `html.dark` (0,1,1) block.
+   ========================================================================== */
+:root[data-theme='light'],
+:root[data-theme='dark'] {
+  --el-color-primary: var(--brand);
+  --el-color-primary-light-3: color-mix(in srgb, var(--brand) 68%, var(--surface));
+  --el-color-primary-light-5: color-mix(in srgb, var(--brand) 50%, var(--surface));
+  --el-color-primary-light-7: color-mix(in srgb, var(--brand) 30%, var(--surface));
+  --el-color-primary-light-8: color-mix(in srgb, var(--brand) 20%, var(--surface));
+  --el-color-primary-light-9: color-mix(in srgb, var(--brand) 12%, var(--surface));
+  --el-color-primary-dark-2: var(--brand-strong);
+
+  --el-color-success: var(--success);
+  --el-color-warning: var(--warning);
+  --el-color-danger: var(--danger);
+  --el-color-error: var(--danger);
+  --el-color-info: var(--text-3);
+
+  --el-bg-color: var(--surface);
+  --el-bg-color-page: var(--bg-app);
+  --el-bg-color-overlay: var(--elevated);
+  --el-fill-color-blank: var(--surface);
+  --el-fill-color: var(--hover);
+  --el-fill-color-light: var(--hover);
+  --el-fill-color-lighter: var(--surface-2);
+  --el-fill-color-dark: var(--active);
+
+  --el-text-color-primary: var(--text-1);
+  --el-text-color-regular: var(--text-2);
+  --el-text-color-secondary: var(--text-3);
+  --el-text-color-placeholder: var(--text-3);
+  --el-text-color-disabled: var(--text-3);
+
+  --el-border-color: var(--border);
+  --el-border-color-light: var(--border);
+  --el-border-color-lighter: var(--border);
+  --el-border-color-extra-light: var(--border);
+  --el-border-color-hover: var(--border-strong);
+  --el-border-color-dark: var(--border-strong);
+
+  --el-border-radius-base: var(--r-sm);
+  --el-border-radius-small: var(--r-xs);
+  --el-box-shadow-light: var(--shadow-sm);
+  --el-box-shadow: var(--shadow);
+  --el-mask-color: color-mix(in srgb, var(--bg-app) 62%, transparent);
+  --el-fill-color-blank: var(--surface);
+}
+
+/* ============================================================================
+   Base
+   ========================================================================== */
+* { box-sizing: border-box; }
+html, body, #app { height: 100%; margin: 0; }
+body {
+  font-family: var(--font-ui);
+  font-size: var(--text-base);
+  background: var(--bg-app);
+  color: var(--text-1);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+a { color: var(--brand); text-decoration: none; }
+a:hover { color: var(--brand-strong); }
+
+::selection { background: var(--brand-soft-2); }
+
+/* Scrollbars ---------------------------------------------------------------- */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--text-3) 40%, transparent);
+  border-radius: var(--r-full);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--text-3) 65%, transparent); background-clip: padding-box; }
+
+/* Splitpanes ---------------------------------------------------------------- */
+.splitpanes__splitter {
+  position: relative;
+  background: var(--border);
+  transition: background var(--dur) var(--ease);
+}
+.splitpanes--vertical > .splitpanes__splitter { min-width: 1px; }
+.splitpanes--horizontal > .splitpanes__splitter { min-height: 1px; }
+.splitpanes__splitter::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+}
+.splitpanes--vertical > .splitpanes__splitter::before { left: -3px; right: -3px; }
+.splitpanes--horizontal > .splitpanes__splitter::before { top: -3px; bottom: -3px; }
+.splitpanes__splitter:hover { background: var(--brand); }
+
+/* Element-Plus polish ------------------------------------------------------- */
+.el-overlay-dialog .el-dialog,
+.el-dialog {
+  border-radius: var(--r-lg);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-lg);
+  --el-dialog-padding-primary: 22px;
+}
+.el-dialog__title { font-weight: 700; font-size: var(--text-md); }
+.el-message-box { border-radius: var(--r-lg); border: 1px solid var(--border); box-shadow: var(--shadow-lg); }
+.el-popper { border-radius: var(--r-sm) !important; }
+.el-dropdown-menu { padding: var(--sp-1); }
+.el-dropdown-menu__item { border-radius: var(--r-xs); font-size: var(--text-base); }
+.el-button { font-weight: 600; }
+.el-tabs__item { font-weight: 600; }
+.el-tag { border-radius: var(--r-xs); }
+
+/* Utilities ----------------------------------------------------------------- */
+.mono { font-family: var(--font-mono); }
+.muted { color: var(--text-3); }
+.card {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+}

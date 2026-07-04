@@ -132,11 +132,25 @@ class GraphData(BaseModel):
     edges: list[GraphEdge] = Field(default_factory=list)
 
 
+class Clarification(BaseModel):
+    """一条待用户确认的结构化问题（对齐 Claude AskUserQuestion 的逐题体验）。
+
+    前端据此渲染独立问答卡：options 提供可选答案（空=纯自定义），multi_select 决定单/多选，
+    allow_custom 允许用户自行描述。相比把所有疑点塞进一段正文，用户可逐题选择/补充。
+    """
+    id: str = ""
+    question: str
+    options: list[str] = Field(default_factory=list)
+    allow_custom: bool = True
+    multi_select: bool = False
+
+
 class RelationResult(BaseModel):
     """关联推导 + 字段语义推导的合并结果（合并为一个步骤）。"""
 
     relations: list[Relation] = Field(default_factory=list)
     ambiguous_questions: list[str] = Field(default_factory=list)
+    clarifications: list[Clarification] = Field(default_factory=list)
     graph_data: GraphData = Field(default_factory=GraphData)
     summary: str = ""
     # 字段语义在 ColumnMeta 上原地更新；此处冗余收集一份便于前端快速展示
@@ -260,6 +274,7 @@ class FlowResult(BaseModel):
     flow_graph: GraphData = Field(default_factory=GraphData)
     mermaid: str = ""                                  # 业务流程图（Mermaid，由节点生成）
     ambiguous_questions: list[str] = Field(default_factory=list)
+    clarifications: list[Clarification] = Field(default_factory=list)
     knowledge_schema: Optional[KnowledgeSchemaMapping] = None  # v1.0.4 通用知识表结构映射
     rule_schema: Optional[RuleSchemaMapping] = None            # v1.0.3 向后兼容
     summary: str = ""
@@ -383,6 +398,7 @@ class Scenario(BaseModel):
     id: str
     name: str
     description: str = ""
+    owner_id: str = ""   # 所属用户；空=历史遗留（可被登录用户认领）
     status: ScenarioStatus = ScenarioStatus.CREATED
     created_at: float = Field(default_factory=time)
     updated_at: float = Field(default_factory=time)

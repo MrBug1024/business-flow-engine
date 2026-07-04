@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage
 
@@ -129,16 +129,17 @@ async def _stream_with_agent(scenario: Scenario, user_message: str) -> AsyncIter
                     tool_output_str = str(output)
                     if tool_output_str.lstrip().startswith("✅"):
                         yield sse("status", status=_TOOL_STATUS_MAP[name].value)
-                # 关联/流程推导后若有不确定项，主动弹出结构化交互（让前端渲染表单）
+                # 关联/流程推导后若有不确定项，主动弹出结构化交互（让前端渲染逐题问答面板）
                 if name in ("deduce_relations", "deduce_flow"):
                     sc = store.get(scenario.id)
-                    qs = []
-                    if name == "deduce_relations" and sc and sc.relations:
-                        qs = list(sc.relations.ambiguous_questions or [])
-                    elif name == "deduce_flow" and sc and sc.flow:
-                        qs = list(sc.flow.ambiguous_questions or [])
-                    if qs:
-                        yield sse("interaction", interaction=_step_interaction(name, qs))
+                    result_obj = None
+                    if name == "deduce_relations" and sc:
+                        result_obj = sc.relations
+                    elif name == "deduce_flow" and sc:
+                        result_obj = sc.flow
+                    interaction = _step_interaction(name, result_obj)
+                    if interaction:
+                        yield sse("interaction", interaction=interaction)
 
         for ev_type, ev_text in parser.flush():
             (final_thinking if ev_type == "thinking" else final_content).append(ev_text)
@@ -197,19 +198,50 @@ def _summarize_result(output) -> str:
     return text[:300] + ("…" if len(text) > 300 else "")
 
 
-def _step_interaction(tool_name: str, questions: list[str]) -> dict:
-    """通用结构化交互：把工具的待确认事项渲染为表单。
+def _step_interaction(tool_name: str, result_obj) -> Optional[dict]:
+    """把工具的待确认事项渲染为**逐题**结构化问答面板（对齐 Claude AskUserQuestion）。
+
+    优先用结果对象里的结构化 `clarifications`（每题自带 options/allow_custom/multi_select）；
+    没有则把纯字符串 `ambiguous_questions` 逐条包装成独立问答卡（默认「确认无误 / 需要修正」
+    两个可选项 + 允许自定义）。这样用户可**逐题**选择或自行描述，而不是面对一整段正文。
 
     严格要求：用户没回答前，agent **不应**进入下一步。
     """
-    qs = questions[:4]
+    if result_obj is None:
+        return None
+
     label = "关联推导" if tool_name == "deduce_relations" else "业务流程推导"
+    questions: list[dict] = []
+
+    clarifications = list(getattr(result_obj, "clarifications", None) or [])
+    if clarifications:
+        for i, c in enumerate(clarifications[:8]):
+            questions.append({
+                "id": getattr(c, "id", "") or f"{tool_name}_q{i}",
+                "question": c.question,
+                "options": list(c.options or []),
+                "allow_custom": bool(c.allow_custom),
+                "multi_select": bool(c.multi_select),
+            })
+    else:
+        raw = list(getattr(result_obj, "ambiguous_questions", None) or [])
+        for i, q in enumerate(raw[:8]):
+            questions.append({
+                "id": f"{tool_name}_q{i}",
+                "question": q,
+                "options": ["确认无误", "需要修正（在下方补充）"],
+                "allow_custom": True,
+                "multi_select": False,
+            })
+
+    if not questions:
+        return None
+
     return {
         "type": "confirm",
-        "question": f"🧩 {label}有以下待确认事项，请逐条确认后我再继续：\n" + "\n".join(f"  · {q}" for q in qs),
-        "options": ["全部确认无误，可继续", "我有修正意见（在下方输入）"],
-        "allow_custom": True,
+        "title": f"🧩 {label}有 {len(questions)} 项待你确认，逐题选择或补充后我再继续：",
         "context": f"{tool_name}_confirm",
+        "questions": questions,
     }
 
 

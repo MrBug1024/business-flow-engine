@@ -6,7 +6,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 
 from .. import executor, trace_sampling, validators
@@ -24,9 +24,11 @@ from ..models import (
 from ..skill_builder import materialize_evolved_skill
 from ..storage import store
 from ..validators import validate_trace_connectivity
-from .deps import get_scenario_or_404
+from .deps import get_owned_scenario_or_404, get_scenario_or_404
 
-router = APIRouter(tags=["graph"])
+# 本路由下所有端点都是 /scenarios/{scenario_id}/...，统一在路由级强制「登录 + 归属校验」，
+# 处理函数内部再用 get_scenario_or_404 取对象（此时已确认归属，仅读文件）。
+router = APIRouter(tags=["graph"], dependencies=[Depends(get_owned_scenario_or_404)])
 
 
 @router.get("/scenarios/{scenario_id}/trace-sample")

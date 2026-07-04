@@ -79,21 +79,28 @@ class ScenarioStore:
         return self.scenario_dir(scenario_id) / "verify_chat.jsonl"
 
     # ------------------------------------------------------------- 场景 CRUD
-    def create(self, name: str, description: str = "") -> Scenario:
+    def create(self, name: str, description: str = "", owner_id: str = "") -> Scenario:
         with self._lock:
-            scenario = Scenario(id=_new_id("sc"), name=name, description=description)
+            scenario = Scenario(
+                id=_new_id("sc"), name=name, description=description, owner_id=owner_id
+            )
             self.scenario_dir(scenario.id).mkdir(parents=True, exist_ok=True)
             self._write_meta(scenario)
             return scenario
 
-    def list(self) -> list[Scenario]:
+    def list(self, owner_id: Optional[str] = None) -> list[Scenario]:
+        """列出场景。owner_id 为 None 时返回全部（内部用）；
+        否则只返回属于该用户的场景（多租户隔离）。"""
         with self._lock:
             scenarios: list[Scenario] = []
             for meta_file in self._root.glob("*/meta.json"):
                 try:
-                    scenarios.append(self._read_meta(meta_file))
+                    sc = self._read_meta(meta_file)
                 except Exception:  # noqa: BLE001  跳过损坏的元数据，保证列表可用
                     continue
+                if owner_id is not None and sc.owner_id != owner_id:
+                    continue
+                scenarios.append(sc)
             scenarios.sort(key=lambda s: s.created_at, reverse=True)
             return scenarios
 

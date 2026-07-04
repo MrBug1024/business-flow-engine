@@ -243,16 +243,34 @@ business-flow-engine/
 └── .env / .env.example
 ```
 
-## 九、快速开始
+## 九、快速开始（v1.1.0 起前后端分离）
+
+### 后端
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env        # 按需填写 LLM API Key；不填也能跑（启发式降级模式）
+cp .env.example .env        # 按需填写 LLM API Key、JWT_SECRET、可选的 OAuth 凭证
 python run.py                # 默认监听 127.0.0.1:8000
 ```
 
-浏览器打开 `http://127.0.0.1:8000/` 进入蒸馏通道，`http://127.0.0.1:8000/verify`
-进入验证通道。
+后端首启会自动在 `system/app.db`（内嵌 SQLite）建好用户表——**无需外部数据库/Redis**。
+登录默认为**邮箱密码**；在 `.env` 填入 `GOOGLE_CLIENT_ID/SECRET`、`GITHUB_CLIENT_ID/SECRET`
+即可启用对应的 Google / GitHub OAuth 登录（前端自动显示按钮）。每个用户的业务场景相互隔离。
+
+### 前端（Vue3 + TS + Vite）
+
+```bash
+cd frontend
+npm install
+npm run dev      # 开发：http://127.0.0.1:5173（已代理 /api 到后端 8000）
+# 或
+npm run build    # 生产：产物 frontend/dist，由后端在 / 直接托管
+```
+
+- 新前端主入口：`http://127.0.0.1:8000/`（构建后）或 `http://127.0.0.1:5173/`（开发）。
+  含**登录**、**蒸馏工作台**（可拖宽的 AI 对话、可收起的场景栏、逐题结构化问答面板）、
+  **第三方沙盒**（能力市场 / 挂载 / MCP 配置面板 / 通用聊天）。
+- 旧原生 HTML 前端保留在 `http://127.0.0.1:8000/legacy` 作回退对照。
 
 ## 十、这个项目"不是"什么
 
@@ -262,3 +280,6 @@ python run.py                # 默认监听 127.0.0.1:8000
   万别，这件事被有意识地留给运行时会思考的 LLM。
 - **不是**要求历史结果与新执行结果逐行精确相等才算验证通过——历史结果本身可能只是一次
   不完整的抽样，验证通道判断的是"新执行结果是否覆盖历史结果"，而不是完全一致。
+
+
+

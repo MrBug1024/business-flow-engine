@@ -8,12 +8,15 @@
 
 from fastapi import APIRouter
 
-from . import chat, files, graph, scenarios, verify
+from ..auth.router import router as auth_router
+from . import chat, files, graph, playground, scenarios, verify
 
 # 汇总所有子路由
 api_router = APIRouter(prefix="/api")
+api_router.include_router(auth_router)
 api_router.include_router(scenarios.router)
 api_router.include_router(files.router)
 api_router.include_router(chat.router)
 api_router.include_router(graph.router)
 api_router.include_router(verify.router)
+api_router.include_router(playground.router)

@@ -1374,6 +1374,24 @@ print(f"产出 {{result['rows']}} 行 → {{result['artifact']}}")
 
 ---
 
+## 八、作为 MCP Server 挂载到第三方（零改动）
+
+除了上面的脚本/函数调用方式，本能力包同时符合 **MCP 标准**，可让任意支持 MCP 的
+Agent 宿主（Claude Desktop / Cursor / Cline 等）**零改动代码**挂载：
+
+1. 打开同目录 `mcp_config.example.json`，把里面的片段粘进你宿主的 MCP 配置；
+2. 宿主启动后会自动发现本场景的命名空间化工具（形如 `<namespace>__execute` /
+   `__query_data` / `__describe_schema` / `__search_knowledge` / `__list_knowledge`）；
+3. 能力卡片（用途 / 何时使用 when_to_use / 何时不用 not_for / 工具清单）见同目录
+   `mcp.json`，宿主的模型据此自主判断何时调用本能力，多个能力同时挂载也因命名空间
+   前缀而互不冲突。
+
+> 也可用 `python -m app.mcp_server --pkg <本目录>` 直接以 stdio 方式起一个 MCP Server。
+> 若把 Anthropic Agent Skills 作为接入形态，本目录根部的 `SKILL.md` 已带触发描述，
+> 直接丢进宿主的 skills 目录即可渐进披露。
+
+---
+
 *由「业务流逆向平台」生成 · 场景：{scenario.name}*
 """
     (skill_dir / "SCENARIO_CONTEXT.md").write_text(md, encoding="utf-8")
@@ -1823,6 +1841,9 @@ python scripts/skill_nl_rule_parser.py knowledge.csv nl_col dispatch_col
     # ---- manifest.json（验证通道发现入口）----
     _write_manifest(base, scenario, all_skills, dispatch, mode)
 
+    # ---- MCP 能力包（第三方零改动挂载：mcp.json + 根 SKILL.md + 粘贴即用配置）----
+    _write_mcp_descriptor(base, scenario, domain, dispatch, mode)
+
     return all_skills
 
 
@@ -1882,10 +1903,17 @@ def _write_manifest(
         "generated_at": now,
         "scenario_id": scenario.id,
         "scenario_name": scenario.name,
+        "namespace": _ascii_namespace(scenario.name, scenario.id),
         "description": scenario.description or "",
         "execution_mode": mode,
         "has_knowledge_table": bool(dispatch.get("knowledge_table")),
         "knowledge_table": dispatch.get("knowledge_table", ""),
+        # MCP 能力包指针（详见同目录 mcp.json / SKILL.md / mcp_config.example.json）
+        "mcp": {
+            "descriptor": "mcp.json",
+            "config_example": "mcp_config.example.json",
+            "skill_md": "SKILL.md",
+        },
         "skills": skills_index,
         "outputs": outputs_summary,
         "tools": tools_def,
@@ -1908,6 +1936,257 @@ def _write_manifest(
     (skill_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+
+# ===========================================================================
+# MCP 能力包生成（第三方零改动挂载的统一标准入口）
+# ===========================================================================
+# 命名空间化工具的固定动作集：任意场景包都暴露这 5 个 action，
+# 工具名 = f"{namespace}__{action}"，用命名空间前缀保证多场景同时挂载不撞名。
+_MCP_ACTIONS = ("describe_schema", "list_knowledge", "search_knowledge", "execute", "query_data")
+
+
+def _ascii_namespace(name: str, scenario_id: str) -> str:
+    """生成 ASCII 安全的命名空间（MCP/OpenAI 工具名要求 ^[A-Za-z0-9_-]+$）。
+
+    中文场景名无法直接做工具名前缀，故：优先取名称里的 ASCII 字母数字；
+    若为空（纯中文名），回退用场景 id 派生一个稳定短标识，保证跨进程一致且唯一。
+    """
+    ascii_part = re.sub(r"[^0-9A-Za-z]+", "_", name).strip("_")
+    if ascii_part and not ascii_part[0].isdigit():
+        return ascii_part[:40]
+    sid = re.sub(r"[^0-9A-Za-z]+", "", scenario_id) or "scn"
+    return f"s_{sid[-8:]}"
+
+
+def _synthesize_capability_card(
+    scenario: Scenario, domain: DomainKnowledge, dispatch: dict, mode: str,
+) -> dict:
+    """确定性地合成「能力卡片」——第三方 Agent 据此发现本场景做什么、何时该/不该调用。
+
+    全部字段从已蒸馏的场景元数据推导，不依赖 LLM，保证一定有值。
+    """
+    name = scenario.name
+    ns = _ascii_namespace(name, scenario.id)
+
+    input_tables = [t.table_name for t in domain.tables if t.role == "input"]
+    knowledge_table = dispatch.get("knowledge_table", "")
+    dispatch_key = dispatch.get("dispatch_key_column", "")
+    # 必需表 = 业务输入表 + 知识表（结果表只是输出列模板，不算必需输入）
+    required_tables: list[str] = []
+    for t in input_tables + ([knowledge_table] if knowledge_table else []):
+        if t and t not in required_tables:
+            required_tables.append(t)
+
+    outputs = scenario.outputs or []
+    output_names = [o.name for o in outputs]
+    steps = scenario.flow.flow_steps if scenario.flow else []
+    purposes = [s.purpose for s in steps if s.purpose]
+
+    # ---- summary：一句话说清这个能力包干什么 ----
+    if scenario.description:
+        summary = f"『{name}』业务能力：{scenario.description}"
+    elif purposes:
+        summary = f"『{name}』业务能力：" + "；".join(purposes[:3])
+    else:
+        summary = f"『{name}』业务能力包（{mode} 模式）"
+    if output_names:
+        summary += f"。产出：{'、'.join(output_names[:3])}"
+
+    # ---- when_to_use：触发判据 ----
+    when_to_use = [f"用户要处理与「{name}」直接相关的业务需求"]
+    if required_tables:
+        w = f"用户提供了与本场景同结构的数据（必需表：{'、'.join(required_tables)}）并希望据此产出结果"
+        if output_names:
+            w += f"，例如「{output_names[0]}」"
+        when_to_use.append(w)
+    if knowledge_table:
+        detail = f"（分派键列「{dispatch_key}」）" if dispatch_key else ""
+        when_to_use.append(
+            f"用户希望依据知识表「{knowledge_table}」{detail}中的条目对业务数据做逐条判定/筛查"
+        )
+
+    # ---- not_for：反触发（多场景并存时避免误调的关键）----
+    not_for = ["与本场景无关的通用数据分析、闲聊、或其他业务领域的任务"]
+    if required_tables:
+        not_for.append(
+            f"用户数据缺少本场景必需表（{'、'.join(required_tables)}），或表结构与本场景明显不匹配"
+        )
+
+    # ---- keywords：粗粒度匹配用 ----
+    keywords: list[str] = [name]
+    for k in list((dispatch.get("dispatch_map") or {}).keys())[:12]:
+        if k and k not in keywords:
+            keywords.append(k)
+    for t in required_tables:
+        if t not in keywords:
+            keywords.append(t)
+
+    return {
+        "namespace": ns,
+        "display_name": name,
+        "summary": summary,
+        "when_to_use": when_to_use,
+        "not_for": not_for,
+        "keywords": keywords,
+        "required_tables": required_tables,
+        "knowledge_table": knowledge_table,
+        "execution_mode": mode,
+    }
+
+
+def _mcp_tool_defs(ns: str, card: dict, scenario: Scenario) -> list[dict]:
+    """构建命名空间化 MCP 工具定义（name / action / description / inputSchema）。
+
+    对应验证 Agent 已有的能力，但去掉 data_dir/out_dir 这类第三方不该关心的内部路径参数
+    ——运行时由 scenario_runtime 用包内默认目录兜底。
+    """
+    name = scenario.name
+    output_ids = [o.output_id for o in (scenario.outputs or [])]
+    trigger = f"（本工具属于「{name}」能力包；仅当用户诉求匹配该能力时才调用）"
+
+    def tool(action: str, desc: str, props: dict, required: list[str]) -> dict:
+        return {
+            "name": f"{ns}__{action}",
+            "action": action,
+            "description": desc + trigger,
+            "inputSchema": {"type": "object", "properties": props, "required": required},
+        }
+
+    defs = [
+        tool(
+            "describe_schema",
+            f"获取「{name}」场景的完整表结构：字段名/类型/业务语义 + 表间关联(ER) + 知识表分派结构。"
+            "构造 query_data 的 SQL 前应先调用一次。",
+            {}, [],
+        ),
+        tool(
+            "list_knowledge",
+            f"浏览「{name}」场景知识表的条目（分页），了解可执行的知识条目范围。",
+            {"limit": {"type": "integer", "description": "返回条数上限（默认 50）", "default": 50}},
+            [],
+        ),
+        tool(
+            "search_knowledge",
+            f"在「{name}」场景知识表中按关键词搜索条目。",
+            {
+                "keyword": {"type": "string", "description": "搜索关键词（空=返回前 N 条）"},
+                "limit": {"type": "integer", "description": "返回条数上限（默认 20）", "default": 20},
+            },
+            [],
+        ),
+        tool(
+            "execute",
+            f"执行「{name}」场景的数据处理并产出结果文件。知识驱动模式下只返回命中的知识行原文，"
+            "需据此再用 query_data 逐条落地查询。",
+            {
+                "output_id": {
+                    "type": "string",
+                    "description": f"产出ID，可选值：{output_ids}",
+                    **({"enum": output_ids} if output_ids else {}),
+                },
+                "params": {
+                    "type": ["string", "object", "null"],
+                    "description": "知识条目过滤：空=全量；字符串=关键词；对象={列名:值}=精确匹配",
+                },
+                "max_rows": {"type": "integer", "description": "最大产出行数（默认 20000）", "default": 20000},
+            },
+            ["output_id"],
+        ),
+        tool(
+            "query_data",
+            f"对「{name}」场景已上传的业务数据执行 DuckDB SQL（任意表/字段/多表 JOIN/聚合）。"
+            "表名用双引号，例如：SELECT * FROM \"表名\" LIMIT 10。",
+            {"sql": {"type": "string", "description": "要执行的 DuckDB SQL"}},
+            ["sql"],
+        ),
+    ]
+    return defs
+
+
+def _write_mcp_descriptor(
+    skill_dir: Path, scenario: Scenario,
+    domain: DomainKnowledge, dispatch: dict, mode: str,
+) -> None:
+    """生成 MCP 标准能力包三件套：mcp.json + 根 SKILL.md + mcp_config.example.json。
+
+    这三样让第三方 Agent 宿主（Claude Desktop / Cursor / Cline 等）能像配置一个普通
+    MCP Server 一样，粘贴一段配置就挂载本场景能力，全程零改动第三方代码。
+    """
+    card = _synthesize_capability_card(scenario, domain, dispatch, mode)
+    ns = card["namespace"]
+    pkg_abs = str(skill_dir.resolve())
+
+    tools = _mcp_tool_defs(ns, card, scenario)
+
+    # ---- mcp.json：能力卡片 + 命名空间化工具定义 ----
+    mcp_doc = {
+        "protocol": "mcp",
+        "spec_version": "2024-11-05",
+        "scenario_id": scenario.id,
+        **card,
+        "server": {
+            "transport": "stdio",
+            "command": "python",
+            "args": ["-m", "app.mcp_server", "--pkg", pkg_abs],
+        },
+        "tools": tools,
+    }
+    (skill_dir / "mcp.json").write_text(
+        json.dumps(mcp_doc, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    # ---- mcp_config.example.json：粘贴即用的第三方宿主配置片段 ----
+    config_example = {
+        "mcpServers": {
+            f"bfe-{ns}": {
+                "command": "python",
+                "args": ["-m", "app.mcp_server", "--pkg", pkg_abs],
+            }
+        }
+    }
+    (skill_dir / "mcp_config.example.json").write_text(
+        json.dumps(config_example, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    # ---- 根 SKILL.md：Anthropic Agent Skills 兼容（frontmatter 触发语做渐进披露）----
+    when_summary = "；".join(card["when_to_use"])
+    not_summary = "；".join(card["not_for"])
+    desc_line = f"{card['summary']} Use this skill when: {when_summary}. Do NOT use for: {not_summary}."
+    # frontmatter 单行 description，避免换行破坏 YAML
+    desc_line = desc_line.replace("\n", " ").replace('"', "'")
+    tool_lines = "\n".join(f"- `{t['name']}` — {t['description']}" for t in tools)
+    skill_md = f"""---
+name: {ns}
+description: "{desc_line}"
+---
+
+# {scenario.name}
+
+{card['summary']}
+
+## 何时使用本能力
+{chr(10).join('- ' + w for w in card['when_to_use'])}
+
+## 何时不要使用
+{chr(10).join('- ' + w for w in card['not_for'])}
+
+## 必需数据表
+{('、'.join(card['required_tables'])) or '（无特定要求）'}
+
+## 提供的工具（命名空间：`{ns}`）
+{tool_lines}
+
+## 两种挂载方式
+1. **作为 MCP Server（推荐，零改动）**：把 `mcp_config.example.json` 的内容粘进你的
+   Agent 宿主 MCP 配置即可，宿主会自动发现上面这些 `{ns}__*` 工具。
+2. **作为独立脚本 / Agent Skill**：详见同目录 `SCENARIO_CONTEXT.md`（完整表结构、ER、
+   业务流程、独立运行方式）与 `manifest.json`。
+
+> 本能力包完全独立于生成它的平台：`pip install -r requirements.txt`
+> （pandas / duckdb / openpyxl）即可运行，无需回连平台、无需数据库服务。
+"""
+    (skill_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
 
 
 def materialize_evolved_skill(scenario: Scenario, skill: Skill) -> Skill:

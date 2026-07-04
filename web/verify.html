@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>验证通道 · 业务 Skill 执行验证</title>
+<title>第三方 Agent 沙盒 · MCP 能力挂载</title>
 <style>
   :root {
     --bg-deep:#0d1117; --bg-panel:#161b22; --bg-card:#1c2230; --bg-hover:#21293a;
@@ -20,70 +20,77 @@
     min-height:100vh; display:flex; overflow:hidden; }
 
   /* ===== 侧边栏 ===== */
-  .sidebar { width:260px; flex-shrink:0; background:var(--bg-panel); border-right:1px solid var(--border);
+  .sidebar { width:288px; flex-shrink:0; background:var(--bg-panel); border-right:1px solid var(--border);
     display:flex; flex-direction:column; height:100vh; }
   .sidebar-logo { padding:20px 16px 14px; border-bottom:1px solid var(--border); }
-  .logo-title { font-size:13px; font-weight:700; letter-spacing:.08em; color:var(--violet); text-transform:uppercase; }
+  .logo-title { font-size:13px; font-weight:700; letter-spacing:.06em; color:var(--violet); }
   .logo-sub { font-size:11px; color:var(--muted); margin-top:2px; font-family:var(--font-mono); }
   .channel-badge { display:inline-block; margin-top:6px; padding:2px 8px; border-radius:10px;
-    font-size:10px; font-weight:700; background:rgba(139,110,245,.2); color:var(--violet);
-    border:1px solid rgba(139,110,245,.4); letter-spacing:.06em; }
-  .sidebar-section { padding:12px 10px 6px; flex:1; overflow-y:auto; }
+    font-size:10px; font-weight:700; background:rgba(88,200,227,.18); color:var(--cyan);
+    border:1px solid rgba(88,200,227,.4); letter-spacing:.06em; }
+  .sidebar-section { padding:12px 10px 6px; overflow-y:auto; }
+  .sidebar-section.mounted { flex-shrink:0; max-height:40%; }
+  .sidebar-section.market { flex:1; border-top:1px solid var(--border); }
   .sidebar-label { font-size:10px; text-transform:uppercase; letter-spacing:.12em; color:var(--muted);
-    padding:0 6px; margin-bottom:4px; }
-  .scenario-item { display:flex; align-items:center; gap:8px; padding:8px 10px; border-radius:var(--radius);
-    cursor:pointer; transition:background .15s; font-size:13px; }
-  .scenario-item:hover { background:var(--bg-hover); }
-  .scenario-item.active { background:rgba(139,110,245,.12); border:1px solid rgba(139,110,245,.25); }
-  .scenario-dot { width:7px; height:7px; border-radius:50%; background:var(--muted); flex-shrink:0; }
-  .dot-ready { background:var(--green); box-shadow:0 0 6px var(--green); }
-  .dot-pending { background:var(--amber); }
-  .scenario-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    padding:0 6px; margin-bottom:6px; display:flex; justify-content:space-between; }
+
+  .cap-item { padding:9px 10px; border-radius:var(--radius); font-size:13px; margin-bottom:6px;
+    border:1px solid var(--border); background:var(--bg-card); }
+  .cap-item.mounted-item { border-color:rgba(57,214,131,.3); background:rgba(57,214,131,.05); }
+  .cap-head { display:flex; align-items:center; gap:7px; }
+  .cap-dot { width:7px; height:7px; border-radius:50%; background:var(--green); box-shadow:0 0 6px var(--green); flex-shrink:0; }
+  .cap-dot.off { background:var(--muted); box-shadow:none; }
+  .cap-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600; }
+  .cap-ns { font-family:var(--font-mono); font-size:10px; color:var(--muted); }
+  .cap-summary { font-size:11px; color:var(--muted); margin-top:4px; line-height:1.5;
+    display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+  .cap-actions { display:flex; gap:6px; margin-top:7px; }
+  .mini-btn { padding:3px 9px; border-radius:6px; font-size:11px; cursor:pointer; border:1px solid var(--border);
+    background:transparent; color:var(--text-secondary); transition:all .15s; }
+  .mini-btn:hover { border-color:var(--border-lit); color:var(--text-primary); }
+  .mini-btn.install { border-color:rgba(139,110,245,.4); color:var(--violet); }
+  .mini-btn.install:hover { background:rgba(139,110,245,.12); }
+  .mini-btn.remove { border-color:rgba(240,106,106,.35); color:var(--rose); }
+
   .sidebar-footer { padding:12px; border-top:1px solid var(--border); font-size:11px; color:var(--muted); }
   .link-distill { color:var(--cyan); text-decoration:none; font-size:11px; }
   .link-distill:hover { text-decoration:underline; }
 
   /* ===== 主区 ===== */
   .main { flex:1; display:flex; flex-direction:column; height:100vh; overflow:hidden; }
+  .isolation-banner { padding:8px 20px; background:rgba(88,200,227,.06);
+    border-bottom:1px solid rgba(88,200,227,.18); font-size:12px; color:var(--cyan);
+    display:flex; align-items:center; gap:8px; flex-shrink:0; }
+  .isolation-icon { font-size:14px; }
   .topbar { height:52px; border-bottom:1px solid var(--border); display:flex; align-items:center;
     padding:0 20px; gap:12px; background:var(--bg-panel); flex-shrink:0; }
   .topbar-name { font-size:14px; font-weight:600; }
   .topbar-sub { font-size:11px; color:var(--muted); }
-  .status-badge { font-size:10px; padding:3px 8px; border-radius:20px; font-weight:600;
-    letter-spacing:.05em; font-family:var(--font-mono); }
-  .badge-ready { background:rgba(57,214,131,.12); color:var(--green); border:1px solid rgba(57,214,131,.3); }
-  .badge-pending { background:rgba(245,166,35,.12); color:var(--amber); border:1px solid rgba(245,166,35,.3); }
   .topbar-actions { margin-left:auto; display:flex; gap:8px; }
   .btn { padding:6px 14px; border-radius:var(--radius); font-size:12px; font-weight:600;
     cursor:pointer; border:none; transition:all .15s; }
-  .btn-violet { background:var(--violet); color:#fff; }
-  .btn-violet:hover { filter:brightness(1.1); }
   .btn-ghost { background:transparent; border:1px solid var(--border); color:var(--text-secondary); }
   .btn-ghost:hover { border-color:var(--border-lit); color:var(--text-primary); }
 
   /* ===== 聊天区 ===== */
   .chat-area { flex:1; display:flex; flex-direction:column; overflow:hidden; }
   .messages { flex:1; overflow-y:auto; padding:20px; display:flex; flex-direction:column; gap:12px; }
-  .msg { max-width:78%; border-radius:var(--radius-lg); padding:12px 16px; font-size:14px;
+  .msg { max-width:80%; border-radius:var(--radius-lg); padding:12px 16px; font-size:14px;
     line-height:1.6; white-space:pre-wrap; word-break:break-word; }
-  .msg-user { align-self:flex-end; background:rgba(139,110,245,.15);
-    border:1px solid rgba(139,110,245,.3); }
+  .msg-user { align-self:flex-end; background:rgba(139,110,245,.15); border:1px solid rgba(139,110,245,.3); }
   .msg-ai { align-self:flex-start; background:var(--bg-card); border:1px solid var(--border); }
-  .msg-thinking { align-self:flex-start; background:var(--bg-hover); border:1px solid var(--border);
-    color:var(--muted); font-size:12px; font-style:italic; }
   .msg-tool { align-self:flex-start; font-size:12px; background:rgba(88,200,227,.05);
     border:1px solid rgba(88,200,227,.2); color:var(--cyan); font-family:var(--font-mono); }
   .msg-tool-result { align-self:flex-start; font-size:12px; background:rgba(57,214,131,.05);
     border:1px solid rgba(57,214,131,.2); color:var(--green); font-family:var(--font-mono);
-    max-width:78%; white-space:pre-wrap; }
+    max-width:80%; white-space:pre-wrap; }
   .status-line { align-self:flex-start; font-size:12px; color:var(--amber);
     font-family:var(--font-mono); padding:4px 12px; display:flex; align-items:center; gap:8px; }
   .status-line::before { content:''; width:10px; height:10px; border-radius:50%;
     border:2px solid var(--amber); border-top-color:transparent; display:inline-block;
     animation:spin 1s linear infinite; }
   @keyframes spin { to { transform:rotate(360deg); } }
-  .trace-box { align-self:flex-start; max-width:78%; font-size:11px; color:var(--muted);
-    font-family:var(--font-mono); }
+  .trace-box { align-self:flex-start; max-width:80%; font-size:11px; color:var(--muted); font-family:var(--font-mono); }
   .trace-box summary { cursor:pointer; color:var(--cyan); font-size:12px; padding:2px 0; }
   .trace-box .trace-step { padding:4px 8px; border-left:2px solid var(--border); margin:4px 0 4px 6px;
     white-space:pre-wrap; word-break:break-all; }
@@ -92,22 +99,8 @@
   .msg-system { align-self:center; font-size:12px; color:var(--muted); background:var(--bg-panel);
     border:1px solid var(--border); padding:8px 16px; border-radius:20px; }
 
-  /* ===== 隔离提示横幅 ===== */
-  .isolation-banner { padding:8px 20px; background:rgba(139,110,245,.08);
-    border-bottom:1px solid rgba(139,110,245,.2); font-size:12px; color:var(--violet);
-    display:flex; align-items:center; gap:8px; flex-shrink:0; }
-  .isolation-icon { font-size:14px; }
-
-  /* ===== 快捷操作区 ===== */
-  .quick-actions { padding:0 20px 8px; display:flex; gap:8px; flex-wrap:wrap; flex-shrink:0; }
-  .quick-btn { padding:5px 12px; border-radius:20px; font-size:12px; cursor:pointer;
-    background:var(--bg-card); border:1px solid var(--border); color:var(--text-secondary);
-    transition:all .15s; }
-  .quick-btn:hover { border-color:var(--violet); color:var(--violet); }
-
   /* ===== 输入区 ===== */
-  .input-area { padding:12px 20px 16px; border-top:1px solid var(--border); background:var(--bg-panel);
-    flex-shrink:0; }
+  .input-area { padding:12px 20px 16px; border-top:1px solid var(--border); background:var(--bg-panel); flex-shrink:0; }
   .input-row { display:flex; gap:10px; align-items:flex-end; }
   .input-wrap { flex:1; background:var(--bg-card); border:1px solid var(--border);
     border-radius:var(--radius-lg); overflow:hidden; transition:border-color .15s; }
@@ -116,91 +109,99 @@
     color:var(--text-primary); font-size:14px; font-family:var(--font-ui); resize:none;
     min-height:44px; max-height:160px; line-height:1.5; }
   .send-btn { padding:10px 18px; background:var(--violet); color:#fff; border:none;
-    border-radius:var(--radius-lg); font-size:14px; font-weight:600; cursor:pointer;
-    transition:all .15s; flex-shrink:0; }
+    border-radius:var(--radius-lg); font-size:14px; font-weight:600; cursor:pointer; transition:all .15s; flex-shrink:0; }
   .send-btn:hover { filter:brightness(1.1); }
   .send-btn:disabled { opacity:.4; cursor:not-allowed; }
 
-  /* ===== 空状态 ===== */
   .empty-state { flex:1; display:flex; flex-direction:column; align-items:center;
-    justify-content:center; gap:12px; color:var(--muted); }
+    justify-content:center; gap:12px; color:var(--muted); text-align:center; }
   .empty-title { font-size:16px; font-weight:600; }
-  .empty-sub { font-size:13px; text-align:center; max-width:360px; line-height:1.6; }
+  .empty-sub { font-size:13px; max-width:420px; line-height:1.7; }
 
-  /* ===== 无场景提示 ===== */
-  .no-scenario { flex:1; display:flex; align-items:center; justify-content:center;
-    flex-direction:column; gap:16px; color:var(--muted); padding:40px; }
+  /* ===== 配置面板（Modal） ===== */
+  .modal-mask { position:fixed; inset:0; background:rgba(0,0,0,.55); display:none;
+    align-items:center; justify-content:center; z-index:50; }
+  .modal-mask.show { display:flex; }
+  .modal { width:640px; max-width:92vw; max-height:86vh; overflow-y:auto; background:var(--bg-panel);
+    border:1px solid var(--border-lit); border-radius:var(--radius-lg); padding:22px 24px; }
+  .modal h2 { font-size:17px; margin-bottom:4px; }
+  .modal .m-ns { font-family:var(--font-mono); font-size:11px; color:var(--cyan); margin-bottom:12px; }
+  .modal-close { float:right; cursor:pointer; color:var(--muted); font-size:20px; line-height:1; }
+  .m-sec { margin-top:16px; }
+  .m-sec .m-h { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin-bottom:6px; }
+  .m-sec p { font-size:13px; line-height:1.6; color:var(--text-primary); }
+  .m-list { list-style:none; }
+  .m-list li { font-size:13px; line-height:1.6; padding-left:16px; position:relative; margin-bottom:2px; }
+  .m-list li::before { content:'▸'; position:absolute; left:0; color:var(--violet); }
+  .m-list.neg li::before { content:'✕'; color:var(--rose); font-size:11px; }
+  .tool-chip { display:inline-block; font-family:var(--font-mono); font-size:11px; padding:3px 8px;
+    background:var(--bg-card); border:1px solid var(--border); border-radius:6px; margin:0 4px 4px 0; color:var(--cyan); }
+  .code-block { position:relative; background:#0b0f16; border:1px solid var(--border); border-radius:var(--radius);
+    padding:12px 14px; font-family:var(--font-mono); font-size:12px; color:#cbd5e1; white-space:pre;
+    overflow-x:auto; line-height:1.5; }
+  .copy-btn { position:absolute; top:8px; right:8px; padding:3px 10px; font-size:11px; }
+  .m-btn-row { display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; align-items:center; }
+  .btn-violet { background:var(--violet); color:#fff; }
+  .btn-violet:hover { filter:brightness(1.1); }
+  .file-note { font-size:11px; color:var(--muted); margin-top:6px; }
 </style>
 </head>
 <body>
 
-<!-- 侧边栏：场景选择 -->
+<!-- 侧边栏：能力挂载 -->
 <div class="sidebar">
   <div class="sidebar-logo">
-    <div class="logo-title">Skill 验证通道</div>
-    <div class="logo-sub">v1.0.5 · isolated executor</div>
-    <div class="channel-badge">VERIFY</div>
+    <div class="logo-title">第三方 Agent 沙盒</div>
+    <div class="logo-sub">generic host · MCP mount</div>
+    <div class="channel-badge">SANDBOX</div>
   </div>
-  <div class="sidebar-section">
-    <div class="sidebar-label">选择场景</div>
-    <div id="scenarioList"></div>
+
+  <div class="sidebar-section mounted">
+    <div class="sidebar-label"><span>已挂载能力</span><span id="mountedCount">0</span></div>
+    <div id="mountedList"></div>
   </div>
+
+  <div class="sidebar-section market">
+    <div class="sidebar-label"><span>能力市场（可安装）</span></div>
+    <div id="marketList"></div>
+  </div>
+
   <div class="sidebar-footer">
     <a href="/" class="link-distill">← 返回蒸馏平台</a>
     <div style="margin-top:6px;font-size:10px;color:var(--muted)">
-      本通道只能调用 Skill 包工具<br>无法访问平台内部代码
+      本沙盒是一个「什么业务都不预置」的通用 Agent，<br>
+      只能看到你在此挂载的能力，自主决定何时调用。
     </div>
   </div>
 </div>
 
 <!-- 主区 -->
 <div class="main">
-  <!-- 隔离提示横幅 -->
   <div class="isolation-banner">
-    <span class="isolation-icon">🔒</span>
-    <span>验证通道已隔离：仅可调用 Skill 包工具（execute_skill / list_knowledge / search_knowledge / query_data），平台内部工具不可用。</span>
+    <span class="isolation-icon">🧩</span>
+    <span id="mountBanner">尚未挂载任何业务能力——此时它就是个普通助理。请在左侧「能力市场」安装一个场景能力后再试。</span>
   </div>
 
-  <!-- 验证测试数据 -->
-  <div class="isolation-banner" id="verifyDataBanner" style="display:none;border-bottom-color:rgba(57,214,131,.2);background:rgba(57,214,131,.06)">
-    <span class="isolation-icon">📁</span>
-    <span id="verifyDataText" style="flex:1"></span>
-    <input type="file" id="verifyFileInput" multiple style="display:none" onchange="onVerifyFilesPicked(this.files)">
-    <button class="btn btn-ghost" style="padding:3px 10px;font-size:11px" onclick="document.getElementById('verifyFileInput').click()">📤 上传新测试数据</button>
-    <button class="btn btn-ghost" id="clearVerifyDataBtn" style="padding:3px 10px;font-size:11px;display:none" onclick="clearVerifyData()">🗑 清空测试数据</button>
-  </div>
-
-  <!-- 顶栏 -->
-  <div class="topbar" id="topbar">
-    <span class="topbar-name" id="topbarName">请选择场景</span>
-    <span class="topbar-sub" id="topbarSub"></span>
-    <span class="status-badge badge-pending" id="statusBadge" style="display:none"></span>
+  <div class="topbar">
+    <span class="topbar-name">通用对话沙盒</span>
+    <span class="topbar-sub">第三方零改动挂载 · 自主发现 · 自主决策</span>
     <div class="topbar-actions">
-      <button class="btn btn-ghost" onclick="loadScenario(currentScenarioId)">刷新状态</button>
+      <button class="btn btn-ghost" onclick="clearChat()">清空对话</button>
+      <button class="btn btn-ghost" onclick="refreshAll()">刷新</button>
     </div>
   </div>
 
-  <!-- 快捷操作 -->
-  <div class="quick-actions" id="quickActions" style="display:none">
-    <span style="font-size:12px;color:var(--muted);line-height:28px">快捷操作：</span>
-    <button class="quick-btn" onclick="sendMsg('查看可以产出什么（list_outputs）')">查看可用产出</button>
-    <button class="quick-btn" onclick="sendMsg('列出所有知识条目')">浏览知识条目</button>
-    <button class="quick-btn" onclick="sendMsg('执行全量产出，params 为空（全部知识条目）')">执行全量产出</button>
-    <button class="quick-btn" onclick="sendMsg('查询业务数据，SELECT * FROM 第一张输入表 LIMIT 20')">查询业务数据</button>
-  </div>
-
-  <!-- 对话区 -->
   <div class="chat-area">
     <div class="messages" id="messages">
       <div class="empty-state" id="emptyState">
-        <div class="empty-title">选择一个已生成技能的场景</div>
-        <div class="empty-sub">在左侧选择场景后，即可在此验证 Skill 包是否能正确处理新业务数据。<br>验证通道与蒸馏平台完全隔离。</div>
+        <div class="empty-title">像配置 MCP 一样挂载业务能力</div>
+        <div class="empty-sub">在左侧「能力市场」点击「+ 安装」挂载一个业务场景能力；点 ⚙️ 可查看它的能力卡片与「粘贴即用」的 MCP 配置片段。挂载后，直接在下方用自然语言提出业务诉求，沙盒会自主判断是否调用、调用哪个能力。</div>
       </div>
     </div>
     <div class="input-area">
       <div class="input-row">
         <div class="input-wrap">
-          <textarea id="msgInput" placeholder="描述你想执行的操作，例如：执行全量产出、搜索某类知识条目..." rows="2"
+          <textarea id="msgInput" placeholder="用自然语言描述你的诉求（业务或通用皆可）……" rows="2"
             onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMsg();}"></textarea>
         </div>
         <button class="send-btn" id="sendBtn" onclick="sendMsg()">发送</button>
@@ -210,145 +211,177 @@
   </div>
 </div>
 
+<!-- 配置面板 Modal -->
+<div class="modal-mask" id="modalMask" onclick="if(event.target===this)closeConfig()">
+  <div class="modal" id="modalBody"></div>
+</div>
+
 <script>
 const API = '';
-let currentScenarioId = null;
 let isStreaming = false;
-let evtSource = null;
+let catalogCache = [];
 
-// ===== 场景列表 =====
-async function loadScenarios() {
+// ===== 能力市场 / 已挂载 =====
+async function refreshAll() {
+  await loadCatalog();
+  await loadHistory();
+}
+
+async function loadCatalog() {
   try {
-    const res = await fetch(`${API}/api/scenarios`);
-    const scenarios = await res.json();
-    renderScenarioList(scenarios);
-  } catch(e) {
-    console.error('加载场景失败', e);
-  }
+    const res = await fetch(`${API}/api/playground/catalog`);
+    const data = await res.json();
+    catalogCache = data.items || [];
+    renderCaps();
+  } catch(e) { console.error('加载能力目录失败', e); }
 }
 
-function renderScenarioList(scenarios) {
-  const el = document.getElementById('scenarioList');
-  el.innerHTML = '';
-  if (!scenarios.length) {
-    el.innerHTML = '<div style="font-size:12px;color:var(--muted);padding:8px 6px">暂无场景，请在蒸馏平台创建</div>';
-    return;
-  }
-  scenarios.forEach(s => {
-    const hasSkills = s.skills && s.skills.length > 0;
-    const item = document.createElement('div');
-    item.className = 'scenario-item' + (s.id === currentScenarioId ? ' active' : '');
-    item.innerHTML = `
-      <div class="scenario-dot ${hasSkills ? 'dot-ready' : 'dot-pending'}"></div>
-      <div class="scenario-name">${s.name}</div>
-      <div style="font-size:10px;color:var(--muted)">${hasSkills ? '✅' : '⏳'}</div>
-    `;
-    item.onclick = () => loadScenario(s.id);
-    el.appendChild(item);
-  });
-}
+function renderCaps() {
+  const mounted = catalogCache.filter(i => i.mounted);
+  const market = catalogCache.filter(i => !i.mounted);
+  document.getElementById('mountedCount').textContent = mounted.length;
 
-async function loadScenario(scenarioId) {
-  if (!scenarioId) return;
-  currentScenarioId = scenarioId;
-
-  try {
-    // 同时获取场景信息和验证状态
-    const [sRes, vRes] = await Promise.all([
-      fetch(`${API}/api/scenarios/${scenarioId}`),
-      fetch(`${API}/api/scenarios/${scenarioId}/verify/status`),
-    ]);
-    const scenario = await sRes.json();
-    const vStatus = await vRes.json();
-
-    // 更新顶栏
-    document.getElementById('topbarName').textContent = scenario.name;
-    document.getElementById('topbarSub').textContent = vStatus.verify_ready
-      ? `执行模式：${scenario.status}` : '技能包未就绪';
-
-    const badge = document.getElementById('statusBadge');
-    badge.style.display = '';
-    if (vStatus.verify_ready) {
-      badge.className = 'status-badge badge-ready';
-      badge.textContent = 'SKILL READY';
-      document.getElementById('quickActions').style.display = 'flex';
-    } else {
-      badge.className = 'status-badge badge-pending';
-      badge.textContent = 'SKILL PENDING';
-      document.getElementById('quickActions').style.display = 'none';
-    }
-
-    renderVerifyDataBanner(vStatus);
-
-    // 加载历史消息
-    const msgRes = await fetch(`${API}/api/scenarios/${scenarioId}/verify/messages`);
-    const msgs = await msgRes.json();
-    renderMessages(msgs, !vStatus.verify_ready ? scenario : null);
-
-    // 刷新侧边栏
-    loadScenarios();
-  } catch(e) {
-    console.error('加载场景失败', e);
-  }
-}
-
-// ===== 验证测试数据（与蒸馏通道 uploads/ 物理隔离） =====
-function renderVerifyDataBanner(vStatus) {
-  const banner = document.getElementById('verifyDataBanner');
-  const text = document.getElementById('verifyDataText');
-  const clearBtn = document.getElementById('clearVerifyDataBtn');
-  if (!vStatus.verify_ready) { banner.style.display = 'none'; return; }
-  banner.style.display = 'flex';
-  if (vStatus.using_verify_data) {
-    text.textContent = `当前使用验证通道新上传的测试数据（${vStatus.verify_data_files.length} 个文件：${vStatus.verify_data_files.join('、')}）`;
-    clearBtn.style.display = '';
+  // 顶部横幅
+  const banner = document.getElementById('mountBanner');
+  if (mounted.length === 0) {
+    banner.textContent = '尚未挂载任何业务能力——此时它就是个普通助理。请在左侧「能力市场」安装一个场景能力后再试。';
   } else {
-    text.textContent = '当前使用蒸馏阶段的原始数据（尚未上传新测试数据）——文件名须与技能表名一致';
-    clearBtn.style.display = 'none';
+    banner.textContent = `已挂载 ${mounted.length} 个业务能力：${mounted.map(m => m.display_name + '(' + m.namespace + ')').join('、')}。沙盒会先发现、再自主判断何时调用。`;
   }
+
+  // 已挂载
+  const mEl = document.getElementById('mountedList');
+  mEl.innerHTML = mounted.length ? '' : '<div style="font-size:12px;color:var(--muted);padding:4px 6px">（空）</div>';
+  mounted.forEach(i => mEl.appendChild(capCard(i, true)));
+
+  // 能力市场
+  const kEl = document.getElementById('marketList');
+  kEl.innerHTML = market.length ? '' : '<div style="font-size:12px;color:var(--muted);padding:4px 6px">暂无可安装能力，请先在蒸馏平台「生成技能」。</div>';
+  market.forEach(i => kEl.appendChild(capCard(i, false)));
 }
 
-async function onVerifyFilesPicked(files) {
-  if (!currentScenarioId || !files || !files.length) return;
+function capCard(item, isMounted) {
+  const div = document.createElement('div');
+  div.className = 'cap-item' + (isMounted ? ' mounted-item' : '');
+  const actions = isMounted
+    ? `<button class="mini-btn" onclick="openConfig('${item.scenario_id}')">⚙️ 配置</button>
+       <button class="mini-btn remove" onclick="unmountCap('${item.scenario_id}')">✕ 卸载</button>`
+    : `<button class="mini-btn install" onclick="mountCap('${item.scenario_id}')">+ 安装</button>
+       <button class="mini-btn" onclick="openConfig('${item.scenario_id}')">详情</button>`;
+  div.innerHTML = `
+    <div class="cap-head">
+      <div class="cap-dot ${isMounted ? '' : 'off'}"></div>
+      <div class="cap-name">${esc(item.display_name)}</div>
+      <div class="cap-ns">${esc(item.namespace)}</div>
+    </div>
+    <div class="cap-summary">${esc(item.summary || '')}</div>
+    <div class="cap-actions">${actions}</div>`;
+  return div;
+}
+
+async function mountCap(sid) {
+  try {
+    const res = await fetch(`${API}/api/playground/mounts/${sid}`, { method: 'POST' });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    await loadCatalog();
+  } catch(e) { alert('安装失败：' + e.message); }
+}
+async function unmountCap(sid) {
+  await fetch(`${API}/api/playground/mounts/${sid}`, { method: 'DELETE' });
+  await loadCatalog();
+}
+
+// ===== 配置面板 =====
+async function openConfig(sid) {
+  const mask = document.getElementById('modalMask');
+  const body = document.getElementById('modalBody');
+  body.innerHTML = '<div style="padding:20px;color:var(--muted)">加载中…</div>';
+  mask.classList.add('show');
+  try {
+    const [cfgRes, upRes] = await Promise.all([
+      fetch(`${API}/api/playground/mounts/${sid}/config`),
+      fetch(`${API}/api/playground/scenarios/${sid}/uploads`),
+    ]);
+    const cfg = await cfgRes.json();
+    const up = await upRes.json();
+    renderConfig(cfg, up, sid);
+  } catch(e) {
+    body.innerHTML = `<div style="padding:20px;color:var(--rose)">加载失败：${esc(e.message)}</div>`;
+  }
+}
+function closeConfig() { document.getElementById('modalMask').classList.remove('show'); }
+
+function renderConfig(cfg, up, sid) {
+  const card = cfg.card || {};
+  const snippet = JSON.stringify(cfg.config_example || {}, null, 2);
+  const tools = (card.tools || []).map(t => `<span class="tool-chip">${esc(t.name || t)}</span>`).join('');
+  const whenList = (card.when_to_use || []).map(w => `<li>${esc(w)}</li>`).join('');
+  const notList = (card.not_for || []).map(w => `<li>${esc(w)}</li>`).join('');
+  const files = (up.files || []);
+  document.getElementById('modalBody').innerHTML = `
+    <span class="modal-close" onclick="closeConfig()">×</span>
+    <h2>${esc(card.display_name || '')}</h2>
+    <div class="m-ns">命名空间：${esc(card.namespace || '')} · 执行模式：${esc(card.execution_mode || '')}</div>
+
+    <div class="m-sec"><div class="m-h">能力摘要</div><p>${esc(card.summary || '')}</p></div>
+    <div class="m-sec"><div class="m-h">何时使用（when_to_use）</div><ul class="m-list">${whenList || '<li>—</li>'}</ul></div>
+    <div class="m-sec"><div class="m-h">何时不要使用（not_for）</div><ul class="m-list neg">${notList || '<li>—</li>'}</ul></div>
+    <div class="m-sec"><div class="m-h">提供的工具（命名空间隔离，多场景不冲突）</div><div>${tools || '—'}</div></div>
+
+    <div class="m-sec">
+      <div class="m-h">作为 MCP Server 挂载到第三方宿主（粘贴即用）</div>
+      <div class="code-block"><button class="btn btn-ghost copy-btn" onclick="copySnippet(this)">复制</button>${esc(snippet)}</div>
+      <div class="file-note">把以上片段粘进 Claude Desktop / Cursor / Cline 等宿主的 MCP 配置即可，宿主会自动发现上面这些 <code>${esc(card.namespace)}__*</code> 工具，无需改动任何第三方代码。</div>
+    </div>
+
+    <div class="m-sec">
+      <div class="m-h">测试数据（沙盒执行时优先使用）</div>
+      <div class="file-note">当前：${files.length ? esc(files.join('、')) : '（无，回退使用蒸馏阶段原始数据）'}</div>
+      <div class="m-btn-row">
+        <input type="file" id="cfgFileInput" multiple style="display:none" onchange="uploadTestData('${sid}', this.files)">
+        <button class="btn btn-ghost" onclick="document.getElementById('cfgFileInput').click()">📤 上传测试数据</button>
+        <span class="file-note" style="margin:0">文件名（不含后缀）须与场景表名一致</span>
+      </div>
+    </div>`;
+}
+
+function copySnippet(btn) {
+  const pre = btn.parentElement;
+  const text = pre.innerText.replace(/^复制\n?/, '');
+  navigator.clipboard.writeText(text).then(() => { btn.textContent = '已复制'; setTimeout(() => btn.textContent = '复制', 1500); });
+}
+
+async function uploadTestData(sid, files) {
+  if (!files || !files.length) return;
   const form = new FormData();
   Array.from(files).forEach(f => form.append('files', f));
   try {
-    const res = await fetch(`${API}/api/scenarios/${currentScenarioId}/verify/uploads`, { method: 'POST', body: form });
+    const res = await fetch(`${API}/api/playground/scenarios/${sid}/uploads`, { method: 'POST', body: form });
     if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
-    document.getElementById('verifyFileInput').value = '';
-    await loadScenario(currentScenarioId);
-    appendMsg('ai', '✅ 已上传新测试数据，后续 execute_skill / query_data 会优先使用这批新数据。');
-  } catch(e) {
-    alert('上传失败：' + e.message);
-  }
+    openConfig(sid);
+  } catch(e) { alert('上传失败：' + e.message); }
 }
 
-async function clearVerifyData() {
-  if (!currentScenarioId) return;
-  if (!confirm('确定清空验证通道的测试数据？之后将退回使用蒸馏阶段的原始数据。')) return;
-  await fetch(`${API}/api/scenarios/${currentScenarioId}/verify/uploads`, { method: 'DELETE' });
-  await loadScenario(currentScenarioId);
+// ===== 历史消息 =====
+async function loadHistory() {
+  try {
+    const res = await fetch(`${API}/api/playground/messages`);
+    const msgs = await res.json();
+    renderMessages(msgs);
+  } catch(e) { console.error(e); }
 }
 
-function renderMessages(msgs, pendingScenario) {
+function renderMessages(msgs) {
   const el = document.getElementById('messages');
   el.innerHTML = '';
-
   if (!msgs.length) {
-    if (pendingScenario) {
-      el.innerHTML = `
-        <div class="msg msg-system">
-          ⚠️ 场景「${pendingScenario.name}」尚未生成技能包。请先在<a href="/" style="color:var(--cyan)">蒸馏平台</a>完成推导+生成技能步骤。
-        </div>`;
-    } else {
-      document.getElementById('emptyState').style.display = '';
-      return;
-    }
+    el.innerHTML = `<div class="empty-state" id="emptyState">
+      <div class="empty-title">像配置 MCP 一样挂载业务能力</div>
+      <div class="empty-sub">在左侧「能力市场」点击「+ 安装」挂载一个业务场景能力；点 ⚙️ 可查看能力卡片与「粘贴即用」的 MCP 配置片段。挂载后直接在下方用自然语言提出诉求即可。</div></div>`;
+    return;
   }
-
   msgs.forEach(m => {
     appendMsg(m.role === 'user' ? 'user' : 'ai', m.content);
-    // 助手消息若带执行轨迹，渲染为可折叠详情，保证历史执行过程可追溯
     if (m.role !== 'user' && m.tools && m.tools.length) {
       const box = document.createElement('details');
       box.className = 'trace-box';
@@ -369,8 +402,7 @@ function renderMessages(msgs, pendingScenario) {
 
 function appendMsg(role, content, id) {
   const emptyEl = document.getElementById('emptyState');
-  if (emptyEl) emptyEl.style.display = 'none';
-
+  if (emptyEl) emptyEl.remove();
   const el = document.getElementById('messages');
   const div = document.createElement('div');
   div.className = `msg msg-${role}`;
@@ -381,170 +413,128 @@ function appendMsg(role, content, id) {
   return div;
 }
 
+async function clearChat() {
+  if (!confirm('清空沙盒对话历史？')) return;
+  await fetch(`${API}/api/playground/messages`, { method: 'DELETE' });
+  await loadHistory();
+}
+
 // ===== 发送消息 =====
 let abortCtrl = null;
-
 function setStreaming(on) {
   isStreaming = on;
   document.getElementById('sendBtn').disabled = on;
   document.getElementById('stopBtn').style.display = on ? '' : 'none';
 }
-
-function stopStreaming() {
-  if (abortCtrl) abortCtrl.abort();
-}
-
+function stopStreaming() { if (abortCtrl) abortCtrl.abort(); }
 function getStatusLine(create) {
   let line = document.getElementById('statusLine');
   if (!line && create) {
     line = document.createElement('div');
-    line.id = 'statusLine';
-    line.className = 'status-line';
+    line.id = 'statusLine'; line.className = 'status-line';
     document.getElementById('messages').appendChild(line);
   }
   return line;
 }
-
-function removeStatusLine() {
-  const line = document.getElementById('statusLine');
-  if (line) line.remove();
-}
+function removeStatusLine() { const l = document.getElementById('statusLine'); if (l) l.remove(); }
 
 async function sendMsg(preset) {
-  if (!currentScenarioId) {
-    alert('请先在左侧选择一个场景');
-    return;
-  }
   if (isStreaming) return;
-
   const input = document.getElementById('msgInput');
   const text = (preset || input.value).trim();
   if (!text) return;
-
   input.value = '';
   setStreaming(true);
   abortCtrl = new AbortController();
-
   appendMsg('user', text);
-
-  const aiId = `ai_${Date.now()}`;
-  const aiDiv = appendMsg('ai', '…', aiId);
+  const aiDiv = appendMsg('ai', '…', `ai_${Date.now()}`);
   let aiContent = '';
-
-  // 初始状态提示：在收到第一帧之前也让用户看到"正在处理"
-  const sl = getStatusLine(true);
-  sl.textContent = '已提交，AI 正在处理…';
+  const sl = getStatusLine(true); sl.textContent = '已提交，AI 正在处理…';
 
   try {
-    const res = await fetch(`${API}/api/scenarios/${currentScenarioId}/verify/chat`, {
+    const res = await fetch(`${API}/api/playground/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message: text }),
       signal: abortCtrl.signal,
     });
-
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
-
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       buf += decoder.decode(value, { stream: true });
-
       const lines = buf.split('\n');
       buf = lines.pop();
-
       for (const line of lines) {
         if (!line.startsWith('data:')) continue;
         const raw = line.slice(5).trim();
         if (raw === '[DONE]') continue;
-        try {
-          const ev = JSON.parse(raw);
-          handleSSE(ev, aiDiv, aiContent, (c) => { aiContent = c; });
-        } catch(_) {}
+        try { handleSSE(JSON.parse(raw), aiDiv, aiContent, (c) => { aiContent = c; }); } catch(_) {}
       }
     }
   } catch(e) {
     if (e.name === 'AbortError') {
-      aiDiv.textContent = (aiContent ? aiContent + '\n\n' : '')
-        + '🛑 已停止等待。该任务已作废，下一条消息将作为全新任务处理。';
+      aiDiv.textContent = (aiContent ? aiContent + '\n\n' : '') + '🛑 已停止等待。该任务已作废。';
     } else {
       aiDiv.textContent = `❌ 请求失败：${e.message}`;
     }
   } finally {
-    removeStatusLine();
-    setStreaming(false);
-    abortCtrl = null;
+    removeStatusLine(); setStreaming(false); abortCtrl = null;
   }
 }
 
 function handleSSE(ev, aiDiv, aiContent, setContent) {
   const el = document.getElementById('messages');
   if (ev.type === 'content') {
-    const newContent = aiContent + (ev.delta || '');
-    setContent(newContent);
-    aiDiv.textContent = newContent;
-    removeStatusLine();
-    el.scrollTop = el.scrollHeight;
+    const c = aiContent + (ev.delta || ''); setContent(c); aiDiv.textContent = c;
+    removeStatusLine(); el.scrollTop = el.scrollHeight;
   } else if (ev.type === 'thinking') {
-    // 思考内容不逐字显示，但更新状态行让用户知道 AI 在推理
-    const line = getStatusLine(true);
-    line.textContent = 'AI 推理中…';
+    getStatusLine(true).textContent = 'AI 推理中…';
   } else if (ev.type === 'heartbeat') {
-    // 后端心跳：工具执行较久时持续告知进度，杜绝"死界面"
-    const line = getStatusLine(true);
-    line.textContent = ev.message || `执行中…（已 ${ev.elapsed || '?'}s）`;
+    getStatusLine(true).textContent = ev.message || `执行中…（已 ${ev.elapsed || '?'}s）`;
     el.scrollTop = el.scrollHeight;
   } else if (ev.type === 'tool_call') {
-    const toolDiv = document.createElement('div');
-    toolDiv.className = 'msg msg-tool';
+    const d = document.createElement('div'); d.className = 'msg msg-tool';
     const args = (ev.args || '').slice(0, 160);
-    toolDiv.textContent = `🔧 ${ev.name || ''}(${args}${(ev.args || '').length > 160 ? '…' : ''})`;
-    el.insertBefore(toolDiv, aiDiv);
-    const line = getStatusLine(true);
-    line.textContent = `正在执行 ${ev.name || '工具'}…`;
+    d.textContent = `🔧 ${ev.name || ''}(${args}${(ev.args || '').length > 160 ? '…' : ''})`;
+    el.insertBefore(d, aiDiv);
+    getStatusLine(true).textContent = `正在执行 ${ev.name || '工具'}…`;
     el.scrollTop = el.scrollHeight;
   } else if (ev.type === 'tool_result') {
-    const rDiv = document.createElement('div');
-    rDiv.className = 'msg msg-tool-result';
+    const d = document.createElement('div'); d.className = 'msg msg-tool-result';
     const elapsed = (ev.elapsed !== null && ev.elapsed !== undefined) ? ` · ${ev.elapsed}s` : '';
     const result = (ev.result || '').slice(0, 220);
-    rDiv.textContent = `✔ ${ev.name || ''}${elapsed}｜${result}${(ev.result || '').length > 220 ? '…' : ''}`;
-    el.insertBefore(rDiv, aiDiv);
-    removeStatusLine();
-    el.scrollTop = el.scrollHeight;
+    d.textContent = `✔ ${ev.name || ''}${elapsed}｜${result}${(ev.result || '').length > 220 ? '…' : ''}`;
+    el.insertBefore(d, aiDiv); removeStatusLine(); el.scrollTop = el.scrollHeight;
   } else if (ev.type === 'trace') {
-    const box = document.createElement('details');
-    box.className = 'trace-box';
+    const box = document.createElement('details'); box.className = 'trace-box';
     const steps = ev.steps || [];
     const total = ev.total_elapsed !== undefined ? `，共 ${ev.total_elapsed}s` : '';
-    const summary = document.createElement('summary');
-    summary.textContent = `📋 本轮执行轨迹（${steps.length} 次工具调用${total}）`;
-    box.appendChild(summary);
-    steps.forEach((s, i) => {
-      const step = document.createElement('div');
-      step.className = 'trace-step';
-      step.textContent = `${i + 1}. ${s.name}(${(s.args || '').slice(0, 200)})\n   → ${(s.result || '').slice(0, 300)}`;
+    const s = document.createElement('summary');
+    s.textContent = `📋 本轮执行轨迹（${steps.length} 次工具调用${total}）`;
+    box.appendChild(s);
+    steps.forEach((st, i) => {
+      const step = document.createElement('div'); step.className = 'trace-step';
+      step.textContent = `${i + 1}. ${st.name}(${(st.args || '').slice(0, 200)})\n   → ${(st.result || '').slice(0, 300)}`;
       box.appendChild(step);
     });
-    el.insertBefore(box, aiDiv.nextSibling);
-    el.scrollTop = el.scrollHeight;
+    el.insertBefore(box, aiDiv.nextSibling); el.scrollTop = el.scrollHeight;
   } else if (ev.type === 'error') {
-    const errDiv = document.createElement('div');
-    errDiv.className = 'msg msg-system';
-    errDiv.textContent = `❌ ${ev.message || '未知错误'}`;
-    el.insertBefore(errDiv, aiDiv);
-    removeStatusLine();
-    el.scrollTop = el.scrollHeight;
+    const d = document.createElement('div'); d.className = 'msg msg-system';
+    d.textContent = `❌ ${ev.message || '未知错误'}`;
+    el.insertBefore(d, aiDiv); removeStatusLine(); el.scrollTop = el.scrollHeight;
   } else if (ev.type === 'done') {
     removeStatusLine();
   }
 }
 
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
 // ===== 初始化 =====
-loadScenarios();
-setInterval(loadScenarios, 30000);
+refreshAll();
+setInterval(loadCatalog, 30000);
 </script>
 </body>
 </html>
