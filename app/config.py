@@ -63,6 +63,20 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8000
 
+    # ===== MCP 对外交付（第三方远程挂载）=====
+    # 第三方宿主（Claude Desktop / Cursor / Cline 等）远程挂载本平台能力时使用的
+    # 公网基址。开发/测试留空即可——此时后端按「请求所用的主机地址」（本机 IP / 域名）
+    # 自动生成安装链接；正式环境在此填固定域名，如 https://mcp.example.com 。
+    mcp_public_base_url: str = ""
+    # 可选：远程 MCP 访问令牌。留空则端点公开（与旧版 stdio 交付一致）；
+    # 填值后 /api/mcp/* 端点要求携带 `Authorization: Bearer <token>`（生成的配置会自动带上）。
+    mcp_access_token: str = ""
+
+    @property
+    def mcp_base_url(self) -> str:
+        """已配置的对外基址（去掉尾部斜杠）；未配置返回空串。"""
+        return self.mcp_public_base_url.strip().rstrip("/")
+
     @property
     def data_path(self) -> Path:
         """数据根目录的绝对路径（不存在时自动创建）。"""

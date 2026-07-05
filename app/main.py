@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import __version__
 from .api import api_router
+from .api.mcp_http import register_mcp_routes
 from .auth.db import init_db
 from .config import settings
 
@@ -43,6 +44,9 @@ app.add_middleware(
 )
 
 app.include_router(api_router)
+
+# 远程 MCP 交付端点（/api/mcp/*）。须在挂载 SPA `/` 之前注册，避免被静态回退吞掉。
+register_mcp_routes(app)
 
 
 @app.get("/api/health")

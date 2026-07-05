@@ -123,22 +123,60 @@ def catalog(user_id: str) -> list[dict]:
     return items
 
 
-def mount_config(scenario_id: str) -> dict:
-    """返回某场景的能力卡片 + 粘贴即用的 MCP 配置片段（配置面板用）。"""
+def public_base_url(request) -> str:
+    """解析对外基址：优先用 .env 的固定域名；未配置则按本次请求的主机地址推导。
+
+    这样开发/测试无需任何配置，第三方就能用「访问本服务所用的地址」安装；
+    正式环境在 .env 配 MCP_PUBLIC_BASE_URL 即切换到固定域名。
+    """
+    env = settings.mcp_base_url
+    if env:
+        return env
+    return str(request.base_url).rstrip("/")
+
+
+def build_install_config(scenario_id: str, base_url: str) -> dict:
+    """据对外基址生成远程 MCP 安装配置（URL 化，第三方零本地依赖即可挂载）。
+
+    返回两种粘贴即用形态：
+    - config_example：走 `mcp-remote` 桥接，兼容仅支持 stdio 的宿主（如 Claude Desktop）
+    - config_example_native：直接给 `url`，供原生支持远程 MCP 的宿主（Cursor / Cline 等）
+    """
     pkg = _pkg_for(scenario_id)
     if not pkg:
         return {}
-    cfg_file = Path(store.skills_dir(scenario_id)) / "mcp_config.example.json"
-    config_example = {}
-    if cfg_file.exists():
-        try:
-            config_example = json.loads(cfg_file.read_text(encoding="utf-8"))
-        except Exception:
-            config_example = {}
+    ns = pkg.namespace
+    base = base_url.rstrip("/")
+    sse_url = f"{base}/api/mcp/{scenario_id}/sse"
+    token = settings.mcp_access_token.strip()
+    key = f"bfe-{ns}"
+
+    remote_args = ["-y", "mcp-remote", sse_url]
+    native_entry: dict = {"url": sse_url}
+    if token:
+        remote_args += ["--header", f"Authorization: Bearer {token}"]
+        native_entry["headers"] = {"Authorization": f"Bearer {token}"}
+
+    return {
+        "sse_url": sse_url,
+        "base_url": base,
+        "base_from_env": bool(settings.mcp_base_url),
+        "requires_token": bool(token),
+        "config_example": {"mcpServers": {key: {"command": "npx", "args": remote_args}}},
+        "config_example_native": {"mcpServers": {key: native_entry}},
+    }
+
+
+def mount_config(scenario_id: str, base_url: str) -> dict:
+    """返回某场景的能力卡片 + 面向第三方的远程 MCP 安装配置（配置面板用）。"""
+    pkg = _pkg_for(scenario_id)
+    if not pkg:
+        return {}
+    install = build_install_config(scenario_id, base_url)
     return {
         "scenario_id": scenario_id,
         "card": pkg.card,
-        "config_example": config_example,
+        **install,
         "skills_dir": str(Path(store.skills_dir(scenario_id)).resolve()),
     }
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 from .. import playground_service as pg
@@ -59,9 +59,11 @@ def unmount_scenario(scenario_id: str, user: PublicUser = Depends(get_current_us
 
 
 @router.get("/mounts/{scenario_id}/config")
-def get_mount_config(scenario_id: str, user: PublicUser = Depends(get_current_user)) -> dict:
+def get_mount_config(
+    scenario_id: str, request: Request, user: PublicUser = Depends(get_current_user)
+) -> dict:
     _require_owned(scenario_id, user)
-    cfg = pg.mount_config(scenario_id)
+    cfg = pg.mount_config(scenario_id, pg.public_base_url(request))
     if not cfg:
         raise HTTPException(status_code=404, detail="能力包不存在或未生成 MCP 描述符")
     return cfg

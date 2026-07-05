@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import transform_builder
+from .config import settings
 from .models import DomainKnowledge, FlowStep, KnowledgeSchemaMapping, Scenario, Skill, TableRole
 from .storage import store
 
@@ -2119,13 +2120,25 @@ def _write_mcp_descriptor(
 
     tools = _mcp_tool_defs(ns, card, scenario)
 
+    # 对外基址：已配置固定域名则用之，否则给占位符（真正的安装链接在配置面板按实际
+    # 访问地址动态生成，见 playground_service.build_install_config）。
+    base = settings.mcp_base_url or "http://<你的服务地址>:8000"
+    sse_url = f"{base}/api/mcp/{scenario.id}/sse"
+
     # ---- mcp.json：能力卡片 + 命名空间化工具定义 ----
     mcp_doc = {
         "protocol": "mcp",
         "spec_version": "2024-11-05",
         "scenario_id": scenario.id,
         **card,
+        # 首选：远程 HTTP(SSE) 交付，第三方零本地依赖即可挂载
         "server": {
+            "transport": "sse",
+            "url": sse_url,
+            "note": "开发/测试用本服务实际访问地址；正式环境在 .env 配 MCP_PUBLIC_BASE_URL",
+        },
+        # 备选：离线场景可用 stdio 本地起服务（需能访问本包目录）
+        "server_stdio_fallback": {
             "transport": "stdio",
             "command": "python",
             "args": ["-m", "app.mcp_server", "--pkg", pkg_abs],
@@ -2136,12 +2149,12 @@ def _write_mcp_descriptor(
         json.dumps(mcp_doc, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    # ---- mcp_config.example.json：粘贴即用的第三方宿主配置片段 ----
+    # ---- mcp_config.example.json：粘贴即用的第三方宿主配置片段（远程 URL 化）----
     config_example = {
         "mcpServers": {
             f"bfe-{ns}": {
-                "command": "python",
-                "args": ["-m", "app.mcp_server", "--pkg", pkg_abs],
+                "command": "npx",
+                "args": ["-y", "mcp-remote", sse_url],
             }
         }
     }
