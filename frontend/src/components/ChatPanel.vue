@@ -238,7 +238,7 @@ async function clearHistory() {
   } catch { /* cancelled */ }
 }
 
-defineExpose({ reload: loadHistory })
+defineExpose({ reload: loadHistory, send })
 </script>
 
 <style scoped lang="scss">

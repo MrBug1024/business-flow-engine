@@ -24,6 +24,7 @@ export interface Scenario {
   created_at: number
   updated_at: number
   tables_meta: TableMeta[]
+  trace_chain?: any
   relations?: any
   flow?: any
   outputs?: any[]

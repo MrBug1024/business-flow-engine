@@ -1,6 +1,6 @@
 """蒸馏对话服务（v1.0.5）。
 
-职责：蒸馏阶段的流式对话（推导关联/流程/生成技能）。
+职责：蒸馏阶段的流式对话（链路追踪/推导关联/流程/生成技能）。
 与验证通道（verify_service.py）完全分离，不提供执行/验证功能。
 """
 
@@ -11,7 +11,7 @@ from typing import AsyncIterator, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage
 
-from . import executor, inference, transform_builder
+from . import clarifications, executor, inference, scenario_state, transform_builder
 from .agent import build_agent
 from .llm import get_llm
 from .models import (
@@ -29,6 +29,7 @@ from .tools import TOOL_REFRESH_MAP
 
 # 蒸馏工具名 → 完成后应推送的状态
 _TOOL_STATUS_MAP = {
+    "trace_data_links": ScenarioStatus.TRACE_SAMPLED,
     "deduce_relations": ScenarioStatus.RELATIONS_DEDUCED,
     "deduce_flow": ScenarioStatus.FLOW_DEDUCED,
     "generate_skills": ScenarioStatus.SKILLS_GENERATED,
@@ -202,8 +203,8 @@ def _step_interaction(tool_name: str, result_obj) -> Optional[dict]:
     """把工具的待确认事项渲染为**逐题**结构化问答面板（对齐 Claude AskUserQuestion）。
 
     优先用结果对象里的结构化 `clarifications`（每题自带 options/allow_custom/multi_select）；
-    没有则把纯字符串 `ambiguous_questions` 逐条包装成独立问答卡（默认「确认无误 / 需要修正」
-    两个可选项 + 允许自定义）。这样用户可**逐题**选择或自行描述，而不是面对一整段正文。
+    没有则把纯字符串 `ambiguous_questions` 先做去重降噪，再生成带推荐项的可选答案。
+    这样用户可**逐题**选择或自行描述，而不是面对一整段正文。
 
     严格要求：用户没回答前，agent **不应**进入下一步。
     """
@@ -225,13 +226,14 @@ def _step_interaction(tool_name: str, result_obj) -> Optional[dict]:
             })
     else:
         raw = list(getattr(result_obj, "ambiguous_questions", None) or [])
-        for i, q in enumerate(raw[:8]):
+        generated = clarifications.build_clarifications(raw, context=tool_name)
+        for i, c in enumerate(generated[:8]):
             questions.append({
-                "id": f"{tool_name}_q{i}",
-                "question": q,
-                "options": ["确认无误", "需要修正（在下方补充）"],
-                "allow_custom": True,
-                "multi_select": False,
+                "id": getattr(c, "id", "") or f"{tool_name}_q{i}",
+                "question": c.question,
+                "options": list(c.options or []),
+                "allow_custom": bool(c.allow_custom),
+                "multi_select": bool(c.multi_select),
             })
 
     if not questions:
@@ -249,6 +251,7 @@ def _step_interaction(tool_name: str, result_obj) -> Optional[dict]:
 # 启发式降级路径
 # ===========================================================================
 _INTENT_KEYWORDS = {
+    "trace":     ("数据链路追踪", "链路追踪", "追踪链路", "追踪样本", "因果链", "trace"),
     "relations": ("关联", "关系", "ER", "字段语义", "字段含义", "推导关联"),
     "flow":      ("流程", "推导流程", "业务流程", "节点", "管线"),
     "skills":    ("技能", "skill", "技能库", "固化", "生成技能"),
@@ -274,19 +277,53 @@ async def _stream_heuristic(scenario: Scenario, user_message: str) -> AsyncItera
         return sse("content", delta=text)
 
     if not scenario.tables_meta and intent != "general":
-        yield emit_content("当前业务场景尚未上传业务表，请先上传业务表/规则表/历史结果表（上传时选择角色）。")
+        yield emit_content("当前业务场景尚未上传业务表，请先上传业务表/知识表（可选）/历史结果表（上传时选择角色）。")
         _persist_assistant(scenario, content_buf)
         return
 
-    if intent == "relations":
+    if intent == "trace":
+        yield sse("thinking", delta="以结果表样本为锚点追踪业务表/知识表链路……")
+        yield sse("tool_call", name="trace_data_links", args="追踪驱动采样：结果表锚点→业务/知识表对应行")
+        from . import trace_sampling, validators  # noqa: PLC0415
+        report = trace_sampling.trace_sampling(scenario)
+        check = validators.validate_trace_connectivity(report)
+        report["connectivity_check"] = check.to_dict()
+        scenario.trace_chain = report
+        scenario_state.invalidate_after_trace(scenario)
+        store.save(scenario)
+        result_summary = f"{check.message}；{report.get('trace_summary', '')}"
+        yield sse("tool_result", name="trace_data_links", result=result_summary)
+        yield sse("refresh", resource="trace")
+        yield sse("status", status=scenario.status.value)
+        traced_lines = []
+        for tbl, info in (report.get("trace_map") or {}).items():
+            by = info.get("matched_by", "")
+            rows = info.get("matched_rows", [])
+            if by and by != "random":
+                traced_lines.append(f"- {tbl}：通过「{by}」追踪到 {len(rows)} 行，置信度 {info.get('trace_confidence', '?')}")
+            else:
+                traced_lines.append(f"- {tbl}：未追踪到稳定链路，当前为随机样本")
+        yield emit_content(
+            f"已完成数据链路追踪。\n\n{result_summary}\n\n"
+            + ("\n".join(traced_lines) or "未形成可展示链路。")
+            + "\n\n请在「表格 & 字段」里展开每张表的追踪链路样本核对；确认无误后再说「推导关联关系」。"
+        )
+
+    elif intent == "relations":
+        if not scenario.trace_chain:
+            yield emit_content(
+                "⚠️ 请先执行「数据链路追踪」。关联推导需要使用以结果样本为锚点追踪到的链路数据，"
+                "否则容易退化成字段名/全量值域猜测，既慢也容易问出无意义问题。"
+            )
+            _persist_assistant(scenario, content_buf)
+            return
         yield sse("thinking", delta="推导字段业务语义 + 表关联……")
         yield sse("tool_call", name="deduce_relations", args="启发式：字段语义+关联推导")
         result = inference.infer_relations(scenario)
         scenario.relations = result
+        scenario_state.invalidate_after_relations(scenario)
         domain = transform_builder.build_domain_knowledge(scenario)
         scenario.domain_knowledge = domain
-        if scenario.status in (ScenarioStatus.CREATED, ScenarioStatus.TABLES_UPLOADED):
-            scenario.status = ScenarioStatus.RELATIONS_DEDUCED
         store.save(scenario)
         yield sse("tool_result", name="deduce_relations", result=result.summary)
         yield sse("refresh", resource="relations")
@@ -305,15 +342,22 @@ async def _stream_heuristic(scenario: Scenario, user_message: str) -> AsyncItera
         if not scenario.relations:
             yield emit_content("⚠️ 请先「推导关联关系」（含字段语义），流程节点的能力描述与模板分派依赖这两份产物。")
         else:
-            yield sse("thinking", delta="基于（表角色+字段语义+关联+规则结构）反推业务流程节点……")
+            yield sse("thinking", delta="基于（表角色+字段语义+关联+知识结构）反推业务流程节点……")
             yield sse("tool_call", name="deduce_flow", args="启发式：业务流程推导")
             result = inference.infer_flow(scenario)
+            if not result.flow_steps:
+                yield sse("tool_result", name="deduce_flow", result="未生成流程节点")
+                yield emit_content(
+                    "🛑 业务流程推导没有生成任何流程节点，当前不会保存为已推导流程。\n\n"
+                    f"{result.summary or '请先检查表角色、追踪链路样本和关联关系后再重试。'}"
+                )
+                _persist_assistant(scenario, content_buf)
+                return
             scenario.flow = result
+            scenario_state.invalidate_after_flow(scenario)
             domain = transform_builder.build_domain_knowledge(scenario)
             scenario.domain_knowledge = domain
             scenario.outputs = transform_builder.build_outputs(scenario, domain)
-            if scenario.status in (ScenarioStatus.RELATIONS_DEDUCED, ScenarioStatus.TABLES_UPLOADED):
-                scenario.status = ScenarioStatus.FLOW_DEDUCED
             store.save(scenario)
             yield sse("tool_result", name="deduce_flow", result=result.summary)
             yield sse("refresh", resource="flow")
@@ -356,7 +400,7 @@ async def _stream_heuristic(scenario: Scenario, user_message: str) -> AsyncItera
             names = "\n".join(f"- {s.name}（{s.operation}）" for s in materialized)
             yield emit_content(
                 f"已生成 {len(materialized)} 个技能：\n\n{names}\n\n"
-                "下一步：对我说「执行」对新数据复刻并对照历史结果。"
+                "蒸馏通道到此结束。执行和验证请切换到「验证通道」。"
             )
 
     elif intent == "execute":
@@ -380,12 +424,13 @@ async def _stream_heuristic(scenario: Scenario, user_message: str) -> AsyncItera
         yield emit_content(
             f"收到：「{user_message}」。\n\n"
             f"当前场景「{scenario.name}」状态：{scenario.status.value}\n表角色：{roles}\n\n"
-            "（无 LLM 模式）5 步工作流：\n"
-            "① 上传业务表 + 规则表(可选) + 历史结果表（上传时选角色）\n"
-            "② 对我说「推导关联关系」（含字段语义）\n"
-            "③ 对我说「推导业务流程」（节点带能力描述 + 规则结构映射）\n"
-            "④ 对我说「生成技能库」（按节点固化）\n"
-            "⑤ 对我说「执行」（含校验）"
+            "（无 LLM 模式）6 步工作流：\n"
+            "① 上传业务表 + 知识表(可选) + 历史结果表（上传时选角色）\n"
+            "② 对我说「数据链路追踪」（以结果样本为锚点追业务/知识表）\n"
+            "③ 对我说「推导关联关系」（含字段语义）\n"
+            "④ 对我说「推导业务流程」（节点带能力描述 + 知识结构映射）\n"
+            "⑤ 对我说「生成技能库」（按节点固化）\n"
+            "⑥ 切换到「验证通道」执行和校验"
         )
 
     _persist_assistant(scenario, content_buf)

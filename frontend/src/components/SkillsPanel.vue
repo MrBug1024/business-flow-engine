@@ -4,8 +4,8 @@
       <el-icon :size="34"><MagicStick /></el-icon>
       <p>尚未生成技能</p>
       <span class="ph-sub">
-        完成「推导关联 → 推导流程」后，在右侧对话让 AI「生成技能」，
-        即可产出可被第三方零改动挂载的 MCP 能力包。
+        完成「数据链路追踪 → 推导关联 → 推导流程」后，在右侧对话让 AI「生成技能」，
+        即可产出可像普通 Skill 一样安装的业务能力包，MCP 挂载作为可选增强。
       </span>
     </div>
     <div v-for="s in skills" :key="s.skill_id" class="scard card" :class="{ main: s.is_main }">

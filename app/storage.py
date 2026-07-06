@@ -69,6 +69,16 @@ class ScenarioStore:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def release_dir(self, scenario_id: str) -> Path:
+        """第三方发布包目录。
+
+        验证沙盒和下载发布物都从这里读取，避免验证时使用平台内部 skills/
+        目录，而第三方安装时使用另一套结构。
+        """
+        path = self.scenario_dir(scenario_id) / "release"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
     def _meta_file(self, scenario_id: str) -> Path:
         return self.scenario_dir(scenario_id) / "meta.json"
 

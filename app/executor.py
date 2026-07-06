@@ -28,12 +28,16 @@ from .models import OutputSpec, Scenario, TableMeta, TableRole, ValidationReport
 # 表定位（按角色，不靠文件名猜）
 # ===========================================================================
 def _input_business_tables(scenario: Scenario) -> list[TableMeta]:
-    """业务输入表：角色为 input；若全未标注角色，则退化为「非规则、非结果」。"""
+    """业务输入表：角色为 input；若全未标注角色，则退化为「非知识、非结果」。"""
     roled = [t for t in scenario.tables_meta if t.role == TableRole.INPUT.value]
     if roled:
         return roled
     return [t for t in scenario.tables_meta
-            if t.role not in (TableRole.RULE.value, TableRole.RESULT.value)]
+            if t.role not in (
+                TableRole.KNOWLEDGE.value,
+                TableRole.RULE.value,
+                TableRole.RESULT.value,
+            )]
 
 
 def _table_files(
@@ -41,14 +45,14 @@ def _table_files(
     data_sources: dict[str, str] | None,
     only: list[str] | None = None,
 ) -> dict[str, str]:
-    """构建 {表名: 文件路径}（不读盘）。data_sources 优先；否则取业务输入表 + 规则表。"""
+    """构建 {表名: 文件路径}（不读盘）。data_sources 优先；否则取业务输入表 + 知识表。"""
     if data_sources:
         base = dict(data_sources)
     else:
         base = {t.table_name: t.file_path for t in _input_business_tables(scenario)}
-        # 规则表也可能被转换 SQL 引用
+        # 知识表也可能被转换 SQL 引用
         for t in scenario.tables_meta:
-            if t.role == TableRole.RULE.value:
+            if t.role in (TableRole.KNOWLEDGE.value, TableRole.RULE.value):
                 base.setdefault(t.table_name, t.file_path)
     if only:
         base = {k: v for k, v in base.items() if k in only}

@@ -54,13 +54,13 @@ const newName = ref('')
 const newDesc = ref('')
 
 const STATUS: Record<string, string> = {
-  created: '未开始', tables_uploaded: '已上传', relations_deduced: '已推关联',
+  created: '未开始', tables_uploaded: '已上传', trace_sampled: '已追踪', relations_deduced: '已推关联',
   flow_deduced: '已推流程', skills_generated: '已生成技能', active: '已激活',
 }
 
 function dotClass(s: Scenario) {
   if (s.skills && s.skills.length) return 'ready'
-  if (['tables_uploaded', 'relations_deduced', 'flow_deduced'].includes(s.status)) return 'deducing'
+  if (['tables_uploaded', 'trace_sampled', 'relations_deduced', 'flow_deduced'].includes(s.status)) return 'deducing'
   return ''
 }
 function statusLabel(s: Scenario) {

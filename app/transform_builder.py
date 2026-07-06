@@ -2,11 +2,11 @@
 
 职责：
 1) `build_domain_knowledge(scenario)`：把场景蒸馏为「领域知识包」（数据字典 + ER + 字段语义
-   + 各产出的结果结构契约 + 规则结构映射）。给执行技能在运行时使用，**无任何写死字段名**。
+   + 各产出的结果结构契约 + 知识结构映射）。给执行技能在运行时使用，**无任何写死字段名**。
 2) `build_outputs(scenario)`：基于（流程节点 + 历史结果表）派生 OutputSpec。
    产出 = 一段流程节点管线 + 输出格式 + 结果列契约。
 
-红线：表角色取自用户标注；字段语义/规则结构由 inference 阶段蒸馏；运行时只跑 SQL。
+红线：表角色取自用户标注；字段语义/知识结构由 inference 阶段蒸馏；运行时只跑 SQL。
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ def _slug(name: str) -> str:
 
 
 # ===========================================================================
-# 领域知识（含字段语义 + 规则结构）
+# 领域知识（含字段语义 + 知识结构）
 # ===========================================================================
 def build_domain_knowledge(scenario: Scenario) -> DomainKnowledge:
     tables = [
@@ -83,6 +83,7 @@ def build_domain_knowledge(scenario: Scenario) -> DomainKnowledge:
                     f"{c.semantic or c.name}（{c.semantic_role}）"
                 )
 
+    knowledge_schema = scenario.flow.knowledge_schema if scenario.flow else None
     rule_schema = scenario.flow.rule_schema if scenario.flow else None
 
     return DomainKnowledge(
@@ -91,6 +92,7 @@ def build_domain_knowledge(scenario: Scenario) -> DomainKnowledge:
         relations=relations,
         result_schema=result_schema,
         field_semantics=field_semantics,
+        knowledge_schema=knowledge_schema,
         rule_schema=rule_schema,
     )
 
@@ -147,8 +149,14 @@ def build_outputs(scenario: Scenario, domain: DomainKnowledge) -> list[OutputSpe
     flow_steps = _refresh_pipeline_sql([s.model_copy() for s in flow_steps])
 
     specs: list[OutputSpec] = []
-    required_input = [t.table_name for t in scenario.tables_meta
-                      if t.role in (TableRole.INPUT.value, TableRole.RULE.value)]
+    required_input = [
+        t.table_name for t in scenario.tables_meta
+        if t.role in (
+            TableRole.INPUT.value,
+            TableRole.KNOWLEDGE.value,
+            TableRole.RULE.value,
+        )
+    ]
 
     for rt in results:
         oid = _slug(rt.table_name)

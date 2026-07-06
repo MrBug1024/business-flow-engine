@@ -4,6 +4,7 @@
     extract_metadata     读取元数据蓝图
     get_field_sample     字段去重样本
     set_table_role       修正表角色
+    trace_data_links     数据链路追踪
     deduce_relations     推导表关联 + 字段语义
     correct_relation     用户明确修正某条关联时必须调用，强制固化 + 刷新因果链样本
     deduce_flow          推导业务流程节点
@@ -26,7 +27,7 @@ from pathlib import Path
 
 from langchain_core.tools import StructuredTool
 
-from . import inference, metadata, strategies, table_io, transform_builder
+from . import inference, metadata, scenario_state, strategies, table_io, transform_builder
 from . import validators as _val
 from . import trace_sampling as _ts
 from .models import Scenario, ScenarioStatus, TableRole
@@ -36,7 +37,9 @@ from .storage import store
 # 蒸馏工具调用产生的「副作用资源」标记，供对话服务推送刷新事件
 TOOL_REFRESH_MAP = {
     "set_table_role": "tables",
+    "trace_data_links": "trace",
     "deduce_relations": "relations",
+    "correct_relation": "relations",
     "deduce_flow": "flow",
     "refine_flow_step": "flow",
     "generate_skills": "skills",
@@ -62,11 +65,11 @@ def build_tools(scenario_id: str) -> list[StructuredTool]:
 
     # ---------------------------------------------------------------- 元数据
     def extract_metadata() -> str:
-        """读取业务场景的「元数据蓝图」：表结构、字段语义、表角色、关联、规则结构、流程节点。
+        """读取业务场景的「元数据蓝图」：表结构、字段语义、表角色、关联、知识结构、流程节点。
         这是你了解数据的**唯一蓝图**，绝不逐行翻看全量数据。无需传参。"""
         scenario = _require(scenario_id)
         if not scenario.tables_meta:
-            return "尚未上传任何业务表。请提示用户先上传表格并选择角色（业务/规则/结果）。"
+            return "尚未上传任何业务表。请提示用户先上传表格并选择角色（业务/知识/结果）。"
         return metadata.build_metadata_report(scenario)
 
     def get_field_sample(table_name: str, field_name: str) -> str:
@@ -101,24 +104,67 @@ def build_tools(scenario_id: str) -> list[StructuredTool]:
         if meta is None:
             names = "、".join(t.table_name for t in scenario.tables_meta) or "（无）"
             return f"未找到表「{table_name}」。可用表：{names}"
+        changed = meta.role != role
         meta.role = role
         meta.role_confirmed = True
+        if changed:
+            scenario_state.invalidate_from_tables(scenario)
         _refresh_domain_and_outputs(scenario)
         store.save(scenario)
         return f"已将表「{table_name}」角色修正为「{role}」。"
 
-    # ---------------------------------------------------------------- 步骤 2：关联 + 字段语义
+    # ---------------------------------------------------------------- 步骤 2：数据链路追踪
+    def trace_data_links(result_table_name: str = "") -> str:
+        """【步骤 2】执行数据链路追踪。
+
+        上传阶段只解析表结构；本步骤才真正以结果表某条记录为锚点，追踪各业务表/知识表
+        的对应样本行，并保存为后续推导关联和业务流程使用的链路样本。可选参数
+        result_table_name 指定追踪入口结果表，不指定时自动选择 role=result 的表。"""
+        scenario = _require(scenario_id)
+        if not scenario.tables_meta:
+            return "🛑 当前场景未上传任何表。"
+        trace_report = _ts.trace_sampling(
+            scenario,
+            result_table_name=result_table_name or None,
+        )
+        val = _val.validate_trace_connectivity(trace_report)
+        scenario.trace_chain = trace_report
+        scenario_state.invalidate_after_trace(scenario)
+        store.save(scenario)
+
+        level_emoji = {"pass": "✅", "warning": "⚠️", "fail": "❌"}.get(val.level, "")
+        traced = []
+        for tbl, info in (trace_report.get("trace_map") or {}).items():
+            by = info.get("matched_by", "")
+            rows = info.get("matched_rows", [])
+            if by and by != "random":
+                traced.append(f"{tbl}({by}, {len(rows)}行)")
+        traced_text = "；".join(traced) or "未追踪到稳定链路"
+        return (
+            f"✅ 数据链路追踪完成。\n"
+            f"{level_emoji} {val.message}\n"
+            f"追踪摘要：{trace_report.get('trace_summary', '')}\n"
+            f"链路样本：{traced_text}\n\n"
+            "🛑 STOP：本步骤完成。请把追踪摘要和有问题的表呈现给用户，"
+            "等用户确认或修正后，再让用户明确说『推导关联关系』。"
+        )
+
+    # ---------------------------------------------------------------- 步骤 3：关联 + 字段语义
     def deduce_relations() -> str:
-        """【步骤 2】推导表关联（ER）+ 字段业务语义。
-        字段语义在此步骤一并完成，作为推流程、推规则结构的基础。无需传参。"""
+        """【步骤 3】推导表关联（ER）+ 字段业务语义。
+        必须先完成 trace_data_links；字段语义在此步骤一并完成，作为推流程、推知识结构的基础。无需传参。"""
         scenario = _require(scenario_id)
         if not scenario.tables_meta:
             return "尚未上传业务表。"
+        if not scenario.trace_chain:
+            return (
+                "🛑 STOP：尚未完成数据链路追踪（步骤 2）。"
+                "请提示用户先说『数据链路追踪』，不要直接推导关联关系。"
+            )
         result = inference.infer_relations(scenario)
         scenario.relations = result
+        scenario_state.invalidate_after_relations(scenario)
         _refresh_domain_and_outputs(scenario)
-        if scenario.status in (ScenarioStatus.CREATED, ScenarioStatus.TABLES_UPLOADED):
-            scenario.status = ScenarioStatus.RELATIONS_DEDUCED
         store.save(scenario)
         lines = "；".join(
             f"{r.from_table}.{r.from_column}→{r.to_table}.{r.to_column}({r.confidence:.0%})"
@@ -187,11 +233,13 @@ def build_tools(scenario_id: str) -> list[StructuredTool]:
 
         # 强制用这条人工确认的关联重新搜一遍真实数据，刷新保存的因果链样本
         try:
-            scenario.relations.trace_chain = _ts.trace_sampling(scenario)
+            scenario.trace_chain = _ts.trace_sampling(scenario)
+            scenario.relations.trace_chain = scenario.trace_chain
             refresh_note = "已用这条关联在真实数据中重新生成因果链样本。"
         except Exception as exc:  # noqa: BLE001
             refresh_note = f"⚠️ 因果链刷新失败（{exc}），关联本身已保存为人工确认。"
 
+        scenario_state.invalidate_after_relations(scenario)
         store.save(scenario)
         cols_note = (
             f"（复合键：{relation.from_columns} ↔ {relation.to_columns}）"
@@ -202,29 +250,36 @@ def build_tools(scenario_id: str) -> list[StructuredTool]:
             f"{cols_note}，已标记为人工确认，后续推导不会再覆盖它。{refresh_note}"
         )
 
-    # ---------------------------------------------------------------- 步骤 3：业务流程（含规则结构）
+    # ---------------------------------------------------------------- 步骤 4：业务流程（含知识结构）
     def deduce_flow() -> str:
-        """【步骤 3】推导业务流程节点链。
+        """【步骤 4】推导业务流程节点链。
 
-        每个节点带「该做什么/能做什么/数据怎么变化/模板算子」描述。**若有规则表**，同时蒸馏出
-        规则结构映射（discriminator → template），规则在运行时按行迭代——几万条也撑得住。无需传参。"""
+        每个节点带「该做什么/能做什么/数据怎么变化/模板算子」描述。**若有知识表**，同时蒸馏出
+        知识结构映射（dispatch key、条目编号、条件列等），知识条目在运行时按行迭代。无需传参。"""
         scenario = _require(scenario_id)
         if not scenario.relations:
-            return ("🛑 STOP：尚未完成关联+字段语义推导（步骤 2）。"
+            return ("🛑 STOP：尚未完成关联+字段语义推导（步骤 3）。"
                     "请提示用户先说『推导关联关系』，**不要**继续做后续推导。")
         result = inference.infer_flow(scenario)
+        if not result.flow_steps:
+            return (
+                "🛑 STOP：业务流程推导未生成任何流程节点，未保存为已推导流程。"
+                f"\n原因：{result.summary or '模型没有返回可用节点，启发式兜底也未能构造流程。'}"
+                "\n请先检查表角色、追踪链路样本和关联关系；必要时让用户修正表角色或关联键后再重试。"
+            )
         scenario.flow = result
+        scenario_state.invalidate_after_flow(scenario)
         _refresh_domain_and_outputs(scenario)
-        if scenario.status in (ScenarioStatus.RELATIONS_DEDUCED, ScenarioStatus.TABLES_UPLOADED):
-            scenario.status = ScenarioStatus.FLOW_DEDUCED
         store.save(scenario)
         head = "\n".join(
             f"  · 步骤{s.step_id} {s.step_name}（{s.template_kind or s.operation}）→ {s.capability[:40]}"
             for s in result.flow_steps
         )
         rs_line = ""
-        if result.rule_schema:
-            rs_line = f"\n规则结构映射：{result.rule_schema.summary}"
+        if result.knowledge_schema:
+            rs_line = f"\n知识结构映射：{result.knowledge_schema.summary}"
+        elif result.rule_schema:
+            rs_line = f"\n知识结构映射：{result.rule_schema.summary}"
         tail = (
             "\n\n🛑 STOP：本步骤完成。请把节点列表呈现给用户，**绝不**自动调用 generate_skills。"
             "等用户明确说『生成技能』再继续。"
@@ -306,15 +361,15 @@ def build_tools(scenario_id: str) -> list[StructuredTool]:
         store.save(scenario)
         return f"已细化节点 {step_id}（{s.template_kind}）。状态：{s.status}。"
 
-    # ---------------------------------------------------------------- 步骤 4：生成技能
+    # ---------------------------------------------------------------- 步骤 5：生成技能
     def generate_skills() -> str:
-        """【步骤 4】按业务流程节点固化技能：
+        """【步骤 5】按业务流程节点固化技能：
         - 每个流程节点 → 一个技能（节点级能力）
         - 另加一个「主技能」串联整条管线对外产出（list_outputs / produce）。
         无需传参。"""
         scenario = _require(scenario_id)
         if not scenario.flow or not scenario.flow.flow_steps:
-            return ("🛑 STOP：尚未完成业务流程推导（步骤 3）。"
+            return ("🛑 STOP：尚未完成业务流程推导（步骤 4）。"
                     "请提示用户先说『推导业务流程』，**不要**继续生成技能。")
         try:
             materialized = materialize_skills(scenario)
@@ -366,16 +421,18 @@ def build_tools(scenario_id: str) -> list[StructuredTool]:
         return text[:4000] + ("…（已截断）" if len(text) > 4000 else "")
 
     def get_trace_sample(result_table_name: str = "") -> str:
-        """获取追踪驱动采样结果——以结果表为入口，追踪各业务/知识表的关联行。
-        返回有因果关联的跨表样本，供推导关联或流程时参考。
-        可选参数 result_table_name 指定追踪入口（结果表名），不指定时自动寻找。"""
+        """读取已保存的追踪驱动采样结果，不会现场重跑大表追踪。
+        如尚未追踪，请先调用 trace_data_links。"""
         scenario = _require(scenario_id)
         if not scenario.tables_meta:
             return "🛑 当前场景未上传任何表。"
-        trace_report = _ts.trace_sampling(
-            scenario,
-            result_table_name=result_table_name or None,
+        trace_report = scenario.trace_chain or (
+            scenario.relations.trace_chain if scenario.relations else {}
         )
+        if not trace_report:
+            return "尚未执行数据链路追踪。请先调用 trace_data_links。"
+        if result_table_name and trace_report.get("result_table") != result_table_name:
+            return f"已保存链路入口为「{trace_report.get('result_table', '')}」，不是「{result_table_name}」。"
         val = _val.validate_trace_connectivity(trace_report)
         level_emoji = {"pass": "✅", "warning": "⚠️", "fail": "❌"}.get(val.level, "")
         lines = [
@@ -405,6 +462,7 @@ def build_tools(scenario_id: str) -> list[StructuredTool]:
         StructuredTool.from_function(extract_metadata),
         StructuredTool.from_function(get_field_sample),
         StructuredTool.from_function(set_table_role),
+        StructuredTool.from_function(trace_data_links),
         StructuredTool.from_function(deduce_relations),
         StructuredTool.from_function(correct_relation),
         StructuredTool.from_function(deduce_flow),

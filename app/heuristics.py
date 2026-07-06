@@ -14,10 +14,11 @@ from __future__ import annotations
 import re
 from difflib import SequenceMatcher
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
-from . import table_io
+from . import clarifications, table_io
 from .models import (
     GraphData,
     GraphEdge,
@@ -64,7 +65,7 @@ def _is_keyish(col_name: str) -> bool:
 def _classify(table: TableMeta) -> str:
     """图谱节点类型：取表角色（用户标注/确认），未知归为 table。"""
     role = table.role or "unknown"
-    return role if role in ("result", "rule", "input") else "table"
+    return role if role in ("result", "knowledge", "rule", "input") else "table"
 
 
 # ===========================================================================
@@ -73,7 +74,11 @@ def _classify(table: TableMeta) -> str:
 _MAX_CANDIDATES_PER_TABLE_PAIR = 3  # 每对表最多保留几个独立候选列对（不止报最强的那一个）
 
 
-def candidate_relations(scenario: Scenario) -> list[Relation]:
+def candidate_relations(
+    scenario: Scenario,
+    trace_report: dict[str, Any] | None = None,
+    stats: dict[str, int] | None = None,
+) -> list[Relation]:
     """计算「真实样本值包含率 + 字段名相似度」双证据支持的候选关联。
 
     这是关联推导的**唯一权威证据来源**：不管是无 LLM 的启发式兜底路径
@@ -97,8 +102,12 @@ def candidate_relations(scenario: Scenario) -> list[Relation]:
     relations: list[Relation] = []
     for i, left in enumerate(tables):
         for right in tables[i + 1:]:
+            if stats is not None:
+                stats["table_pairs"] = stats.get("table_pairs", 0) + 1
             for lcol, rcol, score, evidence, rel_type in _best_column_matches(
                 left, right, frame_cache, value_set_cache,
+                trace_report=trace_report,
+                stats=stats,
             ):
                 relations.append(
                     Relation(
@@ -118,30 +127,21 @@ def deduce_relations(scenario: Scenario) -> RelationResult:
     tables = scenario.tables_meta
     relations = candidate_relations(scenario)
     questions: list[str] = []
-    for r in relations:
-        if r.confidence < 0.8:
-            questions.append(
-                f"{r.from_table}.{r.from_column} 与 {r.to_table}.{r.to_column} "
-                f"是否确为关联键？（置信度 {r.confidence:.0%}，请确认）"
-            )
 
-    # 唯一性提示：追踪采样如果发现"单字段匹配到多行、需要复合键才能收窄"，
-    # 即使没有 LLM 也要把这个信号带出来（问题反馈4），而不是只有走 LLM 路径才有。
-    try:
-        from .trace_sampling import trace_sampling as _trace  # noqa: PLC0415
-        trace_report = _trace(scenario)
-        for tbl, info in (trace_report.get("trace_map") or {}).items():
-            if info.get("composite_suggested") and info.get("warning"):
-                questions.append(f"【{tbl}】{info['warning']}")
-    except Exception:  # noqa: BLE001
-        pass
-
-    graph = _build_relation_graph(tables, relations)
     confident = [r for r in relations if r.confidence >= 0.8]
-    summary = f"共发现 {len(confident)} 条确定关联，{len(relations) - len(confident)} 条待确认关联。"
+    weak_count = len(relations) - len(confident)
+    relations = confident
+    graph = _build_relation_graph(tables, relations)
+    clarification_items = clarifications.build_clarifications(
+        questions, context="deduce_relations"
+    )
+    summary = f"共发现 {len(confident)} 条确定关联。"
+    if weak_count:
+        summary += f" 已忽略 {weak_count} 条缺少足够值证据的弱候选，避免误导后续流程。"
     return RelationResult(
         relations=relations,
-        ambiguous_questions=questions,
+        ambiguous_questions=clarifications.normalized_question_texts(clarification_items),
+        clarifications=clarification_items,
         graph_data=graph,
         summary=summary,
     )
@@ -155,6 +155,8 @@ def _best_column_matches(
     right: TableMeta,
     frame_cache: dict | None = None,
     value_set_cache: dict | None = None,
+    trace_report: dict[str, Any] | None = None,
+    stats: dict[str, int] | None = None,
 ) -> list[tuple[str, str, float, str, str]]:
     """在两张表之间寻找最多 `_MAX_CANDIDATES_PER_TABLE_PAIR` 个独立候选关联列对。
 
@@ -162,8 +164,7 @@ def _best_column_matches(
     `0.6*name_sim + 0.3*overlap`，字段名占大头，导致"两列值完全相等但字段名
     完全不像"的真实关联因为过不了字段名门槛而被剪枝掉、根本没机会算值重叠。
     现在反过来：先探测值层面有没有交集，值证据够强时字段名像不像不重要；
-    只有值层面探测不到任何交集时，才退化成"仅凭字段名"的弱信号，且分数封顶，
-    不能让"名字像"单独顶到高置信度。
+    值层面探测不到任何交集时直接跳过，不再把"仅凭字段名"的弱信号抛给用户确认。
 
     性能：不再用字段名相似度做剪枝（那样会漏判问题1里的场景），改成两级漏斗——
     ① 每列的去重值集合按 (文件, 列名) 缓存，同一列参与多少次比较都只构建一次；
@@ -176,12 +177,24 @@ def _best_column_matches(
     candidates: list[tuple[str, str, float, str, str]] = []
 
     for lc in left.columns:
-        lset = _get_value_set(left, lc.name, fcache, vcache)
-        if not lset:
-            continue
+        lset: set | None = None
         for rc in right.columns:
+            if stats is not None:
+                stats["column_pairs"] = stats.get("column_pairs", 0) + 1
             if not _dtype_compatible(lc.dtype, rc.dtype):
+                if stats is not None:
+                    stats["dtype_skipped"] = stats.get("dtype_skipped", 0) + 1
                 continue
+            if not _should_compare_columns(left, lc, right, rc, trace_report):
+                if stats is not None:
+                    stats["prefilter_skipped"] = stats.get("prefilter_skipped", 0) + 1
+                continue
+            if stats is not None:
+                stats["value_compared"] = stats.get("value_compared", 0) + 1
+            if lset is None:
+                lset = _get_value_set(left, lc.name, fcache, vcache)
+            if not lset:
+                break
             rset = _get_value_set(right, rc.name, fcache, vcache)
             if not rset:
                 continue
@@ -191,14 +204,9 @@ def _best_column_matches(
             probe_hit = _probe_overlap(lset, rset)
 
             if not probe_hit:
-                # 值层面探测不到任何交集：只能退化为纯字段名信号，且必须封顶——
-                # 这是问题反馈的核心诉求："值全等检测应优先于字段名相似性检测"，
-                # 反过来说，没有值证据时，字段名再像也不能给出高置信度。
-                if name_sim < 0.6:
-                    continue
-                score = min(0.4 * name_sim + key_bonus, 0.5)
-                overlap = 0.0
-                evidence = f"字段名相似度 {name_sim:.0%}（无法确认值是否重叠，仅供参考）"
+                # 没有真实值重叠就不产出候选。字段名相似只能作为排序辅助，不能单独
+                # 变成待用户确认的问题，否则会出现"序号/年月/年龄是否关联"这类噪声。
+                continue
             else:
                 overlap = len(lset & rset) / min(len(lset), len(rset))
                 score = min(0.75 * overlap + 0.2 * name_sim + key_bonus, 0.99)
@@ -222,6 +230,92 @@ def _best_column_matches(
         if len(deduped) >= _MAX_CANDIDATES_PER_TABLE_PAIR:
             break
     return deduped
+
+
+def _column_role(col) -> str:
+    return (getattr(col, "semantic_role", "") or "").upper()
+
+
+def _is_blank_value(value: Any) -> bool:
+    if value is None:
+        return True
+    text = str(value).strip().lower()
+    return text in ("", "nan", "none", "null")
+
+
+def _jsonable_values(values: list[Any]) -> set:
+    out = set()
+    for value in values:
+        if _is_blank_value(value):
+            continue
+        try:
+            out.add(table_io._jsonable(value))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def _trace_rows_for_table(table: TableMeta, trace_report: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not trace_report or trace_report.get("degraded"):
+        return []
+    if trace_report.get("result_table") == table.table_name:
+        return list(trace_report.get("result_sample") or [])
+    info = (trace_report.get("trace_map") or {}).get(table.table_name) or {}
+    return list(info.get("matched_rows") or [])
+
+
+def _cheap_sample_values(table: TableMeta, col, trace_report: dict[str, Any] | None) -> set:
+    values = list(getattr(col, "sample_values", []) or [])[:20]
+    for row in _trace_rows_for_table(table, trace_report)[:5]:
+        if col.name in row:
+            values.append(row.get(col.name))
+    for row in (table.sample_rows or [])[:3]:
+        if col.name in row:
+            values.append(row.get(col.name))
+    return _jsonable_values(values)
+
+
+def _cheap_sample_overlap(
+    left: TableMeta,
+    lc,
+    right: TableMeta,
+    rc,
+    trace_report: dict[str, Any] | None,
+) -> bool:
+    lvals = _cheap_sample_values(left, lc, trace_report)
+    if not lvals:
+        return False
+    rvals = _cheap_sample_values(right, rc, trace_report)
+    return bool(rvals and (lvals & rvals))
+
+
+def _should_compare_columns(
+    left: TableMeta,
+    lc,
+    right: TableMeta,
+    rc,
+    trace_report: dict[str, Any] | None = None,
+) -> bool:
+    """轻量判断列对是否值得做全量值集合验证。
+
+    这里不产出关联结论，只决定是否值得扫描大表。真正是否有关联仍由后续全量值重叠证据决定。
+    """
+    name_sim = _name_similarity(lc.name, rc.name)
+    if name_sim >= 0.58:
+        return True
+    if _cheap_sample_overlap(left, lc, right, rc, trace_report):
+        return True
+
+    lrole, rrole = _column_role(lc), _column_role(rc)
+    if lrole in ("PK", "FK") and rrole in ("PK", "FK"):
+        return True
+    if _is_keyish(lc.name) and _is_keyish(rc.name):
+        return True
+    if (_is_keyish(lc.name) or _is_keyish(rc.name)) and name_sim >= 0.25:
+        return True
+    if lrole in ("DIM", "CATEGORY") and rrole in ("DIM", "CATEGORY") and name_sim >= 0.42:
+        return True
+    return False
 
 
 def _cached_frame(file_path: str, cache: dict) -> pd.DataFrame:
@@ -292,5 +386,5 @@ def _build_relation_graph(tables: list[TableMeta], relations: list[Relation]) ->
     return GraphData(nodes=nodes, edges=edges)
 
 
-# 业务流程推导现已由 `inference.infer_flow` 负责（含字段语义 + 规则结构映射 + 节点能力描述）。
+# 业务流程推导现已由 `inference.infer_flow` 负责（含字段语义 + 知识结构映射 + 节点能力描述）。
 # 本模块只保留关联推导启发式与公用图构建函数。

@@ -179,6 +179,28 @@ def sanitize_relations(
     return sane, questions
 
 
+def filter_low_confidence_relations(
+    relations: list["Relation"],
+    min_confidence: float = 0.8,
+) -> tuple[list["Relation"], int]:
+    """过滤未确认的弱关联候选。
+
+    弱候选不进入 ER 图，也不作为问题反复追问用户。普通用户不应该被要求判断
+    "两个字段名看起来像不像关联键"；如果缺少足够证据，系统应先保守跳过。
+    """
+    kept: list["Relation"] = []
+    dropped = 0
+    for r in relations:
+        if getattr(r, "confirmed", False):
+            kept.append(r)
+            continue
+        if float(getattr(r, "confidence", 0.0) or 0.0) >= min_confidence:
+            kept.append(r)
+            continue
+        dropped += 1
+    return kept, dropped
+
+
 def _relation_key(r: "Relation") -> tuple:
     from_cols = tuple(r.from_columns or [r.from_column])
     to_cols = tuple(r.to_columns or [r.to_column])
@@ -328,5 +350,4 @@ def detect_literal_params(
                 "按行读取（每行一个不同的值），还是确实是本场景固定不变的业务口径？"
             )
     return findings
-
 

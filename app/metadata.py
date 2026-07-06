@@ -3,7 +3,7 @@
 纪律不变：**绝不**把原始数据行喂给 AI。AI 推理层只读取本模块产出的「元数据报告」。
 
 v1.0.4 新增：
-* Trace-Driven Sampling —— 当有结果表时，用追踪驱动采样代替独立随机采样，
+* Trace-Driven Sampling —— 优先展示独立「数据链路追踪」阶段保存的样本，
   保证发给 AI 的样本行在跨表之间具有因果关联性（解决"AI 看到互不相干的数据"问题）。
 * 知识表术语统一 —— 报告中使用「知识表」代替「规则表」，
   knowledge_schema 代替 rule_schema（向后兼容旧字段）。
@@ -71,7 +71,7 @@ def _format_knowledge_schema(ks: KnowledgeSchemaMapping | RuleSchemaMapping | No
     return lines
 
 
-def build_metadata_report(scenario: Scenario, use_trace_sampling: bool = True) -> str:
+def build_metadata_report(scenario: Scenario, use_trace_sampling: bool = False) -> str:
     """构建元数据蓝图报告。
 
     v1.0.4 新增 Trace-Driven Sampling：当有结果表且 use_trace_sampling=True 时，
@@ -79,11 +79,15 @@ def build_metadata_report(scenario: Scenario, use_trace_sampling: bool = True) -
 
     Args:
         scenario:            业务场景
-        use_trace_sampling:  是否启用追踪驱动采样（默认 True）
+        use_trace_sampling:  是否允许现场执行追踪驱动采样（默认 False；优先展示已保存链路）
     """
     lines: list[str] = [f"# 业务场景元数据报告：{scenario.name}"]
     if scenario.description:
         lines.append(f"场景描述：{scenario.description}")
+    if scenario.trace_chain:
+        lines.append(f"数据链路追踪：已完成（{scenario.trace_chain.get('trace_summary', '已保存链路样本')}）")
+    else:
+        lines.append("数据链路追踪：尚未执行；请先执行「数据链路追踪」再推导关联关系。")
     lines.append("")
 
     # ---- 一、数据表结构（含字段语义） ----
@@ -114,7 +118,11 @@ def build_metadata_report(scenario: Scenario, use_trace_sampling: bool = True) -
     # ---- 二、追踪驱动采样（v1.0.4 新增） ----
     has_result_table = any(t.role == TableRole.RESULT.value for t in scenario.tables_meta)
 
-    if use_trace_sampling and scenario.tables_meta:
+    saved_trace = scenario.trace_chain or (
+        scenario.relations.trace_chain if scenario.relations else {}
+    )
+
+    if (saved_trace or use_trace_sampling) and scenario.tables_meta:
         lines.append("\n## 二、追踪驱动关联样本（Trace-Driven Sampling）")
         if not has_result_table:
             lines.append(
@@ -122,7 +130,7 @@ def build_metadata_report(scenario: Scenario, use_trace_sampling: bool = True) -
                 "有结果表后可获得因果关联的跨表样本，推导置信度将显著提升）"
             )
         else:
-            trace_report = _ts.trace_sampling(scenario)
+            trace_report = saved_trace or _ts.trace_sampling(scenario)
             val = validate_trace_connectivity(trace_report)
 
             # 校验结论
@@ -170,7 +178,7 @@ def build_metadata_report(scenario: Scenario, use_trace_sampling: bool = True) -
                 lines.append(f"\n⚠️ 以下表追踪失败（无数据关联路径）：{unmatched}")
     else:
         lines.append("\n## 二、数据关联摘要")
-        lines.append("（追踪驱动采样未启用；可上传结果表后重新提取元数据以获得因果关联样本）")
+        lines.append("（尚未执行数据链路追踪；上传只解析表结构，请先执行「数据链路追踪」以获得因果关联样本）")
 
     # ---- 三、已推导的表关联（ER 模型） ----
     lines.append("\n## 三、已推导的表关联（ER 模型）")

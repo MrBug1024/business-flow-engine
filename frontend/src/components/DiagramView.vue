@@ -47,9 +47,9 @@ import { Connection, Share, Plus, Minus, FullScreen } from '@element-plus/icons-
 import type { Scenario } from '@/api/types'
 import { useThemeStore } from '@/stores/theme'
 
-const props = defineProps<{ scenario: Scenario | null }>()
+const props = defineProps<{ scenario: Scenario | null; modeHint?: 'relations' | 'flow' }>()
 const theme = useThemeStore()
-const mode = ref<'relations' | 'flow'>('relations')
+const mode = ref<'relations' | 'flow'>(props.modeHint || 'relations')
 const svg = ref('')
 
 const viewport = ref<HTMLElement>()
@@ -199,6 +199,9 @@ function onUp() {
   window.removeEventListener('pointerup', onUp)
 }
 
+watch(() => props.modeHint, (next) => {
+  if (next && next !== mode.value) mode.value = next
+})
 watch([mode, () => props.scenario, () => theme.theme], renderDiagram, { deep: true })
 onMounted(renderDiagram)
 </script>

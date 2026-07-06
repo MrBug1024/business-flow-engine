@@ -1,6 +1,6 @@
 """文件上传与表结构接口（v1.0.3：上传时即标角色）。
 
-变更：上传接口接受 `roles` 表单字段（与 files 一一对应；input/rule/result），
+变更：上传接口接受 `roles` 表单字段（与 files 一一对应；input/knowledge/result，rule 向后兼容），
 把"选择文件 → 标角色 → 上传"合并为单个动作，减少用户步骤。
 """
 
@@ -11,7 +11,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
 
-from .. import table_io, transform_builder
+from .. import scenario_state, table_io, transform_builder
 from ..models import Scenario, ScenarioStatus, TableMeta, TableRoleRequest, TableRole
 from ..storage import store
 from .deps import get_owned_scenario_or_404
@@ -19,7 +19,12 @@ from .deps import get_owned_scenario_or_404
 router = APIRouter(tags=["files"])
 
 _ALLOWED_SUFFIX = {".csv", ".tsv", ".xlsx", ".xls", ".json", ".md", ".markdown"}
-_VALID_ROLES = {TableRole.INPUT.value, TableRole.RULE.value, TableRole.RESULT.value}
+_VALID_ROLES = {
+    TableRole.INPUT.value,
+    TableRole.KNOWLEDGE.value,
+    TableRole.RULE.value,
+    TableRole.RESULT.value,
+}
 
 
 @router.post("/scenarios/{scenario_id}/uploads")
@@ -28,12 +33,13 @@ async def upload_tables(
     roles: Optional[str] = Form(default=None),
     scenario: Scenario = Depends(get_owned_scenario_or_404),
 ) -> dict:
-    """上传一个或多个文件，并按 roles（input/rule/result）即时标注角色。
+    """上传一个或多个文件，并按 roles（input/knowledge/result）即时标注角色。
 
     roles 形式（任选其一）：
-      * JSON 数组（与 files 顺序一致）：`["input", "rule", "result"]`
-      * JSON 对象（按文件名映射）：`{"order.csv": "input", "rule.xlsx": "rule"}`
-      * 逗号分隔：`input,rule,result`
+      * JSON 数组（与 files 顺序一致）：`["input", "knowledge", "result"]`
+      * JSON 对象（按文件名映射）：`{"order.csv": "input", "standard.xlsx": "knowledge"}`
+      * 逗号分隔：`input,knowledge,result`
+      * 旧值 `rule` 继续兼容，等同于知识表
     缺省时角色为 unknown，需在前端"表格"区补标。
     """
     uploads_dir = store.uploads_dir(scenario.id)
@@ -71,6 +77,7 @@ async def upload_tables(
         new_metas.append(meta)
 
     scenario.tables_meta = list(existing.values())
+    scenario_state.invalidate_from_tables(scenario)
     if scenario.status == ScenarioStatus.CREATED:
         scenario.status = ScenarioStatus.TABLES_UPLOADED
     store.save(scenario)
@@ -124,8 +131,11 @@ def set_table_role(
     meta = next((t for t in scenario.tables_meta if t.table_name == table_name), None)
     if meta is None:
         raise HTTPException(status_code=404, detail=f"未找到表：{table_name}")
+    changed = meta.role != req.role
     meta.role = req.role
     meta.role_confirmed = req.role != TableRole.UNKNOWN.value
+    if changed:
+        scenario_state.invalidate_from_tables(scenario)
     domain = transform_builder.build_domain_knowledge(scenario)
     scenario.domain_knowledge = domain
     if scenario.flow or any(t.role == TableRole.RESULT.value for t in scenario.tables_meta):

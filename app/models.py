@@ -1,8 +1,8 @@
 """领域模型与 API 数据契约（Pydantic）。
 
 v1.0.3 通用化重构：
-* 工作流从 7 步压缩为 **5 步**：上传(含标角色) → 推关联(含字段语义) → 推流程(含节点能力)
-  → 生成技能 → 执行（含校验）。状态机 5 态，无审批 Gate。
+* 工作流从 7 步压缩为 **6 步**：上传(含标角色) → 数据链路追踪 → 推关联(含字段语义)
+  → 推流程(含节点能力) → 生成技能 → 执行（含校验）。无审批 Gate。
 * 字段语义成为画像核心：`ColumnMeta` 新增 `semantic` / `semantic_role`，作为关联推导与
   模板算子参数选择的依据。
 * 规则范式重构：不再逐条解析规则为关键词字典；改为蒸馏 `RuleSchemaMapping`——只学
@@ -23,16 +23,17 @@ from pydantic import BaseModel, Field
 
 
 # ===========================================================================
-# 业务场景状态机（5 步骤）
+# 业务场景状态机（6 步骤）
 # ===========================================================================
 class ScenarioStatus(str, Enum):
-    """业务场景的生命周期状态。5 步通用蒸馏工作流：
+    """业务场景的生命周期状态。6 步通用蒸馏工作流：
 
-    上传(含标角色) → 推关联(含字段语义) → 推流程(含节点能力) → 生成技能 → 执行（含校验）
+    上传(含标角色) → 数据链路追踪 → 推关联(含字段语义) → 推流程(含节点能力) → 生成技能 → 执行（含校验）
     """
 
     CREATED = "created"                    # 已创建，尚未上传数据
     TABLES_UPLOADED = "tables_uploaded"    # 已上传业务表（用户在上传时即已标角色）
+    TRACE_SAMPLED = "trace_sampled"        # 已基于结果锚点完成数据链路追踪
     RELATIONS_DEDUCED = "relations_deduced"  # 已推导表关联 + 字段语义
     FLOW_DEDUCED = "flow_deduced"          # 已推导业务流程（每节点带能力描述）
     SKILLS_GENERATED = "skills_generated"  # 已固化为可复用技能
@@ -98,7 +99,7 @@ class Relation(BaseModel):
     from_column: str  # 复合键时 = from_columns[0]，兼容只认单字段的旧代码
     to_table: str
     to_column: str    # 复合键时 = to_columns[0]
-    relation_type: str = "foreign_key"  # foreign_key / possible_link / rule_mapping
+    relation_type: str = "foreign_key"  # foreign_key / possible_link / knowledge_mapping(rule_mapping legacy)
     confidence: float = 0.0
     evidence: str = ""
     # 复合关联键：单字段不足以唯一确定对应关系时（如需要 结算ID+项目编码 才能定位一行），
@@ -156,8 +157,7 @@ class RelationResult(BaseModel):
     # 字段语义在 ColumnMeta 上原地更新；此处冗余收集一份便于前端快速展示
     field_semantics: dict[str, dict[str, str]] = Field(default_factory=dict)
     # 结构：{表名: {字段名: "语义描述 · 语义角色"}}
-    # 追踪采样得到的因果链（结果行→业务行→知识行），推关联时算过一次就存下来，
-    # 推流程时直接复用，不重新搜一遍大表；人工修正关联后会被强制刷新。
+    # 向后兼容字段：新流程的主存储在 Scenario.trace_chain；人工确认关联后也会同步到这里。
     # 结构与 trace_sampling.trace_sampling() 的返回值一致。
     trace_chain: dict[str, Any] = Field(default_factory=dict)
 
@@ -403,6 +403,8 @@ class Scenario(BaseModel):
     created_at: float = Field(default_factory=time)
     updated_at: float = Field(default_factory=time)
     tables_meta: list[TableMeta] = Field(default_factory=list)
+    # 独立的链路追踪阶段产物。上传只解析结构；用户显式执行「数据链路追踪」后写入这里。
+    trace_chain: dict[str, Any] = Field(default_factory=dict)
     relations: Optional[RelationResult] = None
     flow: Optional[FlowResult] = None
     domain_knowledge: Optional[DomainKnowledge] = None
@@ -447,7 +449,7 @@ class ChatRequest(BaseModel):
 
 
 class TableRoleRequest(BaseModel):
-    role: str = Field(..., pattern="^(input|rule|result|unknown)$")
+    role: str = Field(..., pattern="^(input|knowledge|rule|result|unknown)$")
 
 
 class EvolveSkillRequest(BaseModel):

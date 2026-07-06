@@ -13,9 +13,9 @@
       <div v-for="(r, i) in rows" :key="i" class="row">
         <el-icon class="fico"><Document /></el-icon>
         <span class="fname">{{ r.file.name }}</span>
-        <el-select v-model="r.role" size="small" style="width: 150px">
+        <el-select v-model="r.role" size="small" style="width: 170px">
           <el-option label="业务表 input" value="input" />
-          <el-option label="知识表 rule" value="rule" />
+          <el-option label="知识表 knowledge" value="knowledge" />
           <el-option label="结果表 result" value="result" />
         </el-select>
       </div>
@@ -45,7 +45,7 @@ const uploading = ref(false)
 
 function guessRole(name: string): string {
   const n = name.toLowerCase()
-  if (/(规则|知识|rule|knowledge)/.test(n)) return 'rule'
+  if (/(规则|知识|标准|目录|rule|knowledge|standard|catalog)/.test(n)) return 'knowledge'
   if (/(结果|result|违规|输出)/.test(n)) return 'result'
   return 'input'
 }

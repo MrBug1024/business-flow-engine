@@ -21,11 +21,13 @@ from langchain_core.messages import AIMessage, HumanMessage
 from .agent_stream import stream_agent
 from .config import settings
 from .llm import get_llm
-from .models import ChatMessage, ChatRole, ToolTrace
+from .models import ChatMessage, ChatRole, ScenarioStatus, ToolTrace
+from .release_builder import ensure_release_package, release_status
 from . import scenario_runtime as rt
 from .playground_agent import build_playground_agent
 from .storage import store
 from .streaming import sse, sse_done
+from .verification_state import response_marks_verified
 
 _ABORTED_NOTE = "（本轮执行被中断，任务已终止作废，后续消息将作为全新任务独立处理。）"
 
@@ -85,7 +87,11 @@ def unmount(user_id: str, scenario_id: str) -> list[str]:
 
 
 def _pkg_for(scenario_id: str) -> rt.ScenarioPackage | None:
-    pkg_dir = store.skills_dir(scenario_id)
+    try:
+        release = ensure_release_package(scenario_id)
+        pkg_dir = release.package_dir
+    except Exception:
+        return None
     if not (Path(pkg_dir) / "main_skill").exists():
         return None
     return rt.ScenarioPackage.load(pkg_dir)
@@ -145,11 +151,16 @@ def build_install_config(scenario_id: str, base_url: str) -> dict:
     pkg = _pkg_for(scenario_id)
     if not pkg:
         return {}
+    release = release_status(scenario_id, base_url=base_url)
+    scenario = store.get(scenario_id)
+    scenario_status = scenario.status.value if scenario else ""
+    publish_allowed = scenario is not None and scenario.status == ScenarioStatus.ACTIVE
     ns = pkg.namespace
     base = base_url.rstrip("/")
     sse_url = f"{base}/api/mcp/{scenario_id}/sse"
     token = settings.mcp_access_token.strip()
     key = f"bfe-{ns}"
+    skill_name = pkg.card.get("skill_name") or f"bfe-{ns.replace('_', '-')}"
 
     remote_args = ["-y", "mcp-remote", sse_url]
     native_entry: dict = {"url": sse_url}
@@ -162,6 +173,21 @@ def build_install_config(scenario_id: str, base_url: str) -> dict:
         "base_url": base,
         "base_from_env": bool(settings.mcp_base_url),
         "requires_token": bool(token),
+        "scenario_status": scenario_status,
+        "publish_allowed": publish_allowed,
+        "publish_block_reason": "" if publish_allowed else (
+            f"当前场景状态为 {scenario_status or 'unknown'}，尚未记录为验证通过，不能发布 Docker 镜像。"
+        ),
+        "skill_install": {
+            "skill_name": skill_name,
+            "source_dir": release.get("package_dir") or str(Path(store.skills_dir(scenario_id)).resolve()),
+            "skill_zip": release.get("downloads", {}).get("skill_zip", ""),
+            "toolplane_docker_zip": release.get("downloads", {}).get("toolplane_docker_zip", ""),
+            "codex_target_hint": f"~/.codex/skills/{skill_name}",
+            "install_summary": "发布包根目录可作为标准 Skill 安装；也可下载 skill.zip 或发布到 GitHub 同步。",
+            "default_prompt": f"Use ${skill_name} to inspect my business data and complete this scenario task.",
+        },
+        "release": release,
         "config_example": {"mcpServers": {key: {"command": "npx", "args": remote_args}}},
         "config_example_native": {"mcpServers": {key: native_entry}},
     }
@@ -178,7 +204,21 @@ def mount_config(scenario_id: str, base_url: str) -> dict:
         "card": pkg.card,
         **install,
         "skills_dir": str(Path(store.skills_dir(scenario_id)).resolve()),
+        "release_dir": install.get("release", {}).get("package_dir", ""),
     }
+
+
+def _mark_single_mounted_scenario_verified(user_id: str, content: str) -> None:
+    """Sandbox 验证结论写回场景状态，避免验证和发布状态脱节。"""
+    if not response_marks_verified(content):
+        return
+    owned_ids = [sid for sid in get_mounts(user_id) if _owns(user_id, sid)]
+    if len(owned_ids) != 1:
+        return
+    scenario = store.get(owned_ids[0])
+    if scenario and scenario.status == ScenarioStatus.SKILLS_GENERATED:
+        scenario.status = ScenarioStatus.ACTIVE
+        store.save(scenario)
 
 
 # ---------------------------------------------------------------- 会话历史
@@ -261,6 +301,7 @@ async def stream_chat(user_id: str, user_message: str) -> AsyncIterator[str]:
 
     def _persist(content: str, thinking: str, tools: list[ToolTrace]) -> None:
         _persist_assistant(user_id, content, thinking, tools)
+        _mark_single_mounted_scenario_verified(user_id, content)
 
     async for frame in stream_agent(
         agent, lc_history, user_message, _persist, aborted_note=_ABORTED_NOTE,

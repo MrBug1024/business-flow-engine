@@ -48,8 +48,13 @@
                 </el-tab-pane>
               </el-tabs>
               <div class="tab-body">
-                <TablesPanel v-show="tab === 'tables'" :scenario="cur" @changed="refresh" />
-                <DiagramView v-if="tab === 'flow'" :scenario="cur" />
+                <TablesPanel v-show="tab === 'tables'" :scenario="cur" @changed="refresh" @ask-ai="askAi" />
+                <DiagramView
+                  v-if="tab === 'flow'"
+                  :key="`${cur.id}-${cur.updated_at}-${diagramMode}`"
+                  :scenario="cur"
+                  :mode-hint="diagramMode"
+                />
                 <SkillsPanel v-show="tab === 'skills'" :scenario="cur" />
                 <OutputsPanel v-if="tab === 'outputs'" :scenario="cur" />
               </div>
@@ -61,13 +66,14 @@
         <Pane :size="chatSize" :min-size="24" :max-size="55">
           <ChatPanel
             v-if="cur"
+            ref="chatRef"
             title="AI 协作对话"
             :chat-path="`/scenarios/${cur.id}/chat`"
             :history-path="`/scenarios/${cur.id}/messages`"
             :reload-key="cur.id"
-            placeholder="描述你的诉求，或让 AI「推导关联关系 / 推导业务流程 / 生成技能」…"
+            placeholder="描述你的诉求，或让 AI「数据链路追踪 / 推导关联关系 / 推导业务流程 / 生成技能」…"
             empty-title="与 AI 协作完成蒸馏"
-            empty-sub="上传数据后，逐步让 AI 推导关联、还原流程、生成可复用技能。"
+            empty-sub="上传数据后，逐步完成链路追踪、关联推导、流程还原、技能生成。"
             :quicks="quicks"
             @refresh="onRefresh"
             @status="refresh"
@@ -103,6 +109,8 @@ import { useScenarioStore } from '@/stores/scenarios'
 const store = useScenarioStore()
 const cur = computed(() => store.current)
 const tab = ref('tables')
+const diagramMode = ref<'relations' | 'flow'>('relations')
+const chatRef = ref<InstanceType<typeof ChatPanel> | null>(null)
 const collapsed = ref(false)
 const uploadOpen = ref(false)
 
@@ -111,18 +119,19 @@ const chatSize = 34
 const centerSize = computed(() => 100 - (collapsed.value ? 0 : leftSize) - chatSize)
 
 const STATUS: Record<string, string> = {
-  created: '未开始', tables_uploaded: '已上传', relations_deduced: '已推关联',
+  created: '未开始', tables_uploaded: '已上传', trace_sampled: '已追踪', relations_deduced: '已推关联',
   flow_deduced: '已推流程', skills_generated: '已生成技能', active: '已激活',
 }
 const statusLabel = computed(() => STATUS[cur.value?.status || ''] || cur.value?.status || '')
 const statusTone = computed(() => {
   const s = cur.value?.status || ''
   if (['skills_generated', 'active'].includes(s)) return 'ready'
-  if (['tables_uploaded', 'relations_deduced', 'flow_deduced'].includes(s)) return 'progress'
+  if (['tables_uploaded', 'trace_sampled', 'relations_deduced', 'flow_deduced'].includes(s)) return 'progress'
   return 'idle'
 })
 
 const quicks = [
+  { label: '数据链路追踪', text: '请进行数据链路追踪' },
   { label: '推导关联关系', text: '请推导关联关系' },
   { label: '推导业务流程', text: '请推导业务流程' },
   { label: '生成技能', text: '请生成技能' },
@@ -143,10 +152,14 @@ async function refresh() {
 async function onRefresh(resource: string) {
   await store.refreshCurrent()
   await store.loadList()
-  if (resource === 'flow') tab.value = 'flow'
+  if (resource === 'flow') { diagramMode.value = 'flow'; tab.value = 'flow' }
   else if (resource === 'skills') tab.value = 'skills'
   else if (['outputs', 'validations'].includes(resource)) tab.value = 'outputs'
-  else if (resource === 'relations') tab.value = 'flow'
+  else if (resource === 'relations') { diagramMode.value = 'relations'; tab.value = 'flow' }
+  else if (resource === 'trace') tab.value = 'tables'
+}
+function askAi(text: string) {
+  chatRef.value?.send(text)
 }
 </script>
 

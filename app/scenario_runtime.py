@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,7 +34,15 @@ from typing import Any, Optional
 _DATA_SUFFIXES = (".csv", ".tsv", ".xlsx", ".xls", ".json")
 
 # 与 skill_builder._MCP_ACTIONS 对应：一个能力包对外暴露的固定动作集
-ACTIONS = ("describe_schema", "list_knowledge", "search_knowledge", "execute", "query_data")
+ACTIONS = (
+    "describe_capability",
+    "describe_schema",
+    "list_outputs",
+    "list_knowledge",
+    "search_knowledge",
+    "execute",
+    "query_data",
+)
 
 
 # ===========================================================================
@@ -101,15 +110,35 @@ class ScenarioPackage:
         return (_jload(self._main_skill() / "output_specs.json") or {}).get("outputs", [])
 
     def default_data_dir(self) -> Optional[Path]:
-        """未显式给 data_dir 时的回退：包同级 verify_uploads/ → uploads/。"""
-        parent = self.pkg_dir.parent
-        for name in ("verify_uploads", "uploads"):
-            d = parent / name
+        """未显式给 data_dir 时的回退。
+
+        验证沙盒从 release 包加载时，测试数据仍在场景目录；第三方 Docker/MCP
+        场景里，数据通常挂载到 /data 或通过 BFE_DATA_DIR 指定。因此这里按
+        “显式环境变量 → 包内数据 → 包同级/上级验证数据 → Docker /data”的顺序找。
+        """
+        candidates: list[Path] = []
+        env_dir = os.getenv("BFE_DATA_DIR", "").strip()
+        if env_dir:
+            candidates.append(Path(env_dir))
+
+        candidates.extend([
+            self.pkg_dir / "data",
+            self.pkg_dir.parent / "data",
+            self.pkg_dir.parent / "verify_uploads",
+            self.pkg_dir.parent / "uploads",
+            self.pkg_dir.parent.parent / "verify_uploads",
+            self.pkg_dir.parent.parent / "uploads",
+            Path("/data"),
+        ])
+        for d in candidates:
             if _has_data_files(d):
                 return d
         return None
 
     def default_out_dir(self) -> Path:
+        env_dir = os.getenv("BFE_OUT_DIR", "").strip()
+        if env_dir:
+            return Path(env_dir)
         return self.pkg_dir.parent / "outputs"
 
 
@@ -145,6 +174,80 @@ def _resolve_data_dir(pkg: ScenarioPackage, data_dir: Optional[str]) -> Optional
 # ===========================================================================
 # 五个对外动作（返回给 LLM 的字符串结果，与验证 Agent 行为对齐）
 # ===========================================================================
+def describe_capability(pkg: ScenarioPackage) -> str:
+    """Return a compact onboarding card for third-party agents."""
+    domain = pkg.domain()
+    tables = domain.get("tables", []) if isinstance(domain, dict) else []
+    outputs = pkg.output_specs()
+    required = list(pkg.card.get("required_tables") or [])
+    knowledge_table = pkg.card.get("knowledge_table", "")
+    tools = [
+        {
+            "name": t.get("name"),
+            "action": t.get("action"),
+            "description": t.get("description", ""),
+        }
+        for t in pkg.tools
+    ]
+    table_brief = []
+    for table in tables:
+        table_name = table.get("table_name", "")
+        columns = table.get("columns", []) or []
+        important_columns = [
+            c.get("name") for c in columns
+            if c.get("semantic_role") in {"PK", "FK", "TIME", "METRIC", "NL_TEXT", "CATEGORY"}
+        ][:12]
+        table_brief.append({
+            "name": table_name,
+            "role": table.get("role", "input"),
+            "required": table_name in required,
+            "columns_count": len(columns),
+            "important_columns": important_columns,
+        })
+
+    payload = {
+        "scope": (
+            "This is a standalone published business scenario package. It can describe and execute only "
+            "the scenario(s) mounted in this MCP server; it cannot enumerate the distillation platform "
+            "database or unrelated platform scenarios."
+        ),
+        "scenario_name": pkg.display_name,
+        "namespace": pkg.namespace,
+        "skill_name": pkg.card.get("skill_name", ""),
+        "summary": pkg.summary,
+        "when_to_use": pkg.when_to_use,
+        "not_for": pkg.not_for,
+        "required_business_data": {
+            "required_tables": required,
+            "knowledge_table": knowledge_table,
+            "mount_or_pass_data_dir": (
+                "For Docker MCP, mount business files to /data or set BFE_DATA_DIR. "
+                "File base names should match table names."
+            ),
+            "tables": table_brief,
+        },
+        "outputs": [
+            {
+                "output_id": o.get("output_id"),
+                "name": o.get("name"),
+                "format": o.get("fmt", "csv"),
+                "status": o.get("status", ""),
+                "capability": o.get("capability", ""),
+            }
+            for o in outputs
+        ],
+        "tools": tools,
+        "recommended_workflow": [
+            f"Call {pkg.namespace}__describe_capability first when the host is unsure what this package does.",
+            f"Call {pkg.namespace}__describe_schema before writing SQL or checking field names.",
+            f"Call {pkg.namespace}__list_outputs to see executable outputs.",
+            f"Use {pkg.namespace}__list_knowledge or {pkg.namespace}__search_knowledge when the scenario is knowledge/rule driven.",
+            f"Use {pkg.namespace}__query_data for ad hoc data checks and {pkg.namespace}__execute for scenario outputs.",
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 def describe_schema(pkg: ScenarioPackage) -> str:
     """完整表结构：字段名/类型/业务语义 + 表间关联(ER) + 知识表分派结构。"""
     domain = pkg.domain()
@@ -266,7 +369,7 @@ def execute(pkg: ScenarioPackage, output_id: str, params: Any = "",
     dd = _resolve_data_dir(pkg, data_dir)
     if dd is None:
         return "❌ 未指定业务数据目录，且包内无默认数据。请通过 data_dir 提供包含业务数据文件的目录。"
-    od = Path(out_dir).strip() if isinstance(out_dir, str) and out_dir.strip() else pkg.default_out_dir()
+    od = Path(out_dir.strip()) if isinstance(out_dir, str) and out_dir.strip() else pkg.default_out_dir()
 
     rf = params
     if isinstance(params, str):
@@ -326,7 +429,13 @@ def execute(pkg: ScenarioPackage, output_id: str, params: Any = "",
     return summary
 
 
-def query_data(pkg: ScenarioPackage, sql: str, data_dir: Optional[str] = None) -> str:
+def query_data(
+    pkg: ScenarioPackage,
+    sql: str,
+    data_dir: Optional[str] = None,
+    save_result: bool = False,
+    out_dir: Optional[str] = None,
+) -> str:
     """对能力包引用的业务数据执行 DuckDB SQL（按需加载 SQL 实际引用到的表）。"""
     sql = (sql or "").strip()
     if not sql:
@@ -383,14 +492,15 @@ def query_data(pkg: ScenarioPackage, sql: str, data_dir: Optional[str] = None) -
     elapsed = time.perf_counter() - t0
     n_rows, n_cols = len(result), len(result.columns)
     artifact_name = ""
-    try:
-        out_dir = pkg.default_out_dir()
-        out_dir.mkdir(parents=True, exist_ok=True)
-        artifact = out_dir / f"query_{int(time.time())}.csv"
-        result.to_csv(artifact, index=False, encoding="utf-8-sig")
-        artifact_name = artifact.name
-    except Exception:
-        pass
+    if save_result:
+        try:
+            target_out_dir = Path(out_dir.strip()) if isinstance(out_dir, str) and out_dir.strip() else pkg.default_out_dir()
+            target_out_dir.mkdir(parents=True, exist_ok=True)
+            artifact = target_out_dir / f"query_{int(time.time())}.csv"
+            result.to_csv(artifact, index=False, encoding="utf-8-sig")
+            artifact_name = artifact.name
+        except Exception:
+            pass
 
     preview = _df_preview(result, width=2000, head=20)
     head = (f"✅ 查询完成：{n_rows} 行 × {n_cols} 列，耗时 {elapsed:.1f}s"
@@ -407,8 +517,12 @@ def query_data(pkg: ScenarioPackage, sql: str, data_dir: Optional[str] = None) -
 def call_action(pkg: ScenarioPackage, action: str, args: dict) -> str:
     """按 action 名分发到对应函数。args 为工具入参 dict。"""
     args = args or {}
+    if action == "describe_capability":
+        return describe_capability(pkg)
     if action == "describe_schema":
         return describe_schema(pkg)
+    if action == "list_outputs":
+        return list_outputs(pkg)
     if action == "list_knowledge":
         return list_knowledge(pkg, limit=args.get("limit", 50), data_dir=args.get("data_dir"))
     if action == "search_knowledge":
@@ -419,7 +533,13 @@ def call_action(pkg: ScenarioPackage, action: str, args: dict) -> str:
                        params=args.get("params", ""), data_dir=args.get("data_dir"),
                        out_dir=args.get("out_dir"), max_rows=args.get("max_rows", 20000))
     if action == "query_data":
-        return query_data(pkg, sql=args.get("sql", ""), data_dir=args.get("data_dir"))
+        return query_data(
+            pkg,
+            sql=args.get("sql", ""),
+            data_dir=args.get("data_dir"),
+            save_result=bool(args.get("save_result", False)),
+            out_dir=args.get("out_dir"),
+        )
     return f"❌ 未知动作：{action}（可用：{'、'.join(ACTIONS)}）"
 
 
@@ -449,6 +569,13 @@ def capability_catalog(pkgs: list[ScenarioPackage]) -> list[dict]:
             "summary": p.summary,
             "when_to_use": p.when_to_use,
             "not_for": p.not_for,
+            "required_tables": list(p.card.get("required_tables") or []),
+            "knowledge_table": p.card.get("knowledge_table", ""),
+            "outputs": [
+                {"output_id": o.get("output_id"), "name": o.get("name")}
+                for o in p.output_specs()
+            ],
+            "first_tool_to_call": f"{p.namespace}__describe_capability",
             "tools": [t.get("name") for t in p.tools],
         }
         for p in pkgs

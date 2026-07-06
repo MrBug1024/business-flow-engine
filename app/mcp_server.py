@@ -79,9 +79,10 @@ def build_server(pkgs: list[rt.ScenarioPackage]):
             mcp_types.Tool(
                 name=_DISCOVERY_TOOL,
                 description=(
-                    "列出本 Server 挂载的所有业务场景能力，含每个场景的用途摘要、"
-                    "何时应当调用（when_to_use）、何时不要调用（not_for）、以及它提供的工具名。"
-                    "在决定是否调用某个业务能力前，先调用本工具了解全貌。"
+                    "列出当前 MCP Server 挂载的业务场景能力，而不是蒸馏平台数据库里的全部场景。"
+                    "返回每个能力的用途摘要、适用/不适用边界、必需业务数据、产出、工具名，"
+                    "以及首次接入时应该调用的 `<namespace>__describe_capability`。"
+                    "第三方宿主不清楚这个包做什么时，先调用本工具。"
                 ),
                 inputSchema={"type": "object", "properties": {}, "required": []},
             )

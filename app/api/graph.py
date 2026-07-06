@@ -9,7 +9,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 
-from .. import executor, trace_sampling, validators
+from .. import executor, scenario_state, trace_sampling, validators
 from ..models import (
     EvolveSkillRequest,
     FlowResult,
@@ -50,9 +50,49 @@ def get_trace_sample(scenario_id: str, result_table: Optional[str] = None) -> di
     scenario = get_scenario_or_404(scenario_id)
     if not scenario.tables_meta:
         return {"degraded": True, "trace_summary": "尚未上传任何表", "trace_map": {}, "result_sample": []}
-    report = trace_sampling.trace_sampling(scenario, result_table_name=result_table or None)
+    saved = scenario.trace_chain or (scenario.relations.trace_chain if scenario.relations else {})
+    if result_table:
+        # GET 只读已保存结果，避免展开表格时触发慢任务；指定 result_table 仅用于核对入口。
+        if saved and saved.get("result_table") != result_table:
+            return {
+                "degraded": True,
+                "trace_summary": f"尚未针对结果表「{result_table}」执行数据链路追踪",
+                "trace_map": {},
+                "result_sample": [],
+                "source": "not_traced",
+            }
+    if not saved:
+        return {
+            "degraded": True,
+            "trace_summary": "尚未执行数据链路追踪。请先点击「数据链路追踪」或在对话中让 AI 执行该步骤。",
+            "trace_map": {},
+            "result_sample": [],
+            "source": "not_traced",
+        }
+    report = dict(saved)
+    report["source"] = "saved_trace_chain"
     check = validate_trace_connectivity(report)
     report["connectivity_check"] = check.to_dict()
+    return report
+
+
+@router.post("/scenarios/{scenario_id}/trace-sample")
+def run_trace_sample(scenario_id: str, result_table: Optional[str] = None) -> dict:
+    """显式执行「数据链路追踪」并保存为独立阶段产物。
+
+    这是关联推导前的可见步骤：上传阶段只解析表结构；只有调用本端点才会扫描大表，
+    以结果表某条记录为锚点追踪到业务表/知识表的对应样本行。
+    """
+    scenario = get_scenario_or_404(scenario_id)
+    if not scenario.tables_meta:
+        return {"degraded": True, "trace_summary": "尚未上传任何表", "trace_map": {}, "result_sample": []}
+    report = trace_sampling.trace_sampling(scenario, result_table_name=result_table or None)
+    report["source"] = "fresh_trace_sampling"
+    check = validate_trace_connectivity(report)
+    report["connectivity_check"] = check.to_dict()
+    scenario.trace_chain = report
+    scenario_state.invalidate_after_trace(scenario)
+    store.save(scenario)
     return report
 
 
@@ -93,10 +133,12 @@ def confirm_relation(scenario_id: str, req: RelationConfirmRequest) -> RelationR
     )
 
     try:
-        scenario.relations.trace_chain = trace_sampling.trace_sampling(scenario)
+        scenario.trace_chain = trace_sampling.trace_sampling(scenario)
+        scenario.relations.trace_chain = scenario.trace_chain
     except Exception:  # noqa: BLE001
         pass
 
+    scenario_state.invalidate_after_relations(scenario)
     store.save(scenario)
     return scenario.relations
 
@@ -109,20 +151,21 @@ def unconfirm_relation(scenario_id: str, req: RelationConfirmRequest) -> Relatio
         for r in scenario.relations.relations:
             if _match_relation(r, req):
                 r.confirmed = False
+        scenario_state.invalidate_after_relations(scenario)
         store.save(scenario)
     return scenario.relations or RelationResult()
 
 
 @router.get("/scenarios/{scenario_id}/flow", response_model=FlowResult)
 def get_flow(scenario_id: str) -> FlowResult:
-    """业务流程（含节点能力描述 + 规则结构映射 + Mermaid）。"""
+    """业务流程（含节点能力描述 + 知识结构映射 + Mermaid）。"""
     scenario = get_scenario_or_404(scenario_id)
     return scenario.flow or FlowResult(summary="尚未推导业务流程。")
 
 
 @router.get("/scenarios/{scenario_id}/rule-schema")
 def get_rule_schema(scenario_id: str) -> Optional[RuleSchemaMapping]:
-    """规则表结构映射（discriminator → template）。"""
+    """旧接口：知识表结构映射（v1.0.3 rule_schema 兼容格式）。"""
     scenario = get_scenario_or_404(scenario_id)
     return scenario.flow.rule_schema if scenario.flow else None
 

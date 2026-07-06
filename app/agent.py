@@ -24,7 +24,7 @@ def _load_system_prompt() -> str:
 
 
 def build_agent(scenario: Scenario):
-    """构建蒸馏 Agent（仅负责步骤 2-4：推关联→推流程→生成技能）。"""
+    """构建蒸馏 Agent（仅负责追踪→推关联→推流程→生成技能）。"""
     llm = get_llm()
     if llm is None:
         raise RuntimeError("LLM 未配置，无法构建 Agent；请改用启发式降级路径。")
@@ -38,6 +38,7 @@ def build_agent(scenario: Scenario):
     n_result = sum(1 for r in roles.values() if r == TableRole.RESULT.value)
     role_summary = f"输入表 {n_input}、知识表 {n_knowledge}、结果表 {n_result}"
 
+    trace_line = "已追踪" if scenario.trace_chain else "未追踪"
     rel_line = "已推导（含字段语义）" if scenario.relations else "未推导"
     flow_line = ("已推导" if scenario.flow else "未推导") + (
         f"（{len(scenario.flow.flow_steps)} 节点）" if scenario.flow else ""
@@ -52,7 +53,7 @@ def build_agent(scenario: Scenario):
         f"\n\n# 当前业务场景（蒸馏视图）\n名称：{scenario.name}\n"
         f"描述：{scenario.description or '（无）'}\n"
         f"已上传 {len(scenario.tables_meta)} 张表（{role_summary}）\n{roles_line}\n"
-        f"关联+字段语义：{rel_line}\n业务流程：{flow_line}\n"
+        f"数据链路追踪：{trace_line}\n关联+字段语义：{rel_line}\n业务流程：{flow_line}\n"
         f"{skills_line}\n当前状态：{scenario.status.value}\n\n"
         "⚠️ 本通道仅用于蒸馏（推导+生成技能），不提供执行/验证功能。"
         "执行验证请切换到「验证通道」。"

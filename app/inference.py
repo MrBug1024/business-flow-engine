@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from time import perf_counter
 from typing import Optional
 
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
@@ -29,7 +30,7 @@ def _load_prompt(relative_path: str) -> str:
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
-from . import heuristics, rule_schema, knowledge_schema, table_io, validators
+from . import clarifications, heuristics, rule_schema, knowledge_schema, table_io, validators
 from .llm import get_structured_llm
 from .models import (
     ColumnMeta,
@@ -162,6 +163,26 @@ def _describe_trace_chain(trace_report: "dict | None") -> str:
         return "（追踪路径均为随机采样，无因果关联链）"
 
     return "\n".join(parts)
+
+
+def _trace_quality_questions(trace_report: "dict | None") -> list[str]:
+    """把追踪链路质量问题转成少量需要用户判断的业务问题。"""
+    if not trace_report or trace_report.get("degraded"):
+        return []
+    affected: list[str] = []
+    for tbl in trace_report.get("unmatched_tables", []) or []:
+        if tbl not in affected:
+            affected.append(str(tbl))
+    for tbl, info in (trace_report.get("trace_map") or {}).items():
+        if info.get("matched_by") == "random" and tbl not in affected:
+            affected.append(str(tbl))
+    if not affected:
+        return []
+    names = "、".join(affected[:6]) + (" 等" if len(affected) > 6 else "")
+    return [
+        f"追踪链路没有确认这些表在流程中的作用：{names}。"
+        "请确认它们是否参与本次业务流程；如果参与，请补充它们应通过哪个业务编号/对象/单据与其它表连接。"
+    ]
 
 
 def _describe_value_overlap_evidence(candidates: list[Relation]) -> str:
@@ -361,24 +382,30 @@ def _get_rel_system() -> str:
 def infer_relations(scenario: Scenario) -> RelationResult:
     """推导关联关系（**先**推字段语义，**再**推关联，结果合并返回）。
 
-    v1.0.5 改进：先运行追踪采样，确保 LLM 收到跨表因果关联的样本，而非各表随机前2行。
+    v1.1 改进：只复用独立「数据链路追踪」阶段保存的样本，不在关联推导里隐式重跑大表追踪。
     """
-    from .trace_sampling import trace_sampling  # noqa: PLC0415
-
+    timings: dict[str, float] = {}
+    t0 = perf_counter()
     semantics = infer_field_semantics(scenario)
+    timings["字段语义"] = perf_counter() - t0
 
-    # 追踪采样：以结果表为入口逆向找关联行
-    trace_report = None
-    try:
-        trace_report = trace_sampling(scenario)
-    except Exception:  # noqa: BLE001
-        pass
+    # 关联推导只消费已保存的独立「数据链路追踪」阶段产物，不在这里隐式重跑大表追踪。
+    trace_report = scenario.trace_chain or (
+        scenario.relations.trace_chain if scenario.relations else {}
+    )
 
     # 真实值重叠证据：字段名相似度 + 全字段对的样本值包含率（唯一权威证据来源）
+    rel_stats: dict[str, int] = {}
+    t0 = perf_counter()
     try:
-        value_evidence_candidates = heuristics.candidate_relations(scenario)
+        value_evidence_candidates = heuristics.candidate_relations(
+            scenario,
+            trace_report=trace_report,
+            stats=rel_stats,
+        )
     except Exception:  # noqa: BLE001
         value_evidence_candidates = []
+    timings["值证据"] = perf_counter() - t0
     value_evidence = _describe_value_overlap_evidence(value_evidence_candidates)
 
     llm = get_structured_llm()
@@ -387,6 +414,7 @@ def infer_relations(scenario: Scenario) -> RelationResult:
     summary: str = ""
 
     if llm is not None:
+        t0 = perf_counter()
         try:
             tables_desc = _describe_tables_with_trace(scenario, trace_report, include_semantic=True)
             trace_chain = _describe_trace_chain(trace_report)
@@ -412,37 +440,34 @@ def infer_relations(scenario: Scenario) -> RelationResult:
             summary = out.summary
         except Exception:  # noqa: BLE001
             relations = []
+        timings["LLM"] = perf_counter() - t0
 
     if not relations:
-        fallback = heuristics.deduce_relations(scenario)
-        relations = fallback.relations
-        questions = fallback.ambiguous_questions
-        summary = fallback.summary
+        relations = list(value_evidence_candidates)
+        questions = []
+        summary = "已根据追踪样本和真实值重叠证据生成候选关联。"
 
     # 剔除引用了不存在表/字段的"幻觉"关联（如凭结果文件名联想出一个根本不存在的列）
     relations, bad_relation_questions = validators.sanitize_relations(relations, scenario.tables_meta)
     questions = list(questions) + bad_relation_questions
+
+    # 弱关联候选不进入图，也不再追问普通用户。缺少足够值证据时先保守跳过。
+    relations, weak_relation_count = validators.filter_low_confidence_relations(relations)
+    if not relations and value_evidence_candidates:
+        evidence_relations, evidence_dropped = validators.filter_low_confidence_relations(
+            value_evidence_candidates
+        )
+        if evidence_relations:
+            relations = evidence_relations
+            weak_relation_count += evidence_dropped
+            if not summary:
+                summary = "已根据真实值重叠证据回退生成高置信关联。"
 
     # 人工确认过的关联必须原样保留，不能被这一轮新推导覆盖/丢弃
     old_relations = scenario.relations.relations if scenario.relations else None
     relations = validators.preserve_confirmed_relations(old_relations, relations)
 
     graph = heuristics._build_relation_graph(scenario.tables_meta, relations)
-
-    # 用合并后的**新关联**重新驱动一次追踪采样：追踪层现在以关联关系为第一优先证据
-    # （人工确认 > 推导关联 > 字段名启发式），所以保存的因果链必须基于这一轮的最终
-    # 关联算出来，而不是推导前那一版——否则用户在前端看到的"追踪驱动采样"与刚刚
-    # 推导出的关联各说各话。整表加载有进程内缓存，重跑一次代价很小。
-    _prev_relations = scenario.relations
-    try:
-        scenario.relations = RelationResult(relations=relations)
-        refreshed = trace_sampling(scenario)
-        if refreshed and not refreshed.get("degraded"):
-            trace_report = refreshed
-    except Exception:  # noqa: BLE001
-        pass
-    finally:
-        scenario.relations = _prev_relations
 
     # 复合键建议：追踪层交叉校验发现"单列匹配不唯一、需组合列才能收窄"时，
     # 一律作为待确认问题抛给用户（此前只有无 LLM 的启发式路径带出这个信号，
@@ -452,6 +477,7 @@ def infer_relations(scenario: Scenario) -> RelationResult:
             _q = f"【{_tbl}】{_info['warning']}"
             if _q not in questions:
                 questions.append(_q)
+    questions.extend(_trace_quality_questions(trace_report))
 
     field_sem_payload: dict[str, dict[str, str]] = {}
     for tname, cols in semantics.items():
@@ -463,10 +489,28 @@ def infer_relations(scenario: Scenario) -> RelationResult:
         confident = sum(1 for r in relations if r.confidence >= 0.8)
         summary = (f"共发现 {confident} 条确定关联、{len(relations) - confident} 条待确认；"
                    f"字段语义已为 {sum(len(v) for v in semantics.values())} 个字段标注。")
+    if weak_relation_count:
+        summary += f" 已忽略 {weak_relation_count} 条缺少足够值证据的弱关联候选。"
+    detail = (
+        f" 执行明细：字段语义 {timings.get('字段语义', 0):.1f}s；"
+        f"链路样本 {'已复用' if trace_report else '未提供'}；"
+        f"值证据 {timings.get('值证据', 0):.1f}s"
+        f"（实际比较 {rel_stats.get('value_compared', 0)} 对，"
+        f"预筛跳过 {rel_stats.get('prefilter_skipped', 0)} 对，"
+        f"类型跳过 {rel_stats.get('dtype_skipped', 0)} 对）；"
+        f"LLM {timings.get('LLM', 0):.1f}s。"
+    )
+    summary = (summary or "") + detail
+
+    clarification_items = clarifications.build_clarifications(
+        questions, context="deduce_relations"
+    )
+    questions = clarifications.normalized_question_texts(clarification_items)
 
     return RelationResult(
         relations=relations,
         ambiguous_questions=questions,
+        clarifications=clarification_items,
         graph_data=graph,
         summary=summary,
         field_semantics=field_sem_payload,
@@ -558,7 +602,6 @@ def _llm_step_to_model(s: _FlowStepLLM) -> FlowStep:
 def _heuristic_flow(scenario: Scenario, rs: RuleSchemaMapping | None) -> list[FlowStep]:
     """无 LLM 时的兜底流程节点（结构化的 4~5 步骨架，节点带能力描述）。"""
     inputs = [t for t in scenario.tables_meta if t.role == TableRole.INPUT.value]
-    rules = [t for t in scenario.tables_meta if t.role == TableRole.RULE.value]
     results = [t for t in scenario.tables_meta if t.role == TableRole.RESULT.value]
 
     if not inputs:
@@ -613,7 +656,7 @@ def _heuristic_flow(scenario: Scenario, rs: RuleSchemaMapping | None) -> list[Fl
         ))
         sid += 1
 
-    # 节点 3：应用规则（若有规则表，且已识别规则结构）
+    # 节点 3：应用知识条目（若有知识表，且已识别知识结构）
     if rs and rs.rule_table:
         steps.append(FlowStep(
             step_id=sid,
@@ -790,28 +833,23 @@ def infer_knowledge_schema_llm(
 
 
 def infer_flow(scenario: Scenario) -> FlowResult:
-    """推导业务流程（先蒸馏规则结构映射，再据结构反推流程节点）。
+    """推导业务流程（先蒸馏知识结构映射，再据结构反推流程节点）。
 
-    v1.0.5 改进：
-    1. 先运行追踪采样，LLM 看到因果关联样本而非随机行
+    v1.1 改进：
+    1. 复用独立「数据链路追踪」阶段保存的样本，LLM 看到因果关联样本而非随机行
     2. 加入 NL 规则分析，帮助识别知识表中自然语言规则的模式
     3. 追踪链作为推导依据，节点 capability 更准确
     """
     if not scenario.tables_meta:
         return FlowResult(summary="尚未上传业务表。")
 
-    # 0. 追踪采样（以结果表为入口逆向找关联行）——优先复用「推导关联关系」那一步
-    #    已经算好、且可能已被用户修正过的因果链，不重新对大表搜一遍。只有从未推导过
-    #    关联关系、或那一次结果本身就是降级随机采样时，才在这里现算一次兜底。
+    # 0. 追踪采样（以结果表为入口逆向找关联行）——只复用独立「数据链路追踪」
+    #    或人工修正关联后保存的结果，不在流程推导里隐式重跑大表追踪。
     trace_report = None
-    if scenario.relations and scenario.relations.trace_chain and not scenario.relations.trace_chain.get("degraded"):
+    if scenario.trace_chain and not scenario.trace_chain.get("degraded"):
+        trace_report = scenario.trace_chain
+    elif scenario.relations and scenario.relations.trace_chain and not scenario.relations.trace_chain.get("degraded"):
         trace_report = scenario.relations.trace_chain
-    else:
-        from .trace_sampling import trace_sampling  # noqa: PLC0415
-        try:
-            trace_report = trace_sampling(scenario)
-        except Exception:  # noqa: BLE001
-            pass
 
     # 1. NL 规则模式分析（先算，供知识表结构映射与流程推导共用）
     nl_analysis: dict = {}
@@ -907,7 +945,11 @@ def infer_flow(scenario: Scenario) -> FlowResult:
     except Exception:  # noqa: BLE001
         literal_findings = []
 
-    all_questions = list(ks_questions) + list(questions) + literal_findings
+    all_questions = list(ks_questions) + list(questions) + literal_findings + _trace_quality_questions(trace_report)
+    clarification_items = clarifications.build_clarifications(
+        all_questions, context="deduce_flow"
+    )
+    all_questions = clarifications.normalized_question_texts(clarification_items)
 
     # 5. 生成图与 Mermaid
     graph = _build_flow_graph(steps)
@@ -918,6 +960,7 @@ def infer_flow(scenario: Scenario) -> FlowResult:
         flow_graph=graph,
         mermaid=mermaid,
         ambiguous_questions=all_questions,
+        clarifications=clarification_items,
         knowledge_schema=ks,  # v1.0.4 通用知识表结构映射（LLM 优先，启发式兜底）
         rule_schema=rs,       # v1.0.3 向后兼容
         summary=summary or f"共 {len(steps)} 个流程节点。",

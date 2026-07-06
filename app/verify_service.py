@@ -32,6 +32,7 @@ from .models import ChatMessage, ChatRole, Scenario, ScenarioStatus, ToolTrace
 from .storage import store
 from .streaming import ThinkParser, sse, sse_done
 from .verification_agent import build_verification_agent
+from .verification_state import response_marks_verified
 
 # 失败/中断轮次落盘的占位回复：既保证 user/assistant 交替，也直接告诉下一轮的
 # LLM"这个任务已作废"，不要续跑或与新任务合并。
@@ -113,7 +114,7 @@ async def stream_verify(scenario: Scenario, user_message: str) -> AsyncIterator[
 
     if not scenario.skills:
         msg = ("❌ 当前场景尚未生成技能包。\n\n请先在**蒸馏通道**完成以下步骤：\n"
-               "1. 推导关联关系\n2. 推导业务流程\n3. 生成技能\n\n"
+               "1. 数据链路追踪\n2. 推导关联关系\n3. 推导业务流程\n4. 生成技能\n\n"
                "完成后再切换到验证通道。")
         _persist_assistant(scenario.id, msg)
         yield sse("content", delta=msg)
@@ -298,8 +299,8 @@ async def _stream_with_verify_agent(
             total_elapsed=int(time.monotonic() - turn_start),
         )
 
-    # 若产出成功（response 包含"验证通过"），更新场景状态
+    # 若产出成功，更新场景状态
     full_response = "".join(content_parts)
-    if "验证通过" in full_response and scenario.status == ScenarioStatus.SKILLS_GENERATED:
+    if response_marks_verified(full_response) and scenario.status == ScenarioStatus.SKILLS_GENERATED:
         scenario.status = ScenarioStatus.ACTIVE
         store.save(scenario)

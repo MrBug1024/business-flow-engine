@@ -21,6 +21,7 @@ from langchain_core.tools import StructuredTool
 from .agent_guard import ExcludeBuiltinToolsMiddleware
 from .llm import get_llm
 from .models import Scenario
+from .release_builder import ensure_release_package
 from .storage import store
 from .table_io import load_full_frame_cached
 
@@ -38,7 +39,7 @@ def build_verify_tools(scenario_id: str) -> list[StructuredTool]:
     _DATA_SUFFIXES = (".csv", ".tsv", ".xlsx", ".xls", ".json")
 
     def _skills_dir() -> Path:
-        return Path(store.skills_dir(scenario_id))
+        return ensure_release_package(scenario_id).package_dir
 
     def _has_data_files(d: Path) -> bool:
         return d.exists() and any(f.suffix.lower() in _DATA_SUFFIXES for f in d.iterdir())
@@ -495,7 +496,7 @@ def build_verification_agent(scenario: Scenario):
     tools = build_verify_tools(scenario.id)
     manifest = {}
     try:
-        mp = Path(store.skills_dir(scenario.id)) / "manifest.json"
+        mp = ensure_release_package(scenario.id).package_dir / "manifest.json"
         if mp.exists():
             manifest = json.loads(mp.read_text(encoding="utf-8"))
     except Exception:

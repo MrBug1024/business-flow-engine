@@ -50,8 +50,14 @@ def _make_scenario_tools(pkg: rt.ScenarioPackage) -> list[StructuredTool]:
     # 用 mcp.json 里的工具描述（已含 when_to_use 触发提示），保证与交付给第三方的一致
     desc_by_action = {t.get("action"): t.get("description", "") for t in pkg.tools}
 
+    def describe_capability() -> str:
+        return rt.describe_capability(pkg)
+
     def describe_schema() -> str:
         return rt.describe_schema(pkg)
+
+    def list_outputs() -> str:
+        return rt.list_outputs(pkg)
 
     def list_knowledge(limit: int = 50) -> str:
         return rt.list_knowledge(pkg, limit=limit)
@@ -66,7 +72,9 @@ def _make_scenario_tools(pkg: rt.ScenarioPackage) -> list[StructuredTool]:
         return rt.query_data(pkg, sql=sql)
 
     specs = [
+        ("describe_capability", describe_capability),
         ("describe_schema", describe_schema),
+        ("list_outputs", list_outputs),
         ("list_knowledge", list_knowledge),
         ("search_knowledge", search_knowledge),
         ("execute", execute),
@@ -98,9 +106,10 @@ def build_playground_agent(pkgs: list[rt.ScenarioPackage]):
             list_business_capabilities,
             name="list_business_capabilities",
             description=(
-                "列出本会话挂载的所有业务场景能力，含每个能力的用途摘要、何时应当调用"
-                "（when_to_use）、何时不要调用（not_for）、以及它提供的工具名。"
-                "决定是否调用某业务能力前，先调用本工具了解全貌。"
+                "列出当前会话挂载的业务场景能力，而不是蒸馏平台数据库里的全部场景。"
+                "返回每个能力的用途摘要、适用/不适用边界、必需业务数据、产出、工具名，"
+                "以及首次接入时应该调用的 `<namespace>__describe_capability`。"
+                "不清楚某个包做什么时，先调用本工具。"
             ),
         )
     ]
