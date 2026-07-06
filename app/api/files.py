@@ -11,9 +11,11 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
 
-from .. import scenario_state, table_io, transform_builder
-from ..models import Scenario, ScenarioStatus, TableMeta, TableRoleRequest, TableRole
-from ..storage import store
+from app.data import table_io
+from app.distillation import transform_builder
+from app.domain import scenario_state
+from app.domain.models import Scenario, ScenarioStatus, TableMeta, TableRoleRequest, TableRole
+from app.domain.storage import store
 from .deps import get_owned_scenario_or_404
 
 router = APIRouter(tags=["files"])

@@ -6,9 +6,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from .. import playground_service as pg
-from .. import release_builder
-from ..models import Scenario, ScenarioStatus
+from app.playground import service as pg
+from app.release import builder as release_builder
+from app.domain.models import Scenario, ScenarioStatus
 from .deps import get_owned_scenario_or_404
 
 router = APIRouter(tags=["release"], dependencies=[Depends(get_owned_scenario_or_404)])

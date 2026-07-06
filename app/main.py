@@ -18,7 +18,7 @@ from . import __version__
 from .api import api_router
 from .api.mcp_http import register_mcp_routes
 from .auth.db import init_db
-from .config import settings
+from app.core.config import settings
 
 # 初始化系统数据库（用户/OAuth 身份表），幂等
 init_db()

@@ -15,11 +15,11 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
-from .. import playground_service as pg
+from app.playground import service as pg
 from ..auth.deps import get_current_user
 from ..auth.models import PublicUser
-from ..models import ChatMessage, ChatRequest
-from ..storage import store
+from app.domain.models import ChatMessage, ChatRequest
+from app.domain.storage import store
 
 router = APIRouter(prefix="/playground", tags=["playground"])
 

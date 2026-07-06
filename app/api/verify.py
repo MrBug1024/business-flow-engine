@@ -13,9 +13,9 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
-from ..models import ChatMessage, ChatRequest
-from ..storage import store
-from ..verify_service import stream_verify
+from app.domain.models import ChatMessage, ChatRequest
+from app.domain.storage import store
+from app.verification.service import stream_verify
 from .deps import get_owned_scenario_or_404, get_scenario_or_404
 
 # 所有端点均为 /scenarios/{scenario_id}/verify/...，路由级强制登录 + 归属校验。

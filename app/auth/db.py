@@ -13,7 +13,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from ..config import settings
+from app.core.config import settings
 
 _LOCK = threading.RLock()
 _DB_PATH: Optional[Path] = None

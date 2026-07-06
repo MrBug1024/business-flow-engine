@@ -6,8 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from ..auth.deps import get_current_user
 from ..auth.models import PublicUser
-from ..models import CreateScenarioRequest, Scenario
-from ..storage import store
+from app.domain.models import CreateScenarioRequest, Scenario
+from app.domain.storage import store
 from .deps import get_owned_scenario_or_404
 
 router = APIRouter(tags=["scenarios"])

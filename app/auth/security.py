@@ -8,7 +8,7 @@ from typing import Optional
 import bcrypt
 import jwt
 
-from ..config import settings
+from app.core.config import settings
 
 _ALGO = "HS256"
 

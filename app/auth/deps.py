@@ -8,7 +8,7 @@ from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from . import db
-from .models import PublicUser, to_public_user
+from app.auth.models import PublicUser, to_public_user
 from .security import decode_token
 
 # auto_error=False：让"可选登录"场景也能复用同一个方案

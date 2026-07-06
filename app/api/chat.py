@@ -9,9 +9,9 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
-from ..chat_service import stream_chat
-from ..models import ChatMessage, ChatRequest, Scenario
-from ..storage import store
+from app.distillation.chat_service import stream_chat
+from app.domain.models import ChatMessage, ChatRequest, Scenario
+from app.domain.storage import store
 from .deps import get_owned_scenario_or_404
 
 router = APIRouter(tags=["chat"])

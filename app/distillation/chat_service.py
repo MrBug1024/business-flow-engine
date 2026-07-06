@@ -1,0 +1,450 @@
+"""蒸馏对话服务（v1.0.5）。
+
+职责：蒸馏阶段的流式对话（链路追踪/推导关联/流程/生成技能）。
+与验证通道（verify_service.py）完全分离，不提供执行/验证功能。
+"""
+
+from __future__ import annotations
+
+import uuid
+from typing import AsyncIterator, Optional
+
+from langchain_core.messages import AIMessage, HumanMessage
+
+from app.distillation import clarifications, inference, transform_builder
+from app.distillation.agent import build_agent
+from app.core.llm import get_llm
+from app.domain import scenario_state
+from app.domain.models import (
+    ChatMessage,
+    ChatRole,
+    Scenario,
+    ScenarioStatus,
+    TableRole,
+    ToolTrace,
+)
+from app.distillation.skill_builder import materialize_skills
+from app.domain.storage import store
+from app.runtime import executor
+from app.core.streaming import ThinkParser, sse, sse_done
+from app.distillation.tools import TOOL_REFRESH_MAP
+
+# 蒸馏工具名 → 完成后应推送的状态
+_TOOL_STATUS_MAP = {
+    "trace_data_links": ScenarioStatus.TRACE_SAMPLED,
+    "deduce_relations": ScenarioStatus.RELATIONS_DEDUCED,
+    "deduce_flow": ScenarioStatus.FLOW_DEDUCED,
+    "generate_skills": ScenarioStatus.SKILLS_GENERATED,
+}
+
+
+def _new_msg_id() -> str:
+    return f"msg_{uuid.uuid4().hex[:12]}"
+
+
+def _coerce_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                parts.append(item.get("text", ""))
+        return "".join(parts)
+    return str(content or "")
+
+
+async def stream_chat(scenario: Scenario, user_message: str) -> AsyncIterator[str]:
+    """对外的统一入口：产出 SSE 文本帧。"""
+    store.append_message(
+        scenario.id,
+        ChatMessage(id=_new_msg_id(), role=ChatRole.USER, content=user_message),
+    )
+
+    if get_llm() is not None:
+        gen = _stream_with_agent(scenario, user_message)
+    else:
+        gen = _stream_heuristic(scenario, user_message)
+
+    async for frame in gen:
+        yield frame
+    yield sse_done()
+
+
+# ===========================================================================
+# LLM 路径
+# ===========================================================================
+async def _stream_with_agent(scenario: Scenario, user_message: str) -> AsyncIterator[str]:
+    parser = ThinkParser()
+    final_content: list[str] = []
+    final_thinking: list[str] = []
+    tool_traces: list[ToolTrace] = []
+
+    history = store.get_messages(scenario.id)
+    lc_messages = []
+    for m in history[-20:]:
+        if m.role == ChatRole.USER:
+            lc_messages.append(HumanMessage(content=m.content))
+        elif m.content:
+            lc_messages.append(AIMessage(content=m.content))
+
+    try:
+        agent = build_agent(scenario)
+        async for event in agent.astream_events(
+            {"messages": lc_messages},
+            version="v2",
+            config={"recursion_limit": 120},
+        ):
+            kind = event.get("event")
+
+            if kind == "on_chat_model_stream":
+                chunk = event["data"].get("chunk")
+                text = _coerce_text(getattr(chunk, "content", "")) if chunk else ""
+                if not text:
+                    continue
+                for ev_type, ev_text in parser.feed(text):
+                    if ev_type == "thinking":
+                        final_thinking.append(ev_text)
+                    else:
+                        final_content.append(ev_text)
+                    yield sse(ev_type, delta=ev_text)
+
+            elif kind == "on_tool_start":
+                name = event.get("name", "")
+                args = event["data"].get("input", {})
+                args_summary = _summarize_args(args)
+                yield sse("tool_call", name=name, args=args_summary)
+                tool_traces.append(ToolTrace(name=name, args_summary=args_summary))
+
+            elif kind == "on_tool_end":
+                name = event.get("name", "")
+                output = event["data"].get("output", "")
+                result_summary = _summarize_result(output)
+                yield sse("tool_result", name=name, result=result_summary)
+                if tool_traces and tool_traces[-1].name == name:
+                    tool_traces[-1].result_summary = result_summary
+                if name in TOOL_REFRESH_MAP:
+                    yield sse("refresh", resource=TOOL_REFRESH_MAP[name])
+                if name in _TOOL_STATUS_MAP:
+                    # 只在工具明确返回 ✅ 时才推送状态变更，避免失败时误报
+                    tool_output_str = str(output)
+                    if tool_output_str.lstrip().startswith("✅"):
+                        yield sse("status", status=_TOOL_STATUS_MAP[name].value)
+                # 关联/流程推导后若有不确定项，主动弹出结构化交互（让前端渲染逐题问答面板）
+                if name in ("deduce_relations", "deduce_flow"):
+                    sc = store.get(scenario.id)
+                    result_obj = None
+                    if name == "deduce_relations" and sc:
+                        result_obj = sc.relations
+                    elif name == "deduce_flow" and sc:
+                        result_obj = sc.flow
+                    interaction = _step_interaction(name, result_obj)
+                    if interaction:
+                        yield sse("interaction", interaction=interaction)
+
+        for ev_type, ev_text in parser.flush():
+            (final_thinking if ev_type == "thinking" else final_content).append(ev_text)
+            yield sse(ev_type, delta=ev_text)
+
+    except Exception as exc:  # noqa: BLE001
+        err_str = str(exc)
+        # 检测常见的上下文溢出错误（MiniMax/OpenAI/Claude 各自的错误码）
+        is_context_overflow = (
+            "999" in err_str
+            or "context_length_exceeded" in err_str
+            or "too long" in err_str.lower()
+            or "maximum context" in err_str.lower()
+            or "token" in err_str.lower() and "limit" in err_str.lower()
+        )
+        if is_context_overflow:
+            user_hint = (
+                "AI 处理出错：对话上下文过长。建议：\n"
+                "① 减少一次性提问的内容长度\n"
+                "② 新建会话后从当前步骤继续\n"
+                "③ 或先运行「提取元数据蓝图」，让 AI 重新聚焦场景信息"
+            )
+            yield sse("error", message=user_hint)
+            final_content.append(f"（上下文溢出：{exc}）")
+        else:
+            yield sse("error", message=f"AI 处理出错：{exc}")
+            final_content.append(f"（处理出错：{exc}）")
+
+    store.append_message(
+        scenario.id,
+        ChatMessage(
+            id=_new_msg_id(),
+            role=ChatRole.ASSISTANT,
+            content="".join(final_content).strip(),
+            thinking="".join(final_thinking).strip(),
+            tools=tool_traces,
+        ),
+    )
+
+
+def _summarize_args(args) -> str:
+    if isinstance(args, dict):
+        parts = []
+        for k, v in args.items():
+            sval = str(v)
+            parts.append(f"{k}={sval[:80]}{'…' if len(sval) > 80 else ''}")
+        return "，".join(parts)
+    return str(args)[:160]
+
+
+def _summarize_result(output) -> str:
+    text = getattr(output, "content", None)
+    if text is None:
+        text = str(output)
+    text = str(text)
+    return text[:300] + ("…" if len(text) > 300 else "")
+
+
+def _step_interaction(tool_name: str, result_obj) -> Optional[dict]:
+    """把工具的待确认事项渲染为**逐题**结构化问答面板（对齐 Claude AskUserQuestion）。
+
+    优先用结果对象里的结构化 `clarifications`（每题自带 options/allow_custom/multi_select）；
+    没有则把纯字符串 `ambiguous_questions` 先做去重降噪，再生成带推荐项的可选答案。
+    这样用户可**逐题**选择或自行描述，而不是面对一整段正文。
+
+    严格要求：用户没回答前，agent **不应**进入下一步。
+    """
+    if result_obj is None:
+        return None
+
+    label = "关联推导" if tool_name == "deduce_relations" else "业务流程推导"
+    questions: list[dict] = []
+
+    clarifications = list(getattr(result_obj, "clarifications", None) or [])
+    if clarifications:
+        for i, c in enumerate(clarifications[:8]):
+            questions.append({
+                "id": getattr(c, "id", "") or f"{tool_name}_q{i}",
+                "question": c.question,
+                "options": list(c.options or []),
+                "allow_custom": bool(c.allow_custom),
+                "multi_select": bool(c.multi_select),
+            })
+    else:
+        raw = list(getattr(result_obj, "ambiguous_questions", None) or [])
+        generated = clarifications.build_clarifications(raw, context=tool_name)
+        for i, c in enumerate(generated[:8]):
+            questions.append({
+                "id": getattr(c, "id", "") or f"{tool_name}_q{i}",
+                "question": c.question,
+                "options": list(c.options or []),
+                "allow_custom": bool(c.allow_custom),
+                "multi_select": bool(c.multi_select),
+            })
+
+    if not questions:
+        return None
+
+    return {
+        "type": "confirm",
+        "title": f"🧩 {label}有 {len(questions)} 项待你确认，逐题选择或补充后我再继续：",
+        "context": f"{tool_name}_confirm",
+        "questions": questions,
+    }
+
+
+# ===========================================================================
+# 启发式降级路径
+# ===========================================================================
+_INTENT_KEYWORDS = {
+    "trace":     ("数据链路追踪", "链路追踪", "追踪链路", "追踪样本", "因果链", "trace"),
+    "relations": ("关联", "关系", "ER", "字段语义", "字段含义", "推导关联"),
+    "flow":      ("流程", "推导流程", "业务流程", "节点", "管线"),
+    "skills":    ("技能", "skill", "技能库", "固化", "生成技能"),
+    "execute":   ("执行", "复刻", "产出结果", "跑一下", "运行", "校验", "验证", "对照", "比对"),
+    "metadata":  ("元数据", "结构", "扫描", "蓝图", "概览"),
+}
+
+
+def _detect_intent(message: str) -> str:
+    low = message.lower()
+    for intent, kws in _INTENT_KEYWORDS.items():
+        if any(kw in message or kw in low for kw in kws):
+            return intent
+    return "general"
+
+
+async def _stream_heuristic(scenario: Scenario, user_message: str) -> AsyncIterator[str]:
+    intent = _detect_intent(user_message)
+    content_buf: list[str] = []
+
+    def emit_content(text: str):
+        content_buf.append(text)
+        return sse("content", delta=text)
+
+    if not scenario.tables_meta and intent != "general":
+        yield emit_content("当前业务场景尚未上传业务表，请先上传业务表/知识表（可选）/历史结果表（上传时选择角色）。")
+        _persist_assistant(scenario, content_buf)
+        return
+
+    if intent == "trace":
+        yield sse("thinking", delta="以结果表样本为锚点追踪业务表/知识表链路……")
+        yield sse("tool_call", name="trace_data_links", args="追踪驱动采样：结果表锚点→业务/知识表对应行")
+        from app.distillation import trace_sampling  # noqa: PLC0415
+        from app.domain import validators  # noqa: PLC0415
+        report = trace_sampling.trace_sampling(scenario)
+        check = validators.validate_trace_connectivity(report)
+        report["connectivity_check"] = check.to_dict()
+        scenario.trace_chain = report
+        scenario_state.invalidate_after_trace(scenario)
+        store.save(scenario)
+        result_summary = f"{check.message}；{report.get('trace_summary', '')}"
+        yield sse("tool_result", name="trace_data_links", result=result_summary)
+        yield sse("refresh", resource="trace")
+        yield sse("status", status=scenario.status.value)
+        traced_lines = []
+        for tbl, info in (report.get("trace_map") or {}).items():
+            by = info.get("matched_by", "")
+            rows = info.get("matched_rows", [])
+            if by and by != "random":
+                traced_lines.append(f"- {tbl}：通过「{by}」追踪到 {len(rows)} 行，置信度 {info.get('trace_confidence', '?')}")
+            else:
+                traced_lines.append(f"- {tbl}：未追踪到稳定链路，当前为随机样本")
+        yield emit_content(
+            f"已完成数据链路追踪。\n\n{result_summary}\n\n"
+            + ("\n".join(traced_lines) or "未形成可展示链路。")
+            + "\n\n请在「表格 & 字段」里展开每张表的追踪链路样本核对；确认无误后再说「推导关联关系」。"
+        )
+
+    elif intent == "relations":
+        if not scenario.trace_chain:
+            yield emit_content(
+                "⚠️ 请先执行「数据链路追踪」。关联推导需要使用以结果样本为锚点追踪到的链路数据，"
+                "否则容易退化成字段名/全量值域猜测，既慢也容易问出无意义问题。"
+            )
+            _persist_assistant(scenario, content_buf)
+            return
+        yield sse("thinking", delta="推导字段业务语义 + 表关联……")
+        yield sse("tool_call", name="deduce_relations", args="启发式：字段语义+关联推导")
+        result = inference.infer_relations(scenario)
+        scenario.relations = result
+        scenario_state.invalidate_after_relations(scenario)
+        domain = transform_builder.build_domain_knowledge(scenario)
+        scenario.domain_knowledge = domain
+        store.save(scenario)
+        yield sse("tool_result", name="deduce_relations", result=result.summary)
+        yield sse("refresh", resource="relations")
+        yield sse("status", status=scenario.status.value)
+        n_sem = sum(len(v) for v in (result.field_semantics or {}).values())
+        lines = "\n".join(
+            f"- {r.from_table}.{r.from_column} → {r.to_table}.{r.to_column}（{r.confidence:.0%}）"
+            for r in result.relations
+        )
+        yield emit_content(
+            f"已完成关联推导 + 为 {n_sem} 个字段标注业务语义。\n\n{result.summary}\n\n{lines or '（未发现明显关联）'}\n\n"
+            "下一步：对我说「推导业务流程」。"
+        )
+
+    elif intent == "flow":
+        if not scenario.relations:
+            yield emit_content("⚠️ 请先「推导关联关系」（含字段语义），流程节点的能力描述与模板分派依赖这两份产物。")
+        else:
+            yield sse("thinking", delta="基于（表角色+字段语义+关联+知识结构）反推业务流程节点……")
+            yield sse("tool_call", name="deduce_flow", args="启发式：业务流程推导")
+            result = inference.infer_flow(scenario)
+            if not result.flow_steps:
+                yield sse("tool_result", name="deduce_flow", result="未生成流程节点")
+                yield emit_content(
+                    "🛑 业务流程推导没有生成任何流程节点，当前不会保存为已推导流程。\n\n"
+                    f"{result.summary or '请先检查表角色、追踪链路样本和关联关系后再重试。'}"
+                )
+                _persist_assistant(scenario, content_buf)
+                return
+            scenario.flow = result
+            scenario_state.invalidate_after_flow(scenario)
+            domain = transform_builder.build_domain_knowledge(scenario)
+            scenario.domain_knowledge = domain
+            scenario.outputs = transform_builder.build_outputs(scenario, domain)
+            store.save(scenario)
+            yield sse("tool_result", name="deduce_flow", result=result.summary)
+            yield sse("refresh", resource="flow")
+            yield sse("status", status=scenario.status.value)
+            steps_text = "\n".join(
+                f"- 步骤{s.step_id} {s.step_name}（{s.template_kind or s.operation}）\n"
+                f"  • 该做什么：{s.purpose}\n  • 能做什么：{s.capability}"
+                for s in result.flow_steps
+            )
+            yield emit_content(
+                f"已推导 {len(result.flow_steps)} 个流程节点：\n\n{steps_text}\n\n"
+                "下一步：对我说「生成技能库」。"
+            )
+
+    elif intent == "skills":
+        if not scenario.flow or not scenario.flow.flow_steps:
+            yield emit_content("⚠️ 尚未推导业务流程。请先「推导业务流程」。")
+        else:
+            yield sse("thinking", delta="按流程节点固化为技能：每个节点一个 skill，外加主技能串联……")
+            yield sse("tool_call", name="generate_skills", args="启发式：生成技能")
+            try:
+                materialized = materialize_skills(scenario)
+            except Exception as exc:  # noqa: BLE001
+                import traceback
+                tb = traceback.format_exc()
+                err_msg = f"❌ 技能生成失败（{type(exc).__name__}：{str(exc)[:300]}）"
+                yield sse("tool_result", name="generate_skills", result=err_msg)
+                yield emit_content(
+                    f"{err_msg}\n\n<details><summary>堆栈（点击展开）</summary>\n\n```\n{tb[:1000]}\n```\n</details>\n\n"
+                    "请检查后端日志后重试。"
+                )
+                _persist_assistant(scenario, content_buf)
+                return
+            scenario.skills = materialized
+            scenario.status = ScenarioStatus.SKILLS_GENERATED
+            store.save(scenario)
+            yield sse("tool_result", name="generate_skills", result=f"✅ 生成 {len(materialized)} 个技能")
+            yield sse("refresh", resource="skills")
+            yield sse("status", status=scenario.status.value)
+            names = "\n".join(f"- {s.name}（{s.operation}）" for s in materialized)
+            yield emit_content(
+                f"已生成 {len(materialized)} 个技能：\n\n{names}\n\n"
+                "蒸馏通道到此结束。执行和验证请切换到「验证通道」。"
+            )
+
+    elif intent == "execute":
+        if not scenario.skills:
+            yield emit_content("⚠️ 尚未生成技能包。请先「生成技能库」。")
+        else:
+            yield emit_content(
+                "✅ 技能包已生成，蒸馏完成。\n\n"
+                "执行和验证请切换到**验证通道**（/verify），该通道与本平台代码完全隔离，\n"
+                "只能调用 Skill 包中的工具，确保验证结果真实反映 Skill 包的独立能力。\n\n"
+                f"直接访问：[验证通道 → {scenario.name}](/verify)"
+            )
+
+    elif intent == "metadata":
+        from . import metadata
+        report = metadata.build_metadata_report(scenario)
+        yield emit_content(report[:3000] + ("…（已截断）" if len(report) > 3000 else ""))
+
+    else:
+        roles = "；".join(f"{t.table_name}={t.role}" for t in scenario.tables_meta) or "（无表）"
+        yield emit_content(
+            f"收到：「{user_message}」。\n\n"
+            f"当前场景「{scenario.name}」状态：{scenario.status.value}\n表角色：{roles}\n\n"
+            "（无 LLM 模式）6 步工作流：\n"
+            "① 上传业务表 + 知识表(可选) + 历史结果表（上传时选角色）\n"
+            "② 对我说「数据链路追踪」（以结果样本为锚点追业务/知识表）\n"
+            "③ 对我说「推导关联关系」（含字段语义）\n"
+            "④ 对我说「推导业务流程」（节点带能力描述 + 知识结构映射）\n"
+            "⑤ 对我说「生成技能库」（按节点固化）\n"
+            "⑥ 切换到「验证通道」执行和校验"
+        )
+
+    _persist_assistant(scenario, content_buf)
+
+
+def _persist_assistant(scenario: Scenario, content_buf: list[str]) -> None:
+    store.append_message(
+        scenario.id,
+        ChatMessage(
+            id=_new_msg_id(),
+            role=ChatRole.ASSISTANT,
+            content="".join(content_buf).strip(),
+        ),
+    )

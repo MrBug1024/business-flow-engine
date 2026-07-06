@@ -23,10 +23,10 @@ from starlette.routing import Mount, Route
 from mcp.server.sse import SseServerTransport
 from mcp.server.transport_security import TransportSecuritySettings
 
-from .. import mcp_server
-from .. import scenario_runtime as rt
-from ..config import settings
-from ..storage import store
+from app.core.config import settings
+from app.domain.storage import store
+from app.runtime import mcp_server
+from app.runtime import scenario_runtime as rt
 
 # 面向公网第三方：关闭 DNS-rebinding 校验（否则任意 IP/域名的 Host 会被拒）。
 _SECURITY = TransportSecuritySettings(enable_dns_rebinding_protection=False)

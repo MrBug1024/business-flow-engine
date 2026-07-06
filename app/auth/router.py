@@ -8,10 +8,10 @@ from urllib.parse import urlencode
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import RedirectResponse
 
-from ..config import settings
+from app.core.config import settings
 from . import db, oauth
 from .deps import get_current_user
-from .models import (
+from app.auth.models import (
     LoginRequest,
     PublicUser,
     RegisterRequest,

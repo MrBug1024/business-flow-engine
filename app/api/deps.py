@@ -6,8 +6,8 @@ from fastapi import Depends, HTTPException
 
 from ..auth.deps import get_current_user
 from ..auth.models import PublicUser
-from ..models import Scenario
-from ..storage import store
+from app.domain.models import Scenario
+from app.domain.storage import store
 
 
 def get_scenario_or_404(scenario_id: str) -> Scenario:

@@ -10,7 +10,7 @@ from typing import Optional
 
 import httpx
 
-from ..config import settings
+from app.core.config import settings
 
 # 每个 provider 的端点与 scope
 _PROVIDERS = {

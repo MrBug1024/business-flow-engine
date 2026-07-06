@@ -9,8 +9,8 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 
-from .. import executor, scenario_state, trace_sampling, validators
-from ..models import (
+from app.domain import scenario_state, validators
+from app.domain.models import (
     EvolveSkillRequest,
     FlowResult,
     ProduceRequest,
@@ -21,9 +21,11 @@ from ..models import (
     Skill,
     ValidationReport,
 )
-from ..skill_builder import materialize_evolved_skill
-from ..storage import store
-from ..validators import validate_trace_connectivity
+from app.distillation import trace_sampling
+from app.distillation.skill_builder import materialize_evolved_skill
+from app.domain.storage import store
+from app.domain.validators import validate_trace_connectivity
+from app.runtime import executor
 from .deps import get_owned_scenario_or_404, get_scenario_or_404
 
 # 本路由下所有端点都是 /scenarios/{scenario_id}/...，统一在路由级强制「登录 + 归属校验」，
