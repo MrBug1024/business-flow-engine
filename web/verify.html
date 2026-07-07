@@ -194,8 +194,8 @@
   <div class="chat-area">
     <div class="messages" id="messages">
       <div class="empty-state" id="emptyState">
-        <div class="empty-title">像配置 MCP 一样挂载业务能力</div>
-        <div class="empty-sub">在左侧「能力市场」点击「+ 安装」挂载一个业务场景能力；点 ⚙️ 可查看它的能力卡片与「粘贴即用」的 MCP 配置片段。挂载后，直接在下方用自然语言提出业务诉求，沙盒会自主判断是否调用、调用哪个能力。</div>
+        <div class="empty-title">像安装 Skill 一样挂载业务能力</div>
+        <div class="empty-sub">在左侧「能力市场」点击「+ 安装」挂载一个业务场景能力；点 ⚙️ 可查看它的能力卡片、Skill 安装信息和兼容配置。挂载后，直接在下方用自然语言提出业务诉求，沙盒会自主判断是否调用、调用哪个能力。</div>
       </div>
     </div>
     <div class="input-area">
@@ -376,8 +376,8 @@ function renderMessages(msgs) {
   el.innerHTML = '';
   if (!msgs.length) {
     el.innerHTML = `<div class="empty-state" id="emptyState">
-      <div class="empty-title">像配置 MCP 一样挂载业务能力</div>
-      <div class="empty-sub">在左侧「能力市场」点击「+ 安装」挂载一个业务场景能力；点 ⚙️ 可查看能力卡片与「粘贴即用」的 MCP 配置片段。挂载后直接在下方用自然语言提出诉求即可。</div></div>`;
+      <div class="empty-title">像安装 Skill 一样挂载业务能力</div>
+      <div class="empty-sub">在左侧「能力市场」点击「+ 安装」挂载一个业务场景能力；点 ⚙️ 可查看能力卡片、Skill 安装信息和兼容配置。挂载后直接在下方用自然语言提出诉求即可。</div></div>`;
     return;
   }
   msgs.forEach(m => {

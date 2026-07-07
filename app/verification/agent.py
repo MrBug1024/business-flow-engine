@@ -294,7 +294,7 @@ def build_verify_tools(scenario_id: str) -> list[StructuredTool]:
         if err:
             return err
 
-        search_script = _skills_dir() / "utils" / "scripts" / "list_knowledge.py"
+        search_script = _skills_dir() / "skill_knowledge_search" / "scripts" / "list_knowledge.py"
         if not search_script.exists():
             return "❌ list_knowledge 脚本不存在，技能包可能不完整。"
         try:
@@ -337,7 +337,7 @@ def build_verify_tools(scenario_id: str) -> list[StructuredTool]:
         if err:
             return err
 
-        search_script = _skills_dir() / "utils" / "scripts" / "search_knowledge.py"
+        search_script = _skills_dir() / "skill_knowledge_search" / "scripts" / "search_knowledge.py"
         if not search_script.exists():
             return "❌ search_knowledge 脚本不存在，技能包可能不完整。"
         try:

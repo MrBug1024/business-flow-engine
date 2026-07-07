@@ -4,7 +4,8 @@
     mounts.json          该用户已挂载的场景 id 列表
     chat.jsonl           该用户的沙盒对话历史
 
-「挂载」= 第三方把某个业务能力包接入自己的 Agent（等价于在 MCP 配置里加一条 server）。
+「挂载」= 第三方把某个业务能力包接入自己的 Agent。推荐形态是标准 Skill；
+MCP 配置仅作为支持工具调用宿主的兼容方式。
 用户只能挂载/操作自己拥有的场景能力包。
 """
 
@@ -142,9 +143,12 @@ def public_base_url(request) -> str:
 
 
 def build_install_config(scenario_id: str, base_url: str) -> dict:
-    """据对外基址生成远程 MCP 安装配置（URL 化，第三方零本地依赖即可挂载）。
+    """生成 Skill-only 与 MCP-only 安装配置。
 
-    返回两种粘贴即用形态：
+    返回：
+    - skill_install：标准 Skill 目录/zip 与 system_prompt.md；
+    - config_example/config_example_native：MCP-only 配置，供支持 MCP 的宿主使用。
+    MCP 配置包含两种形态：
     - config_example：走 `mcp-remote` 桥接，兼容仅支持 stdio 的宿主（如 Claude Desktop）
     - config_example_native：直接给 `url`，供原生支持远程 MCP 的宿主（Cursor / Cline 等）
     """
@@ -161,6 +165,33 @@ def build_install_config(scenario_id: str, base_url: str) -> dict:
     token = settings.mcp_access_token.strip()
     key = f"bfe-{ns}"
     skill_name = pkg.card.get("skill_name") or f"bfe-{ns.replace('_', '-')}"
+    skill_dir = Path(release.get("skill_dir") or "")
+    system_prompt_path = skill_dir / "system_prompt.md"
+    system_prompt = ""
+    child_skills: list[dict] = []
+    try:
+        if system_prompt_path.exists():
+            system_prompt = system_prompt_path.read_text(encoding="utf-8")
+    except Exception:
+        system_prompt = ""
+    try:
+        if skill_dir.exists():
+            for child in sorted(skill_dir.iterdir()):
+                md = child / "SKILL.md"
+                if not child.is_dir() or not md.exists():
+                    continue
+                name = child.name
+                label = child.name
+                try:
+                    text = md.read_text(encoding="utf-8")
+                    m = re.search(r"(?m)^name:\s*([^\n]+)$", text)
+                    if m:
+                        label = m.group(1).strip().strip('"')
+                except Exception:
+                    pass
+                child_skills.append({"skill_id": child.name, "name": label})
+    except Exception:
+        child_skills = []
 
     remote_args = ["-y", "mcp-remote", sse_url]
     native_entry: dict = {"url": sse_url}
@@ -176,15 +207,20 @@ def build_install_config(scenario_id: str, base_url: str) -> dict:
         "scenario_status": scenario_status,
         "publish_allowed": publish_allowed,
         "publish_block_reason": "" if publish_allowed else (
-            f"当前场景状态为 {scenario_status or 'unknown'}，尚未记录为验证通过，不能发布 Docker 镜像。"
+            f"当前场景状态为 {scenario_status or 'unknown'}，尚未记录为验证通过。"
         ),
         "skill_install": {
             "skill_name": skill_name,
-            "source_dir": release.get("package_dir") or str(Path(store.skills_dir(scenario_id)).resolve()),
+            "source_dir": str(skill_dir) if skill_dir.exists() else str(Path(store.skills_dir(scenario_id)).resolve()),
             "skill_zip": release.get("downloads", {}).get("skill_zip", ""),
             "toolplane_docker_zip": release.get("downloads", {}).get("toolplane_docker_zip", ""),
+            "mcp_zip": release.get("downloads", {}).get("mcp_zip", ""),
+            "subagent_prompt_file": str(system_prompt_path) if system_prompt_path.exists() else "system_prompt.md",
+            "toolkit_file": "",
+            "subagent_system_prompt": system_prompt,
+            "child_skills": child_skills,
             "codex_target_hint": f"~/.codex/skills/{skill_name}",
-            "install_summary": "发布包根目录可作为标准 Skill 安装；也可下载 skill.zip 或发布到 GitHub 同步。",
+            "install_summary": "推荐按标准 Skill 安装：导入 skill.zip 或复制 skill/ 目录；MCP 请使用单独的 mcp.zip/Docker 包。",
             "default_prompt": f"Use ${skill_name} to inspect my business data and complete this scenario task.",
         },
         "release": release,

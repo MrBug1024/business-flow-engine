@@ -1,7 +1,7 @@
 """场景能力包运行时（平台无关执行核心）。
 
-本模块是 `mcp_server.py`（交付给第三方的 MCP Server）与 `playground_agent.py`
-（通用第三方沙盒）的**唯一公共执行源**。它只接收「能力包目录」（即某场景的
+本模块是标准 Skill 发布包、兼容 MCP Server 与 `playground_agent.py`
+（通用第三方沙盒）的**公共执行源**。它只接收「能力包目录」（即某场景的
 `skills/` 目录）作为输入，**不依赖平台的 `store` / 数据库 / 任何全局状态**——
 这就在代码层面证明了「蒸馏出的业务能力可以脱离平台独立执行」。
 
@@ -15,10 +15,10 @@
         output_specs.json
         dispatch_config.json
         scripts/skill_executor.py
-      utils/scripts/{search,list}_knowledge.py
+      tools/knowledge/{search,list}_knowledge.py
 
-业务数据（新数据）由调用方通过 `data_dir` 显式指定；若不指定，则按
-「包同级 verify_uploads/ → 包同级 uploads/」的顺序回退（便于本平台沙盒复用蒸馏数据）。
+附件上传、文件预览和结果文件下载由宿主 Agent 平台处理。本运行时只在本地脚本/验证沙盒
+场景下支持 `data_dir`，用于读取宿主已经整理好的业务数据目录。
 """
 
 from __future__ import annotations
@@ -112,9 +112,9 @@ class ScenarioPackage:
     def default_data_dir(self) -> Optional[Path]:
         """未显式给 data_dir 时的回退。
 
-        验证沙盒从 release 包加载时，测试数据仍在场景目录；第三方 Docker/MCP
-        场景里，数据通常挂载到 /data 或通过 BFE_DATA_DIR 指定。因此这里按
-        “显式环境变量 → 包内数据 → 包同级/上级验证数据 → Docker /data”的顺序找。
+        验证沙盒从 release 包加载时，测试数据仍在场景目录；本地脚本场景可通过
+        BFE_DATA_DIR 或显式 data_dir 指定。这里保留 /data 作为通用容器/CI 兼容路径，
+        但业务 Skill 不要求第三方平台提供 MCP/Docker 文件写入能力。
         """
         candidates: list[Path] = []
         env_dir = os.getenv("BFE_DATA_DIR", "").strip()
@@ -221,8 +221,8 @@ def describe_capability(pkg: ScenarioPackage) -> str:
             "required_tables": required,
             "knowledge_table": knowledge_table,
             "mount_or_pass_data_dir": (
-                "For Docker MCP, mount business files to /data or set BFE_DATA_DIR. "
-                "File base names should match table names."
+                "When running local scripts, place business files in the data directory or set BFE_DATA_DIR. "
+                "On third-party Agent platforms, file upload/download is expected to be handled by the host platform."
             ),
             "tables": table_brief,
         },
@@ -320,7 +320,7 @@ def list_outputs(pkg: ScenarioPackage) -> str:
 
 
 def list_knowledge(pkg: ScenarioPackage, limit: int = 50, data_dir: Optional[str] = None) -> str:
-    script = pkg.pkg_dir / "utils" / "scripts" / "list_knowledge.py"
+    script = pkg.pkg_dir / "tools" / "knowledge" / "list_knowledge.py"
     if not script.exists():
         return "❌ list_knowledge 脚本不存在，能力包可能不完整。"
     dd = _resolve_data_dir(pkg, data_dir)
@@ -343,7 +343,7 @@ def list_knowledge(pkg: ScenarioPackage, limit: int = 50, data_dir: Optional[str
 
 def search_knowledge(pkg: ScenarioPackage, keyword: str = "", limit: int = 20,
                      data_dir: Optional[str] = None) -> str:
-    script = pkg.pkg_dir / "utils" / "scripts" / "search_knowledge.py"
+    script = pkg.pkg_dir / "tools" / "knowledge" / "search_knowledge.py"
     if not script.exists():
         return "❌ search_knowledge 脚本不存在，能力包可能不完整。"
     dd = _resolve_data_dir(pkg, data_dir)

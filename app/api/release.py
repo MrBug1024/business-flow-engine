@@ -47,7 +47,13 @@ def download_release_artifact(scenario_id: str, artifact: str) -> FileResponse:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"发布物不存在：{artifact}")
-    filename = "skill.zip" if artifact.startswith("skill") else "toolplane-docker.zip"
+    name = artifact.strip().lower()
+    if name.startswith("skill"):
+        filename = "skill.zip"
+    elif name.startswith("mcp"):
+        filename = "mcp.zip"
+    else:
+        filename = "toolplane-docker.zip"
     return FileResponse(path, filename=filename, media_type="application/zip")
 
 
@@ -58,13 +64,13 @@ def publish_docker_image(
     request: Request,
     scenario: Scenario = Depends(get_owned_scenario_or_404),
 ) -> dict:
-    """验证通过后，自动构建、标记并推送 Docker MCP 镜像。"""
+    """高级兼容：验证通过后构建、标记并推送 Docker MCP 镜像。"""
     if scenario.status != ScenarioStatus.ACTIVE:
         raise HTTPException(
             status_code=400,
             detail=(
                 f"当前场景状态为 {scenario.status.value}，尚未记录为验证通过(active)，"
-                "不能发布 Docker 镜像。请先在验证/沙盒通道完成验证，并让 AI 明确输出“验证通过”。"
+                "不能发布兼容 Docker 镜像。请先在验证/沙盒通道完成验证，并让 AI 明确输出“验证通过”。"
             ),
         )
     try:

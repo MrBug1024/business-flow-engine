@@ -1,7 +1,7 @@
 """第三方发布包构建器。
 
 蒸馏阶段生成的 ``data/scenarios/<id>/skills`` 是平台内部工作产物；第三方需要的
-是可复制、可下载、可 Docker 化、无本机绝对路径的发布包。本模块把内部技能目录
+是可复制、可下载、符合主流 Agent Skill 目录约定、无本机绝对路径的发布包。本模块把内部技能目录
 转换为稳定的 release 包，并让验证沙盒也从 release 包加载，确保“验证通过”和
 “第三方安装后可用”走同一套目录结构。
 """
@@ -24,7 +24,7 @@ from app.domain.storage import store
 
 _ROOT = Path(__file__).resolve().parents[2]
 _APP_DIR = _ROOT / "app"
-_BUILDER_VERSION = "1.7"
+_BUILDER_VERSION = "3.0"
 _DEFAULT_DOCKER_REGISTRY = "harbor.gshbzw.com/skills"
 _DEFAULT_IMAGE_TAG = "1.0.0"
 _IGNORED_DIRS = {"__pycache__", ".pytest_cache", ".mypy_cache", "outputs"}
@@ -84,6 +84,8 @@ _PINYIN_CHARS = {
 class ReleaseBuild:
     scenario_id: str
     skill_name: str
+    release_root: Path
+    skill_dir: Path
     package_dir: Path
     artifacts_dir: Path
     skill_zip: Path
@@ -97,6 +99,7 @@ class ReleaseBuild:
         downloads = {
             "skill_zip": f"{prefix}/skill.zip" if prefix else str(self.skill_zip),
             "toolplane_docker_zip": f"{prefix}/toolplane-docker.zip" if prefix else str(self.docker_zip),
+            "mcp_zip": f"{prefix}/mcp.zip" if prefix else str(self.docker_zip),
         }
         registry = _docker_registry()
         docker_image = f"{registry}/{self.skill_name}:{_DEFAULT_IMAGE_TAG}"
@@ -104,18 +107,23 @@ class ReleaseBuild:
         return {
             "scenario_id": self.scenario_id,
             "skill_name": self.skill_name,
+            "release_root": str(self.release_root),
             "package_dir": str(self.package_dir),
+            "mcp_dir": str(self.package_dir),
+            "skill_dir": str(self.skill_dir),
             "artifacts_dir": str(self.artifacts_dir),
             "downloads": downloads,
             "install_modes": {
                 "skill_directory": {
                     "title": "标准 Skill 目录/zip",
-                    "entry": "SKILL.md",
+                    "entry": "system_prompt.md",
                     "artifact": "skill.zip",
-                    "note": "适用于支持本地 Skill 目录、zip 导入或 GitHub Skill 同步的宿主。",
+                    "system_prompt": "system_prompt.md",
+                    "recommended": True,
+                    "note": "Skill-only 发布物。只包含 system_prompt.md 和标准 Skill 子目录，不混入 MCP/manifest/Docker 文件。",
                 },
                 "toolplane_docker": {
-                    "title": "ToolPlane / Docker MCP",
+                    "title": "MCP / Docker 发布包",
                     "artifact": "toolplane-docker.zip",
                     "docker_image": docker_image,
                     "start_command": start_command,
@@ -126,12 +134,14 @@ class ReleaseBuild:
                     "build_command": f"docker build -t {self.skill_name}:{_DEFAULT_IMAGE_TAG} .",
                     "tag_command": f"docker tag {self.skill_name}:{_DEFAULT_IMAGE_TAG} {docker_image}",
                     "push_command": f"docker push {docker_image}",
-                    "note": "适用于支持 Docker source 的 MCP 平台。构建镜像后以 stdio MCP Server 运行。",
+                    "recommended": False,
+                    "note": "MCP-only 发布物。包含 MCP runtime、requirements、Dockerfile 和工具描述，不要求宿主识别 Skill。",
                 },
                 "mcp_stdio": {
-                    "title": "通用 stdio MCP",
+                    "title": "stdio MCP",
                     "command": "python",
                     "args": [str(self.package_dir / "run_mcp.py")],
+                    "recommended": False,
                     "note": "适用于支持 command/args 的本地 MCP 宿主。",
                 },
             },
@@ -147,11 +157,13 @@ def ensure_release_package(scenario_id: str, base_url: str = "") -> ReleaseBuild
     src = Path(store.skills_dir(scenario_id))
     release_base = Path(store.release_dir(scenario_id))
     skill_name = _skill_name(src, scenario_id)
-    package_dir = release_base / skill_name
+    release_root = release_base / skill_name
+    skill_dir = release_root / "skill"
+    package_dir = release_root / "mcp"
     manifest_path = release_base / "release.json"
     source_hash = _tree_hash(src)
 
-    if manifest_path.exists() and package_dir.exists():
+    if manifest_path.exists() and skill_dir.exists() and package_dir.exists():
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             if (
@@ -162,6 +174,8 @@ def ensure_release_package(scenario_id: str, base_url: str = "") -> ReleaseBuild
                 return ReleaseBuild(
                     scenario_id=scenario_id,
                     skill_name=skill_name,
+                    release_root=release_root,
+                    skill_dir=skill_dir,
                     package_dir=package_dir,
                     artifacts_dir=artifacts,
                     skill_zip=artifacts / "skill.zip",
@@ -181,36 +195,42 @@ def build_release_package(
 ) -> ReleaseBuild:
     """从内部 skills/ 目录构建第三方发布包。"""
     src = Path(store.skills_dir(scenario_id))
-    if not (src / "SKILL.md").exists() or not (src / "mcp.json").exists():
-        raise FileNotFoundError("该场景尚未生成可发布的能力包（缺少 SKILL.md 或 mcp.json）。")
+    if not (src / "mcp.json").exists() or not list(src.glob("*/SKILL.md")):
+        raise FileNotFoundError("该场景尚未生成可发布的能力包（缺少 mcp.json 或标准子 Skill）。")
 
     release_base = Path(store.release_dir(scenario_id))
     skill_name = _skill_name(src, scenario_id)
-    package_dir = release_base / skill_name
+    release_root = release_base / skill_name
+    skill_dir = release_root / "skill"
+    package_dir = release_root / "mcp"
     artifacts_dir = release_base / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
-    _cleanup_stale_release_packages(release_base, keep=package_dir)
+    _cleanup_stale_release_packages(release_base, keep=release_root)
 
-    if package_dir.exists():
-        shutil.rmtree(package_dir)
-    _copy_tree(src, package_dir)
+    if release_root.exists():
+        shutil.rmtree(release_root)
+    release_root.mkdir(parents=True, exist_ok=True)
 
     warnings: list[str] = []
-    _normalize_release_package(package_dir, skill_name, warnings)
+    _build_skill_package(src, skill_dir, skill_name)
+    _build_mcp_package(src, package_dir, skill_name, warnings)
     _write_runtime(package_dir)
     _write_docker_files(package_dir, skill_name)
     _write_install_docs(package_dir, skill_name)
     _write_release_mcp_config(package_dir, skill_name)
-    warnings.extend(_validate_release_package(package_dir))
+    warnings.extend(_validate_skill_package(skill_dir))
+    warnings.extend(_validate_mcp_package(package_dir))
 
     skill_zip = artifacts_dir / "skill.zip"
     docker_zip = artifacts_dir / "toolplane-docker.zip"
-    _zip_dir(package_dir, skill_zip, root_name=skill_name, exclude_runtime=True)
-    _zip_dir(package_dir, docker_zip, root_name=skill_name, exclude_runtime=False)
+    _zip_dir(skill_dir, skill_zip, root_name="skill")
+    _zip_dir(package_dir, docker_zip, root_name="mcp")
 
     build = ReleaseBuild(
         scenario_id=scenario_id,
         skill_name=skill_name,
+        release_root=release_root,
+        skill_dir=skill_dir,
         package_dir=package_dir,
         artifacts_dir=artifacts_dir,
         skill_zip=skill_zip,
@@ -221,11 +241,12 @@ def build_release_package(
     manifest = {
         **build.as_dict(base_url=base_url),
         "source_hash": source_hash or _tree_hash(src),
-        "package_format_version": "1.0",
+        "package_format_version": "2.0",
         "builder_version": _BUILDER_VERSION,
         "artifact_files": {
             "skill_zip": str(skill_zip),
             "toolplane_docker_zip": str(docker_zip),
+            "mcp_zip": str(docker_zip),
         },
     }
     build.manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -235,7 +256,7 @@ def build_release_package(
 def release_status(scenario_id: str, base_url: str = "") -> dict[str, Any]:
     build = ensure_release_package(scenario_id, base_url=base_url)
     status = build.as_dict(base_url=base_url)
-    status["ready"] = build.skill_zip.exists() and build.docker_zip.exists()
+    status["ready"] = build.skill_zip.exists()
     return status
 
 
@@ -323,7 +344,7 @@ def artifact_path(scenario_id: str, artifact: str) -> Path:
     name = artifact.strip().lower()
     if name in {"skill", "skill.zip"}:
         return build.skill_zip
-    if name in {"toolplane-docker", "toolplane-docker.zip", "docker", "docker.zip"}:
+    if name in {"mcp", "mcp.zip", "toolplane-docker", "toolplane-docker.zip", "docker", "docker.zip"}:
         return build.docker_zip
     raise FileNotFoundError(f"未知发布物：{artifact}")
 
@@ -420,7 +441,6 @@ def _skill_name(src: Path, scenario_id: str) -> str:
         or card.get("display_name")
         or card.get("summary")
         or card.get("skill_name")
-        or card.get("agent_skill", {}).get("name")
         or scenario_id
     )
     name = _scenario_name_slug(str(raw))
@@ -552,8 +572,95 @@ def _cleanup_stale_release_packages(release_base: Path, keep: Path) -> None:
             continue
         if release_base not in resolved.parents:
             continue
-        if (child / "mcp.json").exists() and (child / "run_mcp.py").exists():
+        if (
+            (child / "mcp.json").exists()
+            or (child / "run_mcp.py").exists()
+            or (child / "mcp" / "mcp.json").exists()
+            or (child / "skill" / "system_prompt.md").exists()
+        ):
             shutil.rmtree(child)
+
+
+def _build_skill_package(src: Path, skill_dir: Path, skill_name: str) -> None:
+    """Build the Skill-only artifact.
+
+    This directory intentionally contains no MCP descriptors, manifests, Docker files,
+    requirements, release docs, runtime package, or platform metadata.
+    """
+    if skill_dir.exists():
+        shutil.rmtree(skill_dir)
+    skill_dir.mkdir(parents=True, exist_ok=True)
+
+    prompt_src = src / "system_prompt.md"
+    prompt = prompt_src.read_text(encoding="utf-8") if prompt_src.exists() else ""
+    if not prompt.strip():
+        prompt = (
+            f"# {skill_name} system prompt\n\n"
+            "你是一个业务场景子 Agent。只处理本 Skill 包描述的业务场景；"
+            "文件上传、预览、下载和权限隔离由宿主平台负责。"
+        )
+    (skill_dir / "system_prompt.md").write_text(prompt, encoding="utf-8")
+
+    copied = 0
+    for child in sorted(src.iterdir()):
+        if not child.is_dir():
+            continue
+        if child.name in {"agents", "bfe_runtime", "utils", "scripts", "skill_runtime_setup"}:
+            continue
+        if not (child / "SKILL.md").exists():
+            continue
+        _copy_tree(child, skill_dir / child.name)
+        copied += 1
+    if copied == 0:
+        raise FileNotFoundError("未找到可发布的标准 Skill 子目录（缺少 */SKILL.md）。")
+
+
+def _build_mcp_package(src: Path, package_dir: Path, skill_name: str, warnings: list[str]) -> None:
+    """Build the MCP-only artifact.
+
+    MCP does not need the host to understand Skill. It keeps only runtime resources,
+    capability descriptors and deterministic scripts used by bfe_runtime.
+    """
+    if package_dir.exists():
+        shutil.rmtree(package_dir)
+    _copy_tree(src, package_dir)
+    _normalize_release_package(package_dir, skill_name, warnings)
+
+    tools_dir = package_dir / "tools"
+    knowledge_tools = tools_dir / "knowledge"
+    knowledge_tools.mkdir(parents=True, exist_ok=True)
+    for fname in ("list_knowledge.py", "search_knowledge.py"):
+        src_script = package_dir / "skill_knowledge_search" / "scripts" / fname
+        if src_script.exists():
+            shutil.copy2(src_script, knowledge_tools / fname)
+
+    for rel in (
+        "SKILL.md",
+        "system_prompt.md",
+        "SUBAGENT_SYSTEM_PROMPT.md",
+        "TOOLKIT.md",
+        "CAPABILITY.md",
+        "CAPABILITY.json",
+        "SCENARIO_CONTEXT.md",
+    ):
+        p = package_dir / rel
+        if p.exists() and p.is_file():
+            p.unlink()
+    keep_dirs = {"main_skill", "tools"}
+    for child in list(package_dir.iterdir()):
+        if not child.is_dir():
+            continue
+        if child.name in keep_dirs:
+            continue
+        if child.name.startswith("step_") or child.name.startswith("skill_") or child.name in {"agents", "utils", "scripts"}:
+            shutil.rmtree(child)
+    for rel in ("agents", "skill_runtime_setup"):
+        p = package_dir / rel
+        if p.exists() and p.is_dir():
+            shutil.rmtree(p)
+    for skill_md in package_dir.rglob("SKILL.md"):
+        if skill_md.is_file():
+            skill_md.unlink()
 
 
 def _normalize_release_package(package_dir: Path, skill_name: str, warnings: list[str]) -> None:
@@ -568,162 +675,71 @@ def _normalize_release_package(package_dir: Path, skill_name: str, warnings: lis
         "args": ["run_mcp.py"],
         "note": "在发布包根目录运行；不依赖蒸馏平台代码。",
     }
-    card["primary_install_mode"] = "toolplane_docker"
-    card["agent_skill"] = {
+    card.pop("agent_skill", None)
+    card["primary_install_mode"] = "mcp_stdio"
+    card["mcp_package"] = {
         "name": skill_name,
-        "install": "将发布包根目录复制/解压到宿主 skills 目录，或通过 GitHub/zip 同步。",
-        "entry": "SKILL.md",
-        "primary": True,
+        "command": "python",
+        "args": ["run_mcp.py"],
+        "docker_image_hint": f"{_docker_registry()}/{skill_name}:{_DEFAULT_IMAGE_TAG}",
     }
     card["release"] = {
-        "format": "bfe-universal-scenario-package",
+        "format": "bfe-mcp-package",
         "root": ".",
         "runtime": "bfe_runtime",
         "detached_from_platform": True,
-        "install_modes": ["skill_directory", "toolplane_docker", "mcp_stdio", "github_source"],
+        "install_modes": ["mcp_stdio", "toolplane_docker"],
     }
     _ensure_release_tool_schema(card)
-    _write_capability_docs(package_dir, card)
+    for tool in card.get("tools", []):
+        if not isinstance(tool, dict):
+            continue
+        desc = str(tool.get("description", ""))
+        desc = desc.replace("命令行入口：skill_query_data/scripts/query_data.py。", "由 MCP query_data 工具执行。")
+        desc = desc.replace("skill_query_data/scripts/query_data.py", "MCP query_data 工具")
+        tool["description"] = desc
     mcp_path.write_text(json.dumps(card, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    req = package_dir / "requirements.txt"
-    existing = req.read_text(encoding="utf-8") if req.exists() else ""
-    if "mcp" not in {line.strip().split("==")[0].split(">=")[0] for line in existing.splitlines()}:
-        existing = existing.rstrip() + "\n\n# MCP Server runtime\nmcp>=1.2.0\n"
-    req.write_text(existing.lstrip(), encoding="utf-8")
-
-    skill_md = package_dir / "SKILL.md"
-    if skill_md.exists():
-        text = skill_md.read_text(encoding="utf-8")
-        text = re.sub(r"(?m)^name:\s*.+$", f"name: {skill_name}", text, count=1)
-        text = text.replace(
-            "若宿主支持 MCP，可使用 `mcp_config.example.json` 挂载平台托管调试端点；正式离线使用时优先按本 Skill 的脚本入口运行。",
-            "若宿主支持 MCP，可使用 `mcp_config.stdio.example.json` 或 Dockerfile 启动本发布包内置 MCP Server；无需回连蒸馏平台。",
+    manifest_path = package_dir / "manifest.json"
+    manifest = _jload(manifest_path) or {}
+    if isinstance(manifest, dict):
+        mcp_meta = manifest.get("mcp")
+        if isinstance(mcp_meta, dict):
+            mcp_meta.pop("skill_md", None)
+        manifest.pop("skills", None)
+        entry_points = manifest.setdefault("entry_points", {})
+        if isinstance(entry_points, dict):
+            entry_points["search_knowledge"] = "tools/knowledge/search_knowledge.py"
+            entry_points["list_knowledge"] = "tools/knowledge/list_knowledge.py"
+            entry_points.pop("query_data", None)
+            entry_points.pop("data_reader", None)
+            entry_points.pop("nl_rule_parser", None)
+            entry_points.pop("context_doc", None)
+        manifest_tools = manifest.get("tools", [])
+        if not isinstance(manifest_tools, list):
+            manifest_tools = []
+        for tool in manifest_tools:
+            if not isinstance(tool, dict):
+                continue
+            fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+            desc = str(fn.get("description", ""))
+            desc = desc.replace("命令行入口：skill_query_data/scripts/query_data.py。", "由 MCP query_data 工具执行。")
+            desc = desc.replace("skill_query_data/scripts/query_data.py", "MCP query_data 工具")
+            fn["description"] = desc
+        manifest["runtime_resources"] = [
+            "main_skill/scripts/skill_executor.py",
+            "tools/knowledge/search_knowledge.py",
+            "tools/knowledge/list_knowledge.py",
+            "bfe_runtime/mcp_server.py",
+            "bfe_runtime/scenario_runtime.py",
+        ]
+        manifest["verify_instructions"] = (
+            "将本 MCP 发布包作为独立能力服务加载。它不依赖蒸馏平台，也不要求宿主识别 Skill；"
+            "Skill-only 安装请使用单独的 skill.zip。"
         )
-        skill_md.write_text(text, encoding="utf-8")
-
-    openai_yaml = package_dir / "agents" / "openai.yaml"
-    if openai_yaml.exists():
-        text = openai_yaml.read_text(encoding="utf-8")
-        text = re.sub(
-            r"(?m)^  default_prompt:\s*.+$",
-            f'  default_prompt: "Use ${skill_name} to inspect my business data and complete this scenario task."',
-            text,
-            count=1,
-        )
-        openai_yaml.write_text(text, encoding="utf-8")
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
     if _contains_platform_path(package_dir):
         warnings.append("发布包中仍检测到平台路径或 app.*.mcp_server 引用，请检查生成内容。")
-
-
-def _write_capability_docs(package_dir: Path, card: dict) -> None:
-    outputs_doc = _jload(package_dir / "main_skill" / "output_specs.json") or {}
-    domain_doc = _jload(package_dir / "main_skill" / "domain_knowledge.json") or {}
-    outputs = outputs_doc.get("outputs", []) if isinstance(outputs_doc, dict) else []
-    tables = domain_doc.get("tables", []) if isinstance(domain_doc, dict) else []
-    required = list(card.get("required_tables") or [])
-    table_brief = []
-    for table in tables:
-        table_name = table.get("table_name", "")
-        columns = table.get("columns", []) or []
-        important = [
-            c.get("name") for c in columns
-            if c.get("semantic_role") in {"PK", "FK", "TIME", "METRIC", "NL_TEXT", "CATEGORY"}
-        ][:16]
-        table_brief.append({
-            "name": table_name,
-            "role": table.get("role", "input"),
-            "required": table_name in required,
-            "columns_count": len(columns),
-            "important_columns": important,
-        })
-
-    capability = {
-        "scenario_name": card.get("display_name", ""),
-        "skill_name": card.get("skill_name", ""),
-        "namespace": card.get("namespace", ""),
-        "summary": card.get("summary", ""),
-        "when_to_use": card.get("when_to_use", []),
-        "not_for": card.get("not_for", []),
-        "required_business_data": {
-            "required_tables": required,
-            "knowledge_table": card.get("knowledge_table", ""),
-            "tables": table_brief,
-            "docker_data_mount": "/data",
-            "env_data_dir": "BFE_DATA_DIR",
-        },
-        "outputs": [
-            {
-                "output_id": o.get("output_id"),
-                "name": o.get("name"),
-                "format": o.get("fmt", "csv"),
-                "status": o.get("status", ""),
-                "capability": o.get("capability", ""),
-            }
-            for o in outputs
-        ],
-        "tools": [
-            {
-                "name": t.get("name"),
-                "action": t.get("action"),
-                "description": t.get("description", ""),
-            }
-            for t in card.get("tools", [])
-        ],
-        "recommended_workflow": [
-            "Call describe_capability first after installation.",
-            "Call describe_schema before writing SQL or matching fields.",
-            "Call list_outputs before execute.",
-            "Use list_knowledge/search_knowledge for rule or knowledge driven tasks.",
-            "Use query_data for ad hoc checks and execute for packaged outputs.",
-        ],
-    }
-    (package_dir / "CAPABILITY.json").write_text(
-        json.dumps(capability, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-
-    tool_lines = "\n".join(
-        f"- `{t.get('name')}`: {t.get('description', '')}" for t in card.get("tools", [])
-    ) or "- 无"
-    output_lines = "\n".join(
-        f"- `{o.get('output_id')}`: {o.get('name', '')}" for o in outputs
-    ) or "- 无"
-    table_lines = "\n".join(
-        f"- `{t['name']}`: role={t['role']}, required={t['required']}, columns={t['columns_count']}"
-        for t in table_brief
-    ) or "- 无"
-    md = f"""# {capability['scenario_name']} 能力说明
-
-{capability['summary']}
-
-## 适用场景
-{chr(10).join('- ' + item for item in capability['when_to_use']) or '- 无'}
-
-## 不适用场景
-{chr(10).join('- ' + item for item in capability['not_for']) or '- 无'}
-
-## 需要的业务数据
-必需表：{('、'.join(required)) or '无特定要求'}
-
-{table_lines}
-
-Docker 运行时默认从 `/data` 读取业务数据，也可通过 `BFE_DATA_DIR` 指定。
-
-## 可产出结果
-{output_lines}
-
-## MCP 工具
-{tool_lines}
-
-## 推荐调用流程
-1. 先调用 `describe_capability`，确认业务场景、数据要求和工具边界。
-2. 再调用 `describe_schema`，读取表结构、字段语义和关联关系。
-3. 用 `list_outputs` 查看可执行产出。
-4. 对知识/规则驱动任务，先用 `list_knowledge` 或 `search_knowledge` 定位规则条目。
-5. 用 `query_data` 做现场查询，用 `execute` 执行封装产出。
-"""
-    (package_dir / "CAPABILITY.md").write_text(md, encoding="utf-8")
 
 
 def _contains_platform_path(package_dir: Path) -> bool:
@@ -746,37 +762,38 @@ def _contains_platform_path(package_dir: Path) -> bool:
 
 
 def _ensure_release_tool_schema(card: dict) -> None:
+    namespace = card.get("namespace", "scn")
+    display = card.get("display_name") or card.get("skill_name") or "业务场景"
+    tools = card.setdefault("tools", [])
+    existing_actions = {tool.get("action") for tool in tools if isinstance(tool, dict)}
+
     data_dir_prop = {
         "type": "string",
-        "description": "可选：新业务数据目录；不传时使用 BFE_DATA_DIR、包内 data/ 或宿主挂载的 /data。",
+        "description": "可选：本地脚本执行时的新业务数据目录。第三方平台文件上传/下载由宿主平台处理。",
     }
     out_dir_prop = {
         "type": "string",
         "description": "可选：结果输出目录；不传时使用 BFE_OUT_DIR 或包同级 outputs/。",
     }
-    tools = card.setdefault("tools", [])
-    existing_actions = {tool.get("action") for tool in tools if isinstance(tool, dict)}
-    namespace = card.get("namespace", "scn")
-    display = card.get("display_name") or card.get("skill_name") or "业务场景"
 
-    def prepend_tool(action: str, description: str) -> None:
+    def ensure_tool(action: str, description: str, props: dict | None = None, required: list[str] | None = None) -> None:
         if action in existing_actions:
             return
-        tools.insert(0, {
+        tools.append({
             "name": f"{namespace}__{action}",
             "action": action,
             "description": description,
-            "inputSchema": {"type": "object", "properties": {}, "required": []},
+            "inputSchema": {"type": "object", "properties": props or {}, "required": required or []},
         })
         existing_actions.add(action)
 
-    prepend_tool(
-        "list_outputs",
-        f"列出「{display}」场景可执行的业务产出、output_id、结果格式和当前可执行状态；调用 execute 前应先查看。",
-    )
-    prepend_tool(
+    ensure_tool(
         "describe_capability",
         f"首次接入或不确定能力用途时先调用：说明「{display}」业务场景是什么、能做什么、需要哪些业务数据、有哪些产出、有哪些工具以及推荐调用流程。",
+    )
+    ensure_tool(
+        "list_outputs",
+        f"列出「{display}」场景可执行的业务产出、output_id、结果格式和当前可执行状态；调用 execute 前应先查看。",
     )
 
     for tool in tools:
@@ -823,6 +840,7 @@ ENV PYTHONUNBUFFERED=1 \\
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir "mcp>=1.2.0"
 COPY . /app
 RUN mkdir -p /data /outputs
 
@@ -833,11 +851,12 @@ CMD ["python", "-m", "bfe_runtime.mcp_server", "--pkg", "/app"]
         "name": skill_name,
         "version": "1.0.0",
         "private": True,
-        "description": "Standalone business scenario MCP package generated by Business Flow Engine.",
+        "description": "Standalone MCP server package generated by Business Flow Engine.",
         "bin": {skill_name: "bin/mcp-server.mjs"},
-        "files": ["SKILL.md", "CAPABILITY.md", "CAPABILITY.json", "agents", "main_skill", "utils", "scripts",
-                  "skill_data_reader", "skill_nl_rule_parser", "bfe_runtime", "manifest.json", "mcp.json",
-                  "requirements.txt"],
+        "files": ["INSTALL.md", "bin", "main_skill", "tools",
+                  "bfe_runtime", "manifest.json", "mcp.json",
+                  "mcp_config.example.json", "mcp_config.stdio.example.json",
+                  "requirements.txt", "run_mcp.py", "Dockerfile"],
         "scripts": {"mcp": "python -m bfe_runtime.mcp_server --pkg ."},
     }
     (package_dir / "package.json").write_text(json.dumps(package_json, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -859,15 +878,17 @@ child.on("exit", (code) => process.exit(code ?? 0));
     pyproject = f"""[project]
 name = "{skill_name}"
 version = "1.0.0"
-description = "Standalone business scenario MCP package generated by Business Flow Engine."
+description = "Standalone MCP server package generated by Business Flow Engine."
 requires-python = ">=3.10"
 dependencies = [
   "pandas>=2.2.0",
   "duckdb>=1.1.0",
   "openpyxl>=3.1.0",
   "python-calamine>=0.7.0",
-  "mcp>=1.2.0",
 ]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.2.0"]
 
 [project.scripts]
 {skill_name} = "bfe_runtime.mcp_server:main"
@@ -877,17 +898,30 @@ dependencies = [
 
 def _write_install_docs(package_dir: Path, skill_name: str) -> None:
     registry = _docker_registry()
-    doc = f"""# {skill_name} 安装说明
+    doc = f"""# {skill_name} MCP 安装说明
 
-这是一个已经脱离蒸馏平台的业务场景能力包。
+这是一个已经脱离蒸馏平台的 MCP 业务场景服务包。
 
-## ToolPlane / Docker
-1. 将本目录构建为 Docker 镜像并推送到 ToolPlane 可访问的镜像仓库。
-2. 在 ToolPlane 的 MCP 页面选择 Docker source。
-3. 按下面字段填写：
-   - Docker Image: `{registry}/{skill_name}:{_DEFAULT_IMAGE_TAG}`
-   - Start Command: `python -m bfe_runtime.mcp_server --pkg /app`
-   - Server Name: `{skill_name}`
+## 内容边界
+
+本包只用于 MCP / Docker 发布，不是 Skill 包。Skill 发布物请使用单独的 `skill.zip`。
+
+MCP 包包含：
+
+- `mcp.json`：工具清单和能力描述。
+- `manifest.json`：场景元数据。
+- `main_skill/`、`tools/`：MCP runtime 调用的执行资源。
+- `bfe_runtime/`：独立 MCP server 运行时。
+- `requirements.txt`：Python 依赖。
+
+## stdio MCP
+
+```bash
+pip install -r requirements.txt
+python run_mcp.py
+```
+
+## Docker
 
 ```bash
 docker build -t {skill_name}:{_DEFAULT_IMAGE_TAG} .
@@ -901,7 +935,7 @@ docker push {registry}/{skill_name}:{_DEFAULT_IMAGE_TAG}
 docker run -i --rm -v /path/to/business-data:/data {skill_name}:{_DEFAULT_IMAGE_TAG}
 ```
 
-## 通用 stdio MCP
+## MCP 配置
 
 ```json
 {{
@@ -914,12 +948,9 @@ docker run -i --rm -v /path/to/business-data:/data {skill_name}:{_DEFAULT_IMAGE_
 }}
 ```
 
-## Skill 目录
-将整个 `{skill_name}` 目录复制到宿主的 skills 目录，入口文件是 `SKILL.md`。
-
-## 新业务数据
-把新业务数据文件放到 `/data`、包内 `data/`、或调用工具时传入 `data_dir`。文件名不含后缀应与场景表名一致。
+文件上传、文件预览和结果下载仍由宿主 Agent 平台负责；本 MCP 只提供业务能力工具。
 """
+    (package_dir / "INSTALL.md").write_text(doc, encoding="utf-8")
     (package_dir / "TOOLPLANE_INSTALL.md").write_text(doc, encoding="utf-8")
 
 
@@ -940,15 +971,47 @@ def _write_release_mcp_config(package_dir: Path, skill_name: str) -> None:
     )
 
 
-def _validate_release_package(package_dir: Path) -> list[str]:
+def _validate_skill_package(skill_dir: Path) -> list[str]:
+    warnings: list[str] = []
+    if not (skill_dir / "system_prompt.md").exists():
+        warnings.append("Skill 包缺少 system_prompt.md。")
+    skill_files = list(skill_dir.glob("*/SKILL.md"))
+    if not skill_files:
+        warnings.append("Skill 包缺少标准子 Skill（*/SKILL.md）。")
+    forbidden = {
+        "mcp.json",
+        "manifest.json",
+        "requirements.txt",
+        "Dockerfile",
+        "package.json",
+        "pyproject.toml",
+        "run_mcp.py",
+        "INSTALL.md",
+        "TOOLKIT.md",
+        "SUBAGENT_SYSTEM_PROMPT.md",
+        "CAPABILITY.md",
+        "CAPABILITY.json",
+        "SCENARIO_CONTEXT.md",
+    }
+    for rel in forbidden:
+        if (skill_dir / rel).exists():
+            warnings.append(f"Skill 包不应包含：{rel}")
+    for rel in ("bfe_runtime", "agents", "skill_runtime_setup"):
+        if (skill_dir / rel).exists():
+            warnings.append(f"Skill 包不应包含目录：{rel}")
+    return warnings
+
+
+def _validate_mcp_package(package_dir: Path) -> list[str]:
     warnings: list[str] = []
     required = [
-        "SKILL.md",
-        "agents/openai.yaml",
+        "INSTALL.md",
         "manifest.json",
         "mcp.json",
         "requirements.txt",
         "main_skill/scripts/skill_executor.py",
+        "tools/knowledge/search_knowledge.py",
+        "tools/knowledge/list_knowledge.py",
         "bfe_runtime/mcp_server.py",
         "bfe_runtime/scenario_runtime.py",
         "Dockerfile",
@@ -959,12 +1022,16 @@ def _validate_release_package(package_dir: Path) -> list[str]:
     card = _jload(package_dir / "mcp.json") or {}
     if not card.get("tools"):
         warnings.append("mcp.json 未声明工具，第三方无法发现业务能力。")
+    forbidden = ["SKILL.md", "system_prompt.md", "SUBAGENT_SYSTEM_PROMPT.md", "TOOLKIT.md", "skill_runtime_setup"]
+    for rel in forbidden:
+        if (package_dir / rel).exists():
+            warnings.append(f"MCP 包不应包含 Skill-only 文件或目录：{rel}")
     if _contains_platform_path(package_dir):
         warnings.append("仍检测到平台私有路径或 app.*.mcp_server 引用。")
     return warnings
 
 
-def _zip_dir(package_dir: Path, zip_path: Path, root_name: str, exclude_runtime: bool) -> None:
+def _zip_dir(package_dir: Path, zip_path: Path, root_name: str) -> None:
     if zip_path.exists():
         zip_path.unlink()
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -972,11 +1039,6 @@ def _zip_dir(package_dir: Path, zip_path: Path, root_name: str, exclude_runtime:
             if not file.is_file():
                 continue
             rel = file.relative_to(package_dir)
-            if exclude_runtime and rel.parts and rel.parts[0] in {
-                "bfe_runtime", "bin", "run_mcp.py", "Dockerfile", "package.json", "pyproject.toml",
-                "TOOLPLANE_INSTALL.md",
-            }:
-                continue
             if any(part in _IGNORED_DIRS for part in rel.parts):
                 continue
             if any(str(rel).endswith(suf) for suf in _IGNORED_SUFFIXES):

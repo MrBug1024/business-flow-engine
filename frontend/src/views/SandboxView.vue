@@ -57,7 +57,7 @@
             clear-path="/playground/messages"
             :reload-key="reloadKey"
             placeholder="用自然语言描述你的诉求（业务或通用皆可）…"
-            empty-title="像配置 MCP 一样挂载业务能力"
+            empty-title="像安装 Skill 一样挂载业务能力"
             empty-sub="左侧安装一个业务能力后，直接提出业务诉求；沙盒会自主判断是否调用、调用哪个能力。"
           />
         </Pane>

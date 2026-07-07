@@ -12,7 +12,7 @@
         <span class="ns-chip">模式 {{ card.execution_mode }}</span>
         <span v-if="release?.package_dir" class="ns-chip ok">验证使用发布包</span>
         <span class="ns-chip" :class="{ ok: publishAllowed, warn: !publishAllowed }">
-          {{ publishAllowed ? '可发布' : `未验证 ${scenarioStatus || 'unknown'}` }}
+          {{ publishAllowed ? '已验证' : `未验证 ${scenarioStatus || 'unknown'}` }}
         </span>
       </div>
 
@@ -29,73 +29,15 @@
       </section>
 
       <section>
-        <h4>发布包安装方式</h4>
+        <h4>标准 Skill 发布方式</h4>
         <div class="publish-grid">
           <div class="install-card primary">
             <div class="install-head">
-              <span>ToolPlane / Docker MCP</span>
+              <span>标准 Skill 包 / zip</span>
               <el-tag size="small" type="success" effect="light">推荐</el-tag>
             </div>
             <p class="hint">
-              适合截图中支持 Docker source 的第三方平台。下载后构建镜像并发布，第三方填镜像名即可。
-            </p>
-            <div class="install-row">
-              <span class="url-tag">Docker 包</span>
-              <code class="url mono">{{ skillInstall.toolplane_docker_zip }}</code>
-              <el-button size="small" text :icon="CopyDocument" @click="copyText(skillInstall.toolplane_docker_zip, '已复制 Docker 包地址')" />
-            </div>
-            <div class="install-row">
-              <span class="url-tag">Docker Image</span>
-              <code class="url mono">{{ dockerImagePreview }}</code>
-              <el-button size="small" text :icon="CopyDocument" @click="copyText(dockerImagePreview, '已复制镜像名')" />
-            </div>
-            <div class="install-row">
-              <span class="url-tag">Start Command</span>
-              <code class="url mono">{{ dockerMode.start_command }}</code>
-              <el-button size="small" text :icon="CopyDocument" @click="copyText(dockerMode.start_command, '已复制启动命令')" />
-            </div>
-            <div class="install-row">
-              <span class="url-tag">Server Name</span>
-              <code class="url mono">{{ dockerMode.server_name }}</code>
-              <el-button size="small" text :icon="CopyDocument" @click="copyText(dockerMode.server_name, '已复制服务名称')" />
-            </div>
-            <div class="publish-form">
-              <el-input v-model="publishRegistry" size="small">
-                <template #prepend>Registry</template>
-              </el-input>
-              <el-input v-model="publishRepository" size="small">
-                <template #prepend>Repository</template>
-              </el-input>
-              <el-input v-model="publishTag" size="small">
-                <template #prepend>Tag</template>
-              </el-input>
-            </div>
-            <div class="actions">
-              <el-button size="small" type="primary" :icon="Download" @click="downloadUrl(skillInstall.toolplane_docker_zip, 'toolplane-docker.zip')">
-                下载 Docker 包
-              </el-button>
-              <el-button size="small" type="success" :loading="publishing" :disabled="!publishAllowed" @click="publishDocker">
-                发布到 Harbor
-              </el-button>
-            </div>
-            <div v-if="!publishAllowed" class="publish-gate">
-              {{ publishBlockReason || '当前场景尚未记录为验证通过，不能发布 Docker 镜像。' }}
-            </div>
-            <div v-if="publishResult" class="publish-log">
-              <div class="publish-status" :class="{ ok: publishResult.ok }">
-                {{ publishResult.ok ? '发布成功' : '发布失败' }}：{{ publishResult.image || publishResult.error }}
-              </div>
-              <pre>{{ formatPublishLog(publishResult) }}</pre>
-            </div>
-          </div>
-
-          <div class="install-card">
-            <div class="install-head">
-              <span>标准 Skill 目录 / zip</span>
-              <el-tag size="small" effect="plain">Skill</el-tag>
-            </div>
-            <p class="hint">
-              适合支持本地 Skill 目录、zip 导入或 GitHub Skill 同步的宿主。包根目录名与 Skill 名称一致。
+              Skill 包只包含 <code>system_prompt.md</code> 和标准 Skill 子目录；不混入 MCP、Docker、manifest 或安装文档。
             </p>
             <div class="install-row">
               <span class="url-tag">Skill 名称</span>
@@ -107,20 +49,48 @@
               <code class="url mono">{{ skillInstall.skill_zip }}</code>
               <el-button size="small" text :icon="CopyDocument" @click="copyText(skillInstall.skill_zip, '已复制 Skill zip 地址')" />
             </div>
-            <div class="actions">
-              <el-button size="small" :icon="Download" @click="downloadUrl(skillInstall.skill_zip, 'skill.zip')">下载 Skill zip</el-button>
+            <div class="install-row">
+              <span class="url-tag">System Prompt</span>
+              <code class="url mono">{{ skillInstall.subagent_prompt_file }}</code>
+              <el-button size="small" text :icon="CopyDocument" @click="copyText(skillInstall.subagent_system_prompt, '已复制 System Prompt')" />
             </div>
+            <div v-if="childSkills.length" class="child-skills">
+              <div class="child-skills-title">包内子 Skill（随 zip 一起安装）</div>
+              <span v-for="s in childSkills" :key="s.skill_id || s.name" class="child-skill">
+                <strong>{{ s.skill_id }}</strong>
+                <em>{{ s.name }}</em>
+              </span>
+            </div>
+            <div class="actions">
+              <el-button size="small" type="primary" :icon="Download" @click="downloadUrl(skillInstall.skill_zip, 'skill.zip')">
+                下载 Skill zip
+              </el-button>
+              <el-button size="small" :icon="CopyDocument" @click="copyText(skillInstall.subagent_system_prompt, '已复制子 Agent System Prompt')">
+                复制 System Prompt
+              </el-button>
+            </div>
+          </div>
+
+          <div class="install-card">
+            <div class="install-head">
+              <span>system_prompt.md</span>
+              <el-tag size="small" effect="plain">Agent</el-tag>
+            </div>
+            <p class="hint">
+              第三方平台如果支持创建专用 Agent，可直接使用这段系统提示词绑定本业务场景。
+            </p>
+            <pre class="prompt-box">{{ skillInstall.subagent_system_prompt || 'Skill 包内提供 system_prompt.md。' }}</pre>
           </div>
         </div>
 
         <div class="release-note">
-          <div><strong>发布包目录</strong><code class="mono">{{ release?.package_dir || skillInstall.source_dir }}</code></div>
-          <div>沙盒验证会从这个发布包加载能力，不再直接加载平台内部 <code>skills/</code> 目录。</div>
+          <div><strong>Skill 目录</strong><code class="mono">{{ release?.skill_dir || skillInstall.source_dir }}</code></div>
+          <div><strong>MCP 目录</strong><code class="mono">{{ release?.mcp_dir || release?.package_dir || '' }}</code></div>
         </div>
       </section>
 
       <section>
-        <h4>通用 MCP 配置</h4>
+        <h4>MCP / Docker 发布方式</h4>
         <el-segmented v-model="variant" :options="variantOptions" size="small" class="variant-seg" />
         <div class="code">
           <el-button size="small" class="copy" :icon="CopyDocument" @click="copy">复制</el-button>
@@ -134,6 +104,58 @@
             这是原生远程 MCP URL 配置；要求第三方平台能访问当前服务地址。
           </template>
         </div>
+
+        <details class="advanced-box">
+          <summary>MCP / Docker 发布包</summary>
+          <div class="install-card legacy">
+            <p class="hint">
+              MCP 包与 Skill 包完全分开：它包含 MCP runtime、requirements、Dockerfile 和工具描述，不要求第三方平台识别 Skill。
+            </p>
+            <div class="install-row">
+              <span class="url-tag">MCP 包</span>
+              <code class="url mono">{{ skillInstall.mcp_zip || skillInstall.toolplane_docker_zip }}</code>
+              <el-button size="small" text :icon="CopyDocument" @click="copyText(skillInstall.mcp_zip || skillInstall.toolplane_docker_zip, '已复制 MCP 包地址')" />
+            </div>
+            <div class="install-row">
+              <span class="url-tag">Docker Image</span>
+              <code class="url mono">{{ dockerImagePreview }}</code>
+              <el-button size="small" text :icon="CopyDocument" @click="copyText(dockerImagePreview, '已复制镜像名')" />
+            </div>
+            <div class="install-row">
+              <span class="url-tag">Start Command</span>
+              <code class="url mono">{{ dockerMode.start_command }}</code>
+              <el-button size="small" text :icon="CopyDocument" @click="copyText(dockerMode.start_command, '已复制启动命令')" />
+            </div>
+            <div class="publish-form">
+              <el-input v-model="publishRegistry" size="small">
+                <template #prepend>Registry</template>
+              </el-input>
+              <el-input v-model="publishRepository" size="small">
+                <template #prepend>Repository</template>
+              </el-input>
+              <el-input v-model="publishTag" size="small">
+                <template #prepend>Tag</template>
+              </el-input>
+            </div>
+            <div class="actions">
+              <el-button size="small" :icon="Download" @click="downloadUrl(skillInstall.mcp_zip || skillInstall.toolplane_docker_zip, 'mcp.zip')">
+                下载 MCP 包
+              </el-button>
+              <el-button size="small" :loading="publishing" :disabled="!publishAllowed" @click="publishDocker">
+                发布到 Harbor
+              </el-button>
+            </div>
+            <div v-if="!publishAllowed" class="publish-gate">
+              {{ publishBlockReason || '当前场景尚未记录为验证通过。' }}
+            </div>
+            <div v-if="publishResult" class="publish-log">
+              <div class="publish-status" :class="{ ok: publishResult.ok }">
+                {{ publishResult.ok ? '发布成功' : '发布失败' }}：{{ publishResult.image || publishResult.error }}
+              </div>
+              <pre>{{ formatPublishLog(publishResult) }}</pre>
+            </div>
+          </div>
+        </details>
       </section>
 
       <section>
@@ -177,7 +199,7 @@ const fi = ref<HTMLInputElement>()
 
 const variant = ref<'remote' | 'native'>('remote')
 const variantOptions = [
-  { label: '平台托管测试', value: 'remote' },
+  { label: 'MCP 桥接', value: 'remote' },
   { label: '远程 MCP URL', value: 'native' },
 ]
 const cfgRemote = ref<any>({})
@@ -199,6 +221,7 @@ const dockerImagePreview = computed(() => {
   const tag = publishTag.value || '1.0.0'
   return repo ? `${registry}/${repo}:${tag}` : dockerMode.value.docker_image || ''
 })
+const childSkills = computed(() => skillInstall.value?.child_skills || [])
 const snippet = computed(() =>
   JSON.stringify((variant.value === 'remote' ? cfgRemote.value : cfgNative.value) || {}, null, 2),
 )
@@ -271,7 +294,7 @@ async function onUpload(e: Event) {
 async function publishDocker() {
   if (!props.scenarioId) return
   if (!publishAllowed.value) {
-    ElMessage.warning(publishBlockReason.value || '当前场景尚未记录为验证通过，不能发布 Docker 镜像。')
+    ElMessage.warning(publishBlockReason.value || '当前场景尚未记录为验证通过。')
     return
   }
   publishing.value = true
@@ -335,6 +358,7 @@ ul.neg li::marker { color: var(--danger); }
   border-radius: var(--r-sm); padding: 12px;
 }
 .install-card.primary { border-color: color-mix(in srgb, var(--success) 40%, transparent); }
+.install-card.legacy { margin-top: 10px; background: var(--surface-1); }
 .install-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-weight: 700; color: var(--text-1); }
 .install-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
 .url-tag { flex-shrink: 0; font-size: var(--text-xs); font-weight: 700; color: var(--text-3); }
@@ -345,6 +369,29 @@ ul.neg li::marker { color: var(--danger); }
   overflow-x: auto; white-space: nowrap;
 }
 .actions { margin-top: 10px; }
+.child-skills { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.child-skills-title {
+  width: 100%; font-size: var(--text-xs); font-weight: 700; color: var(--text-3);
+}
+.child-skill {
+  display: inline-flex; flex-direction: column; gap: 1px; max-width: 180px;
+  border: 1px solid var(--border); background: var(--surface-1);
+  border-radius: var(--r-xs); padding: 6px 8px;
+}
+.child-skill strong {
+  font-size: var(--text-xs); color: var(--text-1); font-family: var(--font-mono);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.child-skill em {
+  font-size: var(--text-xs); color: var(--text-3); font-style: normal;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.prompt-box {
+  margin: 10px 0 0; max-height: 260px; overflow: auto; white-space: pre-wrap;
+  font-family: var(--font-mono); font-size: var(--text-xs); line-height: 1.6;
+  color: var(--text-2); background: var(--code-bg); border: 1px solid var(--border);
+  border-radius: var(--r-sm); padding: 10px;
+}
 .publish-form { display: grid; gap: 7px; margin-top: 10px; }
 .publish-log {
   margin-top: 10px; background: var(--code-bg); border: 1px solid var(--border);
@@ -369,6 +416,10 @@ ul.neg li::marker { color: var(--danger); }
 }
 .release-note code { margin-left: 6px; }
 .variant-seg { margin-bottom: 10px; }
+.advanced-box { margin-top: 12px; }
+.advanced-box summary {
+  cursor: pointer; color: var(--text-2); font-size: var(--text-sm); font-weight: 700;
+}
 .code { position: relative; background: var(--code-bg); border: 1px solid var(--border); border-radius: var(--r-sm); padding: 12px 14px; overflow-x: auto; }
 .code pre { margin: 0; font-family: var(--font-mono); font-size: var(--text-sm); color: var(--text-2); line-height: 1.6; }
 .copy { position: absolute; top: 8px; right: 8px; }

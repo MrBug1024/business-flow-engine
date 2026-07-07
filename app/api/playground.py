@@ -2,8 +2,8 @@
 
 把「验证通道」升级为「默认第三方 Agent 平台 + 配置面板」：
 - catalog：能力市场（当前用户拥有的、已生成能力包的场景）
-- mounts：安装/卸载能力（等价于在 MCP 配置里增删一条 server）
-- config：某能力的能力卡片 + 粘贴即用 MCP 配置片段（配置面板）
+- mounts：安装/卸载能力（等价于第三方宿主安装一个业务 Skill）
+- config：某能力的能力卡片 + Skill 安装信息 + MCP 兼容配置片段（配置面板）
 - uploads：给某已挂载场景上传测试数据（复用场景的 verify_uploads 目录）
 - chat：通用沙盒流式对话（Agent 不预置业务知识，自主发现 + 决策）
 """
@@ -35,7 +35,7 @@ def _require_owned(scenario_id: str, user: PublicUser) -> None:
 
 @router.get("/catalog")
 def get_catalog(user: PublicUser = Depends(get_current_user)) -> dict:
-    """能力市场：列出当前用户拥有的、已生成 MCP 能力包的场景（含是否已挂载）。"""
+    """能力市场：列出当前用户拥有的、已生成 Skill 能力包的场景（含是否已挂载）。"""
     return {"items": pg.catalog(user.id), "mounted": pg.get_mounts(user.id)}
 
 
@@ -49,7 +49,7 @@ def mount_scenario(scenario_id: str, user: PublicUser = Depends(get_current_user
     _require_owned(scenario_id, user)
     pkg_dir = Path(store.skills_dir(scenario_id))
     if not (pkg_dir / "main_skill").exists() or not (pkg_dir / "mcp.json").exists():
-        raise HTTPException(status_code=400, detail="该场景尚未生成 MCP 能力包，无法挂载")
+        raise HTTPException(status_code=400, detail="该场景尚未生成标准 Skill 能力包，无法挂载")
     return {"mounted": pg.mount(user.id, scenario_id)}
 
 
@@ -65,7 +65,7 @@ def get_mount_config(
     _require_owned(scenario_id, user)
     cfg = pg.mount_config(scenario_id, pg.public_base_url(request))
     if not cfg:
-        raise HTTPException(status_code=404, detail="能力包不存在或未生成 MCP 描述符")
+        raise HTTPException(status_code=404, detail="能力包不存在或未生成 Skill 描述符")
     return cfg
 
 
