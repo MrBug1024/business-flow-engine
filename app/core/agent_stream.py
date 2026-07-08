@@ -1,8 +1,8 @@
 """通用 Agent 事件流 → SSE 帧（心跳 / 超时 / 工具轨迹 / 落盘）。
 
-从验证通道 `verify_service` 沉淀出的可复用流式内核：任何「deepagents Agent + 历史消息」
+从 Agent 流式对话沉淀出的可复用流式内核：任何「deepagents Agent + 历史消息」
 都可用它跑一轮流式对话，并获得同样的健壮性保障（每轮必落盘、慢工具心跳、单轮总超时、
-工具调用轨迹）。playground（通用第三方沙盒）复用它，避免重复实现这套生命周期逻辑。
+工具调用轨迹）。playground（通用 Agent 平台）复用它，避免重复实现这套生命周期逻辑。
 
 调用方通过 `persist(content, thinking, tools)` 回调决定把本轮助手消息落到哪里。
 """

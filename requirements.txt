@@ -21,6 +21,7 @@ duckdb>=1.1.0  # 技能运行时：在新数据上跑 SQL 模板（规范 Sectio
 
 # MCP 标准接入：把蒸馏出的业务场景能力作为 stdio MCP Server 交付给第三方 Agent 宿主零改动挂载
 mcp>=1.2.0
+langchain-mcp-adapters>=0.1.0
 
 # 鉴权与用户体系（系统数据用内嵌 SQLite；OAuth 授权码流程用 httpx 手写，无需 authlib）
 PyJWT>=2.8.0

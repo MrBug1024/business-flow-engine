@@ -39,6 +39,15 @@ def get_release_status(scenario_id: str, request: Request) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.get("/scenarios/{scenario_id}/release/config")
+def get_release_config(scenario_id: str, request: Request) -> dict:
+    """返回蒸馏完成后的发布配置：标准 Skill、MCP、Docker、安装提示。"""
+    cfg = pg.mount_config(scenario_id, pg.public_base_url(request))
+    if not cfg:
+        raise HTTPException(status_code=404, detail="发布配置不存在或能力包尚未生成")
+    return cfg
+
+
 @router.get("/scenarios/{scenario_id}/release/download/{artifact}")
 def download_release_artifact(scenario_id: str, artifact: str) -> FileResponse:
     try:
@@ -70,7 +79,7 @@ def publish_docker_image(
             status_code=400,
             detail=(
                 f"当前场景状态为 {scenario.status.value}，尚未记录为验证通过(active)，"
-                "不能发布兼容 Docker 镜像。请先在验证/沙盒通道完成验证，并让 AI 明确输出“验证通过”。"
+                "不能发布兼容 Docker 镜像。请先在 Agent 平台完成验证，并让 AI 明确输出“验证通过”。"
             ),
         )
     try:

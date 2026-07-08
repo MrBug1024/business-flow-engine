@@ -2,7 +2,7 @@
 
 蒸馏阶段生成的 ``data/scenarios/<id>/skills`` 是平台内部工作产物；第三方需要的
 是可复制、可下载、符合主流 Agent Skill 目录约定、无本机绝对路径的发布包。本模块把内部技能目录
-转换为稳定的 release 包，并让验证沙盒也从 release 包加载，确保“验证通过”和
+转换为稳定的 release 包，并让 Agent 平台也从 release 包加载，确保“验证通过”和
 “第三方安装后可用”走同一套目录结构。
 """
 
@@ -152,7 +152,7 @@ class ReleaseBuild:
 def ensure_release_package(scenario_id: str, base_url: str = "") -> ReleaseBuild:
     """确保 release 包存在并且比内部 skills 新。
 
-    为了避免验证通道偷吃内部目录，这个函数会在沙盒 catalog/mount 时自动构建。
+    为了避免执行阶段读取内部目录，这个函数会在 Agent 平台 catalog/mount 时自动构建。
     """
     src = Path(store.skills_dir(scenario_id))
     release_base = Path(store.release_dir(scenario_id))
@@ -558,6 +558,18 @@ def _copy_tree(src: Path, dst: Path) -> None:
     shutil.copytree(src, dst, ignore=ignore)
 
 
+def _package_has_knowledge_table(package_dir: Path) -> bool:
+    """Return whether this generated package actually contains a knowledge table."""
+    manifest = _jload(package_dir / "manifest.json") or {}
+    if isinstance(manifest, dict):
+        if "has_knowledge_table" in manifest:
+            return bool(manifest.get("has_knowledge_table"))
+        if str(manifest.get("knowledge_table", "")).strip():
+            return True
+    dispatch = _jload(package_dir / "main_skill" / "dispatch_config.json") or {}
+    return bool(isinstance(dispatch, dict) and dispatch.get("knowledge_table"))
+
+
 def _cleanup_stale_release_packages(release_base: Path, keep: Path) -> None:
     """Remove old generated package directories under release/, keeping artifacts."""
     release_base = release_base.resolve()
@@ -627,12 +639,13 @@ def _build_mcp_package(src: Path, package_dir: Path, skill_name: str, warnings: 
     _normalize_release_package(package_dir, skill_name, warnings)
 
     tools_dir = package_dir / "tools"
-    knowledge_tools = tools_dir / "knowledge"
-    knowledge_tools.mkdir(parents=True, exist_ok=True)
-    for fname in ("list_knowledge.py", "search_knowledge.py"):
-        src_script = package_dir / "skill_knowledge_search" / "scripts" / fname
-        if src_script.exists():
-            shutil.copy2(src_script, knowledge_tools / fname)
+    if _package_has_knowledge_table(package_dir):
+        knowledge_tools = tools_dir / "knowledge"
+        knowledge_tools.mkdir(parents=True, exist_ok=True)
+        for fname in ("list_knowledge.py", "search_knowledge.py"):
+            src_script = package_dir / "skill_knowledge_search" / "scripts" / fname
+            if src_script.exists():
+                shutil.copy2(src_script, knowledge_tools / fname)
 
     for rel in (
         "SKILL.md",
@@ -666,6 +679,7 @@ def _build_mcp_package(src: Path, package_dir: Path, skill_name: str, warnings: 
 def _normalize_release_package(package_dir: Path, skill_name: str, warnings: list[str]) -> None:
     mcp_path = package_dir / "mcp.json"
     card = _jload(mcp_path) or {}
+    has_knowledge = _package_has_knowledge_table(package_dir)
 
     card.pop("server", None)
     card["skill_name"] = skill_name
@@ -690,6 +704,12 @@ def _normalize_release_package(package_dir: Path, skill_name: str, warnings: lis
         "detached_from_platform": True,
         "install_modes": ["mcp_stdio", "toolplane_docker"],
     }
+    if not has_knowledge:
+        card["tools"] = [
+            tool for tool in card.get("tools", [])
+            if not isinstance(tool, dict)
+            or tool.get("action") not in {"list_knowledge", "search_knowledge"}
+        ]
     _ensure_release_tool_schema(card)
     for tool in card.get("tools", []):
         if not isinstance(tool, dict):
@@ -708,8 +728,12 @@ def _normalize_release_package(package_dir: Path, skill_name: str, warnings: lis
         manifest.pop("skills", None)
         entry_points = manifest.setdefault("entry_points", {})
         if isinstance(entry_points, dict):
-            entry_points["search_knowledge"] = "tools/knowledge/search_knowledge.py"
-            entry_points["list_knowledge"] = "tools/knowledge/list_knowledge.py"
+            if has_knowledge:
+                entry_points["search_knowledge"] = "tools/knowledge/search_knowledge.py"
+                entry_points["list_knowledge"] = "tools/knowledge/list_knowledge.py"
+            else:
+                entry_points.pop("search_knowledge", None)
+                entry_points.pop("list_knowledge", None)
             entry_points.pop("query_data", None)
             entry_points.pop("data_reader", None)
             entry_points.pop("nl_rule_parser", None)
@@ -725,13 +749,17 @@ def _normalize_release_package(package_dir: Path, skill_name: str, warnings: lis
             desc = desc.replace("命令行入口：skill_query_data/scripts/query_data.py。", "由 MCP query_data 工具执行。")
             desc = desc.replace("skill_query_data/scripts/query_data.py", "MCP query_data 工具")
             fn["description"] = desc
-        manifest["runtime_resources"] = [
+        runtime_resources = [
             "main_skill/scripts/skill_executor.py",
-            "tools/knowledge/search_knowledge.py",
-            "tools/knowledge/list_knowledge.py",
             "bfe_runtime/mcp_server.py",
             "bfe_runtime/scenario_runtime.py",
         ]
+        if has_knowledge:
+            runtime_resources[1:1] = [
+                "tools/knowledge/search_knowledge.py",
+                "tools/knowledge/list_knowledge.py",
+            ]
+        manifest["runtime_resources"] = runtime_resources
         manifest["verify_instructions"] = (
             "将本 MCP 发布包作为独立能力服务加载。它不依赖蒸馏平台，也不要求宿主识别 Skill；"
             "Skill-only 安装请使用单独的 skill.zip。"
@@ -851,7 +879,7 @@ CMD ["python", "-m", "bfe_runtime.mcp_server", "--pkg", "/app"]
         "name": skill_name,
         "version": "1.0.0",
         "private": True,
-        "description": "Standalone MCP server package generated by Business Flow Engine.",
+        "description": "Standalone MCP server package generated by Zero Singularity Workshop.",
         "bin": {skill_name: "bin/mcp-server.mjs"},
         "files": ["INSTALL.md", "bin", "main_skill", "tools",
                   "bfe_runtime", "manifest.json", "mcp.json",
@@ -878,7 +906,7 @@ child.on("exit", (code) => process.exit(code ?? 0));
     pyproject = f"""[project]
 name = "{skill_name}"
 version = "1.0.0"
-description = "Standalone MCP server package generated by Business Flow Engine."
+description = "Standalone MCP server package generated by Zero Singularity Workshop."
 requires-python = ">=3.10"
 dependencies = [
   "pandas>=2.2.0",
@@ -1004,18 +1032,22 @@ def _validate_skill_package(skill_dir: Path) -> list[str]:
 
 def _validate_mcp_package(package_dir: Path) -> list[str]:
     warnings: list[str] = []
+    has_knowledge = _package_has_knowledge_table(package_dir)
     required = [
         "INSTALL.md",
         "manifest.json",
         "mcp.json",
         "requirements.txt",
         "main_skill/scripts/skill_executor.py",
-        "tools/knowledge/search_knowledge.py",
-        "tools/knowledge/list_knowledge.py",
         "bfe_runtime/mcp_server.py",
         "bfe_runtime/scenario_runtime.py",
         "Dockerfile",
     ]
+    if has_knowledge:
+        required.extend([
+            "tools/knowledge/search_knowledge.py",
+            "tools/knowledge/list_knowledge.py",
+        ])
     for rel in required:
         if not (package_dir / rel).exists():
             warnings.append(f"缺少发布文件：{rel}")

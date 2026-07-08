@@ -116,11 +116,11 @@ def _describe_tables_with_trace(
                 samples_data = matched[:3]
                 note = f"追踪样本（置信:{conf}，关联键:{by}）"
             else:
-                samples_data = matched[:2] if matched else t.sample_rows[:2]
-                note = "随机样本（未追踪到关联行）"
+                samples_data = []
+                note = "未追踪到因果行（不向 AI 提供随机样本）"
         else:
-            samples_data = t.sample_rows[:2]
-            note = "随机样本（无追踪路径）"
+            samples_data = []
+            note = "未进入当前因果链路（不向 AI 提供随机样本）"
 
         samples = json.dumps(samples_data, ensure_ascii=False)
         lines.append(
@@ -133,7 +133,7 @@ def _describe_tables_with_trace(
 def _describe_trace_chain(trace_report: "dict | None") -> str:
     """将追踪链以 '结果行→业务行→知识行' 格式描述给 LLM，作为推导因果关系的核心依据。"""
     if not trace_report or trace_report.get("degraded"):
-        return "（未建立追踪链，样本为随机采样，关联推导参考字段名相似度）"
+        return "（未建立稳定追踪链；不会把随机样本作为因果依据）"
 
     result_sample = trace_report.get("result_sample", [])
     result_table = trace_report.get("result_table", "")
@@ -142,7 +142,8 @@ def _describe_trace_chain(trace_report: "dict | None") -> str:
     if not result_sample:
         return "（结果表无数据，无法建立追踪链）"
 
-    parts = [f"以下是以「结果表第1行」为锚点，逆向追踪到各表的关联行（因果样本链）：\n"]
+    anchor_idx = trace_report.get("anchor_result_row_index") or 1
+    parts = [f"以下是以「结果表第 {anchor_idx} 条非空记录」为锚点，逆向追踪到各表的关联行（因果样本链）：\n"]
 
     if result_table:
         row0 = result_sample[0]
@@ -150,19 +151,21 @@ def _describe_trace_chain(trace_report: "dict | None") -> str:
         parts.append(json.dumps(row0, ensure_ascii=False))
         parts.append("")
 
+    causal_links = 0
     for tbl, info in trace_map.items():
         matched = info.get("matched_rows", [])
         by = info.get("matched_by", "?")
         conf = info.get("trace_confidence", "?")
         if matched and by != "random":
+            causal_links += 1
             parts.append(f"**↳ 关联到「{tbl}」（关联键={by}，置信度={conf}）**：")
             parts.append(json.dumps(matched[0], ensure_ascii=False))
             if info.get("composite_suggested"):
                 parts.append(f"⚠️ {info.get('warning', '')}")
             parts.append("")
 
-    if len(parts) == 2:
-        return "（追踪路径均为随机采样，无因果关联链）"
+    if causal_links == 0:
+        parts.append("未追踪到其它表的稳定因果行；后续推导必须先让用户确认关联键或修正表角色。")
 
     return "\n".join(parts)
 
@@ -233,7 +236,7 @@ def _describe_knowledge_schema(
         parts = [
             f"知识表：{ks.knowledge_table}",
             f"分派键列：{ks.dispatch_key_column or '（未识别）'}",
-            f"分派值→处理模式：{ks.dispatch_map}",
+            f"分派值→说明（不驱动执行）：{ks.dispatch_map}",
             f"条目编号列：{ks.item_id_column or '（未识别）'}",
             f"自然语言条件列：{ks.condition_columns}",
             f"参数列：{ks.parameter_columns}",
@@ -244,7 +247,7 @@ def _describe_knowledge_schema(
         parts = [
             f"知识表（旧称规则表）：{ks.rule_table}",
             f"分派键列（旧称分派列）：{ks.discriminator_column or '（未识别）'}",
-            f"分派值→处理模式：{ks.discriminator_to_template}",
+            f"分派值→说明（不驱动执行）：{ks.discriminator_to_template}",
             f"条目编号列（旧称规则编号列）：{ks.rule_id_column or '（未识别）'}",
             f"自然语言条件列：{ks.nl_description_columns}",
             f"参数列：{ks.parameter_columns}",
@@ -522,7 +525,7 @@ def infer_relations(scenario: Scenario) -> RelationResult:
 
 
 # ===========================================================================
-# 业务流程推导（v1.0.3 重写：节点带可读能力描述 + 模板算子）
+# 业务流程推导（节点带可读能力描述 + 结构性策略线索）
 # ===========================================================================
 class _FlowStepLLM(BaseModel):
     """供 LLM 填充的「节点结构」。字段名与 FlowStep 对齐，便于直接映射。"""
@@ -533,7 +536,7 @@ class _FlowStepLLM(BaseModel):
     capability: str = ""                                 # 能做什么 / 输出什么数据
     data_in: list[str] = Field(default_factory=list)     # 输入数据的可读说明
     data_out: list[str] = Field(default_factory=list)    # 输出数据的可读说明
-    template_kind: str = ""                              # passthrough/dedup/threshold/keyword/aggregate/join/column_select/lookup/formula/set_compare/knowledge_driven_join/sql（任意自定义逻辑写 sql 直接给 DuckDB 语句，不必迁就前面的枚举）
+    template_kind: str = ""                              # 兼容字段：结构性策略线索；任意自定义逻辑可直接给 sql
     input_tables: list[str] = Field(default_factory=list)
     output: str = ""
     output_columns: list[str] = Field(default_factory=list)
@@ -828,7 +831,7 @@ def infer_knowledge_schema_llm(
     # v1.0.7 铁律：不再为每个分派值预先派生+固化一条 SQL。规则可能有成百上千条，
     # 每条的判断逻辑千差万别，提前逐条"解题"既跑不完也不可能穷尽真实业务的各种要求。
     # 知识表结构映射到此为止——它只负责说清楚"知识表长什么样、字段怎么对应业务表"，
-    # 真正"这条规则该怎么查"交给验证通道里会思考的 LLM，用 search_knowledge 读到
+    # 真正"这条规则该怎么查"交给 Agent 平台里会思考的 LLM，用 search_knowledge 读到
     # 规则原文 + describe_schema 看到真实字段后，现场用 query_data 构造查询，
     # 而不是让平台在蒸馏阶段替它把所有可能的规则都预先写成代码。
     return merged, out.ambiguous_questions
@@ -869,7 +872,7 @@ def infer_flow(scenario: Scenario) -> FlowResult:
     ks, ks_questions = infer_knowledge_schema_llm(scenario, nl_analysis=nl_analysis)
     rs = rule_schema.infer_rule_schema(scenario)             # v1.0.3 兼容版（纯启发式镜像）
 
-    # 3. LLM 推流程节点（带能力描述与模板算子）
+    # 3. LLM 推流程节点（带能力描述与结构性策略线索）
     llm = get_structured_llm()
     steps: list[FlowStep] = []
     questions: list[str] = []

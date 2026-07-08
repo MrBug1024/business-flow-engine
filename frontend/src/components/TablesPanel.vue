@@ -177,7 +177,8 @@ function traceLabel(tableName: string): string {
   const info = traceInfo(tableName)
   if (!traceData.value || traceData.value.source === 'not_traced') return '未追踪'
   if (!info) return '未追踪'
-  if (info.matched_by === 'random') return '随机样本'
+  if (!info.matched_by) return '未追踪'
+  if (info.matched_by === 'random') return '未进入链路'
   if (info.matched_by === '结果入口') return '结果入口'
   return `${info.matched_by || '已追踪'} · ${info.trace_confidence || '?'}`
 }
@@ -193,7 +194,8 @@ function traceSummary(tableName: string): string {
   if (!traceData.value || traceData.value.source === 'not_traced') return '尚未执行数据链路追踪。'
   if (!info) return '这张表未能匹配到追踪链路，请确认它是否参与当前业务流程。'
   if (info.matched_by === '结果入口') return '这是追踪入口表，下面展示用于反推的结果样本行。'
-  if (info.matched_by === 'random') return '这张表没有追到因果关联，当前展示的是随机兜底样本。'
+  if (!info.matched_by) return '这张表没有追到因果关联，不会作为后续推导样本。'
+  if (info.matched_by === 'random') return '这张表没有追到因果关联；这些行不会作为后续推导样本。'
   return `通过「${info.matched_by}」追踪到 ${traceRows(tableName).length} 行，置信度 ${info.trace_confidence || 'unknown'}。`
 }
 

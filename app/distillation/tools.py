@@ -1,6 +1,6 @@
 """蒸馏工具集（v1.0.6）。
 
-蒸馏阶段工具（不包含执行/验证工具，那些属于验证通道）：
+蒸馏阶段工具（不包含执行/验证工具，那些属于 Agent 平台）：
     extract_metadata     读取元数据蓝图
     get_field_sample     字段去重样本
     set_table_role       修正表角色
@@ -16,7 +16,7 @@
     get_trace_sample     追踪驱动采样
 
 v1.0.6：移除 list_patterns / suggest_patterns_for_table——不再引导 AI 从一个固定的
-处理模式目录里挑选算子。节点逻辑（含知识表驱动节点的执行 SQL）现在由 AI 依据这个
+业务判断模式目录里挑选算子。节点逻辑（含知识表驱动节点的执行 SQL）现在由 AI 依据这个
 场景的真实 schema 直接写 SQL、并在真实数据上验证，不是从模板库里选一个形状套上去。
 """
 
@@ -256,7 +256,7 @@ def build_tools(scenario_id: str) -> list[StructuredTool]:
     def deduce_flow() -> str:
         """【步骤 4】推导业务流程节点链。
 
-        每个节点带「该做什么/能做什么/数据怎么变化/模板算子」描述。**若有知识表**，同时蒸馏出
+        每个节点带「该做什么/能做什么/数据怎么变化/结构性算子」描述。**若有知识表**，同时蒸馏出
         知识结构映射（dispatch key、条目编号、条件列等），知识条目在运行时按行迭代。无需传参。"""
         scenario = _require(scenario_id)
         if not scenario.relations:
@@ -296,7 +296,7 @@ def build_tools(scenario_id: str) -> list[StructuredTool]:
                 f"{result.summary}{tail}")
 
     def describe_flow_step(step_id: int) -> str:
-        """查看某个流程节点的细节（能力描述、模板算子、参数、SQL）。"""
+        """查看某个流程节点的细节（能力描述、策略线索、参数、SQL）。"""
         scenario = _require(scenario_id)
         if not scenario.flow:
             return "尚未推导业务流程。请先 deduce_flow。"
@@ -308,7 +308,7 @@ def build_tools(scenario_id: str) -> list[StructuredTool]:
             f"步骤{s.step_id}：{s.step_name}（{s.operation}/{s.template_kind}）\n"
             f"- 该做什么：{s.purpose}\n- 能做什么：{s.capability}\n"
             f"- 数据输入：{s.data_in}\n- 数据输出：{s.data_out}\n"
-            f"- 模板算子：{s.template_kind}\n- 参数：{json.dumps(s.params, ensure_ascii=False)}\n"
+            f"- 策略线索：{s.template_kind}\n- 参数：{json.dumps(s.params, ensure_ascii=False)}\n"
             f"- 状态：{s.status}\n"
             + (f"- 缺：{s.external_data_needed}\n" if s.external_data_needed else "")
             + (f"- SQL：\n{s.sql}" if s.sql else "- （暂无可执行 SQL，待 refine_flow_step 细化）")
@@ -324,7 +324,7 @@ def build_tools(scenario_id: str) -> list[StructuredTool]:
     ) -> str:
         """细化/修正某个流程节点。
         二选一：
-        * `template_kind` + `params_json`（用模板算子+参数生成 SQL，推荐）；
+        * `template_kind` + `params_json`（用结构性算子+参数生成 SQL，适合确定性转换）；
         * `sql`（直接给 DuckDB SQL，表名=注册视图名，标识符用双引号）。
         可选：`purpose` / `capability` 覆盖节点描述。"""
         scenario = _require(scenario_id)
@@ -354,7 +354,7 @@ def build_tools(scenario_id: str) -> list[StructuredTool]:
             s.params = params
             built = strategies.build_sql(template_kind, params)
             if not built:
-                return (f"模板「{template_kind}」+ 给定参数未能生成 SQL，请检查参数。"
+                return (f"结构算子「{template_kind}」+ 给定参数未能生成 SQL，请检查参数。"
                         "可参考 strategies 模块的各算子参数约定。")
             s.sql = built
             s.status = "executable"
@@ -390,7 +390,8 @@ def build_tools(scenario_id: str) -> list[StructuredTool]:
         names = "、".join(s.name for s in materialized)
         return (f"✅ 已生成 {len(materialized)} 个技能：{names}。"
                 "\n\n🛑 STOP：本步骤完成。技能包已落盘，蒸馏工作到此结束。"
-                "请提示用户切换到**验证通道**执行产出，**不要**在本通道尝试执行。")
+                "请提示用户到**技能页**查看发布配置，或切换到**Agent 平台**执行产出，"
+                "**不要**在本通道尝试执行。")
 
     def list_skills() -> str:
         """列出当前业务场景已落盘的技能库（含每个流程节点对应的子技能）。"""
@@ -449,11 +450,10 @@ def build_tools(scenario_id: str) -> list[StructuredTool]:
             by = info.get("matched_by", "")
             conf = info.get("trace_confidence", "?")
             n = len(rows)
-            lines.append(
-                f"\n【{tbl}】通过「{by}」追踪 {n} 行（置信度:{conf}）"
-                if by != "random"
-                else f"\n【{tbl}】随机采样 {n} 行（⚠️ 未找到关联路径）"
-            )
+            if by and by != "random" and rows:
+                lines.append(f"\n【{tbl}】通过「{by}」追踪 {n} 行（置信度:{conf}）")
+            else:
+                lines.append(f"\n【{tbl}】未追踪到稳定因果行（不作为推导样本）")
             if rows:
                 import json as _json
                 lines.append(_json.dumps(rows[:2], ensure_ascii=False)[:500])

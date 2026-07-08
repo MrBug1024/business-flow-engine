@@ -167,16 +167,6 @@
         <h4>何时不要使用</h4>
         <ul class="neg"><li v-for="(w, i) in card.not_for" :key="i">{{ w }}</li></ul>
       </section>
-
-      <section>
-        <h4>测试数据</h4>
-        <div class="hint">当前：{{ files.length ? files.join('、') : '无，沙盒会回退使用蒸馏阶段原始数据' }}</div>
-        <input ref="fi" type="file" multiple style="display: none" @change="onUpload" />
-        <div class="upload-row">
-          <el-button size="small" :icon="Upload" @click="fi?.click()">上传测试数据</el-button>
-          <span class="hint inline">文件名不含后缀应与场景表名一致。</span>
-        </div>
-      </section>
     </template>
   </el-dialog>
 </template>
@@ -184,18 +174,14 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { CopyDocument, Download, Upload } from '@element-plus/icons-vue'
+import { CopyDocument, Download } from '@element-plus/icons-vue'
 import { http } from '@/api/http'
-import { useSandboxStore } from '@/stores/sandbox'
 
 const props = defineProps<{ modelValue: boolean; scenarioId: string | null }>()
 const emit = defineEmits<{ (e: 'update:modelValue', v: boolean): void }>()
-const sandbox = useSandboxStore()
 
 const loading = ref(false)
 const card = ref<any>(null)
-const files = ref<string[]>([])
-const fi = ref<HTMLInputElement>()
 
 const variant = ref<'remote' | 'native'>('remote')
 const variantOptions = [
@@ -232,7 +218,7 @@ watch(
     if (!props.modelValue || !props.scenarioId) return
     loading.value = true
     try {
-      const cfg = await sandbox.config(props.scenarioId)
+      const { data: cfg } = await http.get(`/scenarios/${props.scenarioId}/release/config`)
       card.value = cfg.card
       cfgRemote.value = cfg.config_example || {}
       cfgNative.value = cfg.config_example_native || {}
@@ -246,18 +232,11 @@ watch(
       publishRepository.value = dm.repository || dm.server_name || cfg.skill_install?.skill_name || ''
       publishTag.value = dm.tag || '1.0.0'
       publishResult.value = null
-      await loadFiles()
     } finally {
       loading.value = false
     }
   },
 )
-
-async function loadFiles() {
-  if (!props.scenarioId) return
-  const { data } = await http.get(`/playground/scenarios/${props.scenarioId}/uploads`)
-  files.value = data.files || []
-}
 
 function copy() {
   navigator.clipboard.writeText(snippet.value)
@@ -279,16 +258,6 @@ async function downloadUrl(url: string, filename: string) {
   a.download = filename
   a.click()
   URL.revokeObjectURL(blobUrl)
-}
-
-async function onUpload(e: Event) {
-  const fl = (e.target as HTMLInputElement).files
-  if (!fl || !fl.length || !props.scenarioId) return
-  const form = new FormData()
-  Array.from(fl).forEach((f) => form.append('files', f))
-  await http.post(`/playground/scenarios/${props.scenarioId}/uploads`, form)
-  ElMessage.success('测试数据已上传')
-  await loadFiles()
 }
 
 async function publishDocker() {
@@ -425,7 +394,6 @@ ul.neg li::marker { color: var(--danger); }
 .copy { position: absolute; top: 8px; right: 8px; }
 .hint { font-size: var(--text-xs); color: var(--text-3); margin-top: 8px; line-height: 1.6; }
 .hint.inline { margin-top: 0; }
-.upload-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
 code { font-family: var(--font-mono); color: var(--info); background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
 @media (max-width: 760px) {
   .publish-grid { grid-template-columns: 1fr; }

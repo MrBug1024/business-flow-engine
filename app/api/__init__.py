@@ -1,8 +1,9 @@
-"""HTTP 接口层（v1.0.5：蒸馏通道 + 验证通道分离）。
+"""HTTP 接口层：蒸馏工作台 + Agent 平台。
 
 接口划分：
 * /scenarios/{id}/chat        — 蒸馏通道（推关联/推流程/生成技能）
-* /scenarios/{id}/verify/chat — 验证通道（Skill 包执行，与平台隔离）
+* /playground/*               — Agent 平台（普通主 Agent + Skill/MCP 配置）
+* /scenarios/{id}/verify/*    — 兼容旧验证接口
 * 其余 REST 接口：场景管理、文件上传、图谱查询等
 """
 

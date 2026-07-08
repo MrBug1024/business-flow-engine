@@ -6,9 +6,9 @@
 
     <div class="login-card">
       <div class="brand">
-        <BrandMark :size="52" />
-        <div class="brand-title">业务流逆向工程引擎</div>
-        <div class="brand-sub mono">Business Flow Reverse-Engineering Engine</div>
+        <img src="/logo.png" alt="Brand Logo" width="52" height="52" />
+        <div class="brand-title">零号.奇点工坊</div>
+        <div class="brand-sub mono">Zero Singularity Workshop</div>
       </div>
 
       <el-segmented v-model="mode" :options="modeOptions" block class="mode-seg" />

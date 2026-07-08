@@ -1,4 +1,4 @@
-"""验证对话服务（v1.1.0）。
+"""兼容旧验证对话服务（v1.1.0）。
 
 与蒸馏对话服务（chat_service.py）完全分离：
 - 只使用 verification_agent（无平台工具访问权限）
@@ -99,14 +99,14 @@ def _build_lc_history(scenario_id: str) -> list:
 
 
 async def stream_verify(scenario: Scenario, user_message: str) -> AsyncIterator[str]:
-    """验证通道流式对话入口。产出 SSE 文本帧。"""
+    """旧验证接口流式对话入口。产出 SSE 文本帧。"""
     store.append_verify_message(
         scenario.id,
         ChatMessage(id=_msg_id(), role=ChatRole.USER, content=user_message),
     )
 
     if get_llm() is None:
-        msg = "❌ LLM 未配置，无法使用验证通道。请先配置 LLM。"
+        msg = "❌ LLM 未配置，无法使用旧验证接口。请先配置 LLM。"
         _persist_assistant(scenario.id, msg)
         yield sse("content", delta=msg)
         yield sse_done()
@@ -115,7 +115,7 @@ async def stream_verify(scenario: Scenario, user_message: str) -> AsyncIterator[
     if not scenario.skills:
         msg = ("❌ 当前场景尚未生成技能包。\n\n请先在**蒸馏通道**完成以下步骤：\n"
                "1. 数据链路追踪\n2. 推导关联关系\n3. 推导业务流程\n4. 生成技能\n\n"
-               "完成后再切换到验证通道。")
+               "完成后到**技能**页查看发布配置，或切换到**Agent 平台**执行/验证。")
         _persist_assistant(scenario.id, msg)
         yield sse("content", delta=msg)
         yield sse_done()

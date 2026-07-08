@@ -1,7 +1,7 @@
 """蒸馏对话服务（v1.0.5）。
 
 职责：蒸馏阶段的流式对话（链路追踪/推导关联/流程/生成技能）。
-与验证通道（verify_service.py）完全分离，不提供执行/验证功能。
+与 Agent 平台/旧验证服务完全分离，不提供执行/验证功能。
 """
 
 from __future__ import annotations
@@ -305,7 +305,7 @@ async def _stream_heuristic(scenario: Scenario, user_message: str) -> AsyncItera
             if by and by != "random":
                 traced_lines.append(f"- {tbl}：通过「{by}」追踪到 {len(rows)} 行，置信度 {info.get('trace_confidence', '?')}")
             else:
-                traced_lines.append(f"- {tbl}：未追踪到稳定链路，当前为随机样本")
+                traced_lines.append(f"- {tbl}：未追踪到稳定因果行，不作为后续推导样本")
         yield emit_content(
             f"已完成数据链路追踪。\n\n{result_summary}\n\n"
             + ("\n".join(traced_lines) or "未形成可展示链路。")
@@ -403,7 +403,7 @@ async def _stream_heuristic(scenario: Scenario, user_message: str) -> AsyncItera
             names = "\n".join(f"- {s.name}（{s.operation}）" for s in materialized)
             yield emit_content(
                 f"已生成 {len(materialized)} 个技能：\n\n{names}\n\n"
-                "蒸馏通道到此结束。执行和验证请切换到「验证通道」。"
+                "蒸馏通道到此结束。发布配置可在「技能」页查看；执行/验证可到「Agent 平台」。"
             )
 
     elif intent == "execute":
@@ -412,9 +412,9 @@ async def _stream_heuristic(scenario: Scenario, user_message: str) -> AsyncItera
         else:
             yield emit_content(
                 "✅ 技能包已生成，蒸馏完成。\n\n"
-                "执行和验证请切换到**验证通道**（/verify），该通道与本平台代码完全隔离，\n"
-                "只能调用 Skill 包中的工具，确保验证结果真实反映 Skill 包的独立能力。\n\n"
-                f"直接访问：[验证通道 → {scenario.name}](/verify)"
+                "发布配置请在当前场景的**技能**页查看；执行/验证请切换到**Agent 平台**（/sandbox），\n"
+                "它默认是普通 Agent，只有安装并勾选 Skill/MCP 后才会调用业务能力。\n\n"
+                f"直接访问：[Agent 平台 → {scenario.name}](/sandbox)"
             )
 
     elif intent == "metadata":
@@ -433,7 +433,7 @@ async def _stream_heuristic(scenario: Scenario, user_message: str) -> AsyncItera
             "③ 对我说「推导关联关系」（含字段语义）\n"
             "④ 对我说「推导业务流程」（节点带能力描述 + 知识结构映射）\n"
             "⑤ 对我说「生成技能库」（按节点固化）\n"
-            "⑥ 切换到「验证通道」执行和校验"
+            "⑥ 到「技能」页查看发布配置，或切换到「Agent 平台」执行和校验"
         )
 
     _persist_assistant(scenario, content_buf)

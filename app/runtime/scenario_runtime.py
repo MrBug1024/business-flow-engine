@@ -1,7 +1,7 @@
 """场景能力包运行时（平台无关执行核心）。
 
 本模块是标准 Skill 发布包、兼容 MCP Server 与 `playground_agent.py`
-（通用第三方沙盒）的**公共执行源**。它只接收「能力包目录」（即某场景的
+（通用 Agent 平台）的**公共执行源**。它只接收「能力包目录」（即某场景的
 `skills/` 目录）作为输入，**不依赖平台的 `store` / 数据库 / 任何全局状态**——
 这就在代码层面证明了「蒸馏出的业务能力可以脱离平台独立执行」。
 
@@ -17,7 +17,7 @@
         scripts/skill_executor.py
       tools/knowledge/{search,list}_knowledge.py
 
-附件上传、文件预览和结果文件下载由宿主 Agent 平台处理。本运行时只在本地脚本/验证沙盒
+附件上传、文件预览和结果文件下载由宿主 Agent 平台处理。本运行时只在本地脚本/Agent 平台
 场景下支持 `data_dir`，用于读取宿主已经整理好的业务数据目录。
 """
 
@@ -112,7 +112,7 @@ class ScenarioPackage:
     def default_data_dir(self) -> Optional[Path]:
         """未显式给 data_dir 时的回退。
 
-        验证沙盒从 release 包加载时，测试数据仍在场景目录；本地脚本场景可通过
+        Agent 平台从 release 包加载时，验证数据仍在场景目录；本地脚本场景可通过
         BFE_DATA_DIR 或显式 data_dir 指定。这里保留 /data 作为通用容器/CI 兼容路径，
         但业务 Skill 不要求第三方平台提供 MCP/Docker 文件写入能力。
         """

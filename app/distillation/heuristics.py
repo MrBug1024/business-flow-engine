@@ -262,6 +262,8 @@ def _trace_rows_for_table(table: TableMeta, trace_report: dict[str, Any] | None)
     if trace_report.get("result_table") == table.table_name:
         return list(trace_report.get("result_sample") or [])
     info = (trace_report.get("trace_map") or {}).get(table.table_name) or {}
+    if info.get("matched_by") == "random":
+        return []
     return list(info.get("matched_rows") or [])
 
 

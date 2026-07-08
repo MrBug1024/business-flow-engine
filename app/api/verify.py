@@ -1,5 +1,6 @@
-"""验证通道接口（v1.0.5）。
+"""兼容旧验证接口。
 
+新前端使用 /playground/* 的 Agent 平台；本模块保留给旧版界面和历史集成。
 与蒸馏通道 /api/scenarios/{id}/chat 完全分离：
 - 使用独立的验证 Agent（只有 Skill 包工具）
 - 独立的对话历史（verify_chat.jsonl）
@@ -32,7 +33,7 @@ _SSE_HEADERS = {
 
 @router.post("/scenarios/{scenario_id}/verify/chat")
 async def verify_chat(scenario_id: str, req: ChatRequest) -> StreamingResponse:
-    """验证通道流式对话（SSE）。
+    """旧验证接口流式对话（SSE）。
 
     与蒸馏通道隔离：只能调用 Skill 包中的工具，不能调用平台内部工具。
     技能包必须已在蒸馏通道生成，否则返回引导信息。
@@ -47,38 +48,39 @@ async def verify_chat(scenario_id: str, req: ChatRequest) -> StreamingResponse:
 
 @router.get("/scenarios/{scenario_id}/verify/messages", response_model=list[ChatMessage])
 def get_verify_messages(scenario_id: str) -> list[ChatMessage]:
-    """获取验证通道的历史对话记录（与蒸馏通道隔离）。"""
+    """获取旧验证接口的历史对话记录（与蒸馏通道隔离）。"""
     get_scenario_or_404(scenario_id)
     return store.get_verify_messages(scenario_id)
 
 
 @router.post("/scenarios/{scenario_id}/verify/uploads")
 async def upload_verify_data(scenario_id: str, files: list[UploadFile]) -> dict:
-    """上传验证通道专用的「新业务数据」——与蒸馏通道的 uploads/ 物理隔离。
+    """旧接口：上传验证专用的「新业务数据」——与蒸馏通道的 uploads/ 物理隔离。
 
     文件名（不含后缀）须与技能包 domain_knowledge.json 里的表名一致，
-    验证 Agent 才能识别应该把哪个文件当哪张表用。上传后，验证通道的
+    验证 Agent 才能识别应该把哪个文件当哪张表用。上传后，旧验证接口的
     execute_skill / query_data 等工具会优先使用这批新数据，而不是蒸馏时的旧数据。
     """
     get_scenario_or_404(scenario_id)
     dest_dir = Path(store.verify_uploads_dir(scenario_id))
     saved = []
     for upload in files:
-        suffix = "." + upload.filename.rsplit(".", 1)[-1].lower() if "." in upload.filename else ""
+        filename = Path(upload.filename).name
+        suffix = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
         if suffix not in _ALLOWED_SUFFIX:
             raise HTTPException(
                 status_code=400,
-                detail=f"不支持的文件类型：{upload.filename}（支持 CSV/TSV/Excel/JSON）",
+                detail=f"不支持的文件类型：{filename}（支持 CSV/TSV/Excel/JSON）",
             )
-        dest = dest_dir / upload.filename
+        dest = dest_dir / filename
         dest.write_bytes(await upload.read())
-        saved.append(upload.filename)
-    return {"message": f"已上传 {len(saved)} 个验证测试文件", "files": saved}
+        saved.append(filename)
+    return {"message": f"已上传 {len(saved)} 个验证文件", "files": saved}
 
 
 @router.get("/scenarios/{scenario_id}/verify/uploads")
 def list_verify_uploads(scenario_id: str) -> dict:
-    """列出当前验证通道暂存的「新业务数据」文件（为空则验证通道会退回使用蒸馏数据）。"""
+    """列出旧验证接口暂存的「新业务数据」文件（为空则退回使用蒸馏数据）。"""
     get_scenario_or_404(scenario_id)
     dest_dir = Path(store.verify_uploads_dir(scenario_id))
     files = sorted(
@@ -90,7 +92,7 @@ def list_verify_uploads(scenario_id: str) -> dict:
 
 @router.delete("/scenarios/{scenario_id}/verify/uploads")
 def clear_verify_uploads(scenario_id: str) -> dict:
-    """清空验证通道的暂存测试数据，之后验证通道会退回使用蒸馏阶段的原始数据。"""
+    """清空旧验证接口的暂存验证数据，之后会退回使用蒸馏阶段的原始数据。"""
     get_scenario_or_404(scenario_id)
     dest_dir = Path(store.verify_uploads_dir(scenario_id))
     removed = 0
@@ -99,7 +101,7 @@ def clear_verify_uploads(scenario_id: str) -> dict:
             if f.is_file():
                 f.unlink()
                 removed += 1
-    return {"message": f"已清空 {removed} 个验证测试文件，验证通道将退回使用蒸馏数据"}
+    return {"message": f"已清空 {removed} 个验证文件，旧验证接口将退回使用蒸馏数据"}
 
 
 @router.get("/scenarios/{scenario_id}/verify/status")

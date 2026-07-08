@@ -32,7 +32,7 @@ from app.domain.models import Scenario, TableMeta, TableRole
 from app.data.table_io import _sanitize_rows
 
 _MAX_TRACE_ROWS = 50
-_SAMPLE_SIZE = 5  # 增加到 5 行，覆盖更多结果模式
+_SAMPLE_SIZE = 1  # 默认严格以结果表第一条非空记录为锚点；可由调用方显式放宽
 
 # 列名语义判断
 _ID_HINTS = ("id", "编号", "编码", "序号", "流水", "单号", "no", "key", "code", "num", "number")
@@ -53,6 +53,16 @@ def _is_category_col(name: str) -> bool:
 def _is_time_col(name: str) -> bool:
     n = name.lower().replace("_", "").replace(" ", "")
     return any(h in n for h in _TIME_HINTS)
+
+
+def _no_trace_result(warning: str) -> dict[str, Any]:
+    """未追踪到因果行时的标准返回；不再用随机样本污染后续推导。"""
+    return {
+        "matched_rows": [],
+        "matched_by": "",
+        "trace_confidence": "low",
+        "warning": warning,
+    }
 
 
 def _col_name_overlap(col_a: str, col_b: str) -> bool:
@@ -321,10 +331,10 @@ def _duckdb_full_query(
                         "trace_confidence": "medium",
                     }
 
-        return None  # 未匹配，调用方降级随机采样
+        return None  # 未匹配，调用方记录为未追踪
 
     except Exception:  # noqa: BLE001
-        return None  # DuckDB 不可用（GBK 编码/权限/格式异常），调用方回退 scan_frame
+        return None  # DuckDB 不可用（GBK 编码/权限/格式异常），调用方回退整表/未追踪
 
 
 # ===========================================================================
@@ -534,7 +544,7 @@ def _trace_business_table(
        这里必须是整表而不是 2000 行采样：真实业务表几十万行很常见，命中的具体行
        几乎不可能恰好落在文件最前面，用采样搜会系统性地把"没搜到"误判成"不存在"，
        进而让 AI 收到一堆互不相干的样本去瞎猜关联/流程。
-    3. 仍无匹配 → 随机采样前 max_rows 行 + 警告
+    3. 仍无匹配 → 标记未追踪，不提供随机样本给后续 AI 推导
     """
     from pathlib import Path  # noqa: PLC0415
     from app.data import table_io  # noqa: PLC0415
@@ -556,29 +566,18 @@ def _trace_business_table(
         )
         if result is not None:
             return result
-        # DuckDB 已经对全文件搜过一遍没找到 → 这里只需要随机兜底样本，
-        # 用采样帧就够了，没必要把同一个大 CSV 再整表读一遍。
-        try:
-            df = table_io._load_scan_frame(path)
-        except Exception:  # noqa: BLE001
-            return {"matched_rows": [], "matched_by": "", "trace_confidence": "low"}
-        sample = df.head(max_rows)
-        return {
-            "matched_rows": _sanitize_rows(sample.to_dict("records")),
-            "matched_by": "random",
-            "trace_confidence": "low",
-            "warning": "⚠️ 未找到关联路径，随机采样",
-        }
+        # DuckDB 已经对全文件搜过一遍没找到；不能再塞随机行给 AI。
+        return _no_trace_result("⚠️ 未找到与结果锚点关联的业务行；该表不作为推导样本。")
 
     # --- 路径 B：整表加载（Excel/JSON/MD 从未被 DuckDB 搜过，必须整表才能真正判断
     #     有没有关联；CSV 已在路径 A 全文件搜过，不会走到这里）---
     try:
         df = table_io.load_full_frame_cached(str(path))
     except Exception:  # noqa: BLE001
-        return {"matched_rows": [], "matched_by": "", "trace_confidence": "low"}
+        return _no_trace_result("⚠️ 表数据读取失败，无法追踪。")
 
     if df.empty:
-        return {"matched_rows": [], "matched_by": "", "trace_confidence": "low"}
+        return _no_trace_result("⚠️ 表数据为空，无法追踪。")
 
     cols = [str(c) for c in df.columns]
 
@@ -667,14 +666,8 @@ def _trace_business_table(
             except Exception:  # noqa: BLE001
                 continue
 
-    # 全失败：随机采样 + 警告
-    sample = df.head(max_rows)
-    return {
-        "matched_rows": _sanitize_rows(sample.to_dict("records")),
-        "matched_by": "random",
-        "trace_confidence": "low",
-        "warning": "⚠️ 未找到关联路径，随机采样",
-    }
+    # 全失败：未追踪。不要用随机样本冒充链路样本。
+    return _no_trace_result("⚠️ 未找到与结果锚点关联的业务行；该表不作为推导样本。")
 
 
 # ===========================================================================
@@ -711,26 +704,16 @@ def _trace_knowledge_table(
         )
         if result is not None:
             return result
-        try:
-            df = table_io._load_scan_frame(path)
-        except Exception:  # noqa: BLE001
-            return {"matched_rows": [], "matched_by": "", "trace_confidence": "low"}
-        sample = df.head(max_rows)
-        return {
-            "matched_rows": _sanitize_rows(sample.to_dict("records")),
-            "matched_by": "random",
-            "trace_confidence": "low",
-            "warning": "⚠️ 未找到关联知识点，随机采样",
-        }
+        return _no_trace_result("⚠️ 未找到与结果锚点关联的知识行；该表不作为推导样本。")
 
     # --- 路径 B：整表加载（Excel/JSON/MD）---
     try:
         df = table_io.load_full_frame_cached(str(path))
     except Exception:  # noqa: BLE001
-        return {"matched_rows": [], "matched_by": "", "trace_confidence": "low"}
+        return _no_trace_result("⚠️ 表数据读取失败，无法追踪。")
 
     if df.empty:
-        return {"matched_rows": [], "matched_by": "", "trace_confidence": "low"}
+        return _no_trace_result("⚠️ 表数据为空，无法追踪。")
 
     cols = [str(c) for c in df.columns]
 
@@ -790,14 +773,8 @@ def _trace_knowledge_table(
             except Exception:  # noqa: BLE001
                 continue
 
-    # 全失败：随机采样
-    sample = df.head(max_rows)
-    return {
-        "matched_rows": _sanitize_rows(sample.to_dict("records")),
-        "matched_by": "random",
-        "trace_confidence": "low",
-        "warning": "⚠️ 未找到关联知识点，随机采样",
-    }
+    # 全失败：未追踪。不要用随机样本冒充链路样本。
+    return _no_trace_result("⚠️ 未找到与结果锚点关联的知识行；该表不作为推导样本。")
 
 
 # ===========================================================================
@@ -808,10 +785,14 @@ def _build_trace_report(
     trace_map: dict[str, dict[str, Any]],
     unmatched_tables: list[str],
     result_table_name: str = "",
+    anchor_result_row_index: int = 1,
+    candidate_result_rows: int = 1,
 ) -> dict[str, Any]:
     """构建发给 AI 的结构化关联样本报告。"""
     total_rows = len(result_sample) + sum(
-        len(v.get("matched_rows", [])) for v in trace_map.values()
+        len(v.get("matched_rows", []))
+        for v in trace_map.values()
+        if v.get("matched_by") != "random"
     )
 
     summary_parts = []
@@ -819,18 +800,18 @@ def _build_trace_report(
         n = len(info.get("matched_rows", []))
         by = info.get("matched_by", "")
         conf = info.get("trace_confidence", "low")
-        if by != "random":
+        if by and by != "random":
             summary_parts.append(f"通过「{by}」追踪到「{tbl}」{n}行(置信度:{conf})")
-        else:
-            summary_parts.append(f"「{tbl}」随机采样{n}行")
 
     return {
         "result_sample": result_sample,
         "result_table": result_table_name,
+        "anchor_result_row_index": anchor_result_row_index,
+        "candidate_result_rows": candidate_result_rows,
         "trace_map": trace_map,
         "unmatched_tables": unmatched_tables,
         "total_rows": total_rows,
-        "trace_summary": "；".join(summary_parts) if summary_parts else "无追踪路径",
+        "trace_summary": "；".join(summary_parts) if summary_parts else "未追踪到稳定因果链路",
     }
 
 
@@ -885,7 +866,7 @@ def trace_sampling(
     Args:
         scenario:           业务场景（含所有表元数据）
         result_table_name:  结果表名（追踪入口），None 时自动寻找
-        sample_size:        从结果表取的样本行数（默认 3）
+        sample_size:        从结果表取的样本行数（默认 1，即第一条非空结果记录）
         max_trace_rows:     每个业务表最多追踪行数（默认 50）
 
     Returns:
@@ -904,7 +885,8 @@ def trace_sampling(
     if result_table is None:
         return _fallback_random_sampling(scenario, reason="无结果表")
 
-    # 2. 取结果表样本行（多条候选，逐条试锚点——见下方步骤 3）
+    # 2. 取结果表样本行。默认只取第一条非空结果记录；调用方显式传入更大的
+    # sample_size 时，才会逐条试锚点并选择链路最完整的一条。
     result_rows = _sample_result_rows(result_table.file_path, sample_size)
     if not result_rows:
         return _fallback_random_sampling(scenario, reason="结果表为空")
@@ -979,11 +961,12 @@ def trace_sampling(
     max_possible = sum(_table_max_weight(t.table_name) for t in non_result_tables)
 
     best_row = result_rows[0]
+    best_row_index = 1
     best_trace_map: dict[str, dict[str, Any]] = {}
     best_unmatched: list[str] = list(non_result_tables and [t.table_name for t in non_result_tables])
     best_score = -1
 
-    for row in result_rows:
+    for row_index, row in enumerate(result_rows, start=1):
         trace_keys = _extract_trace_keys([row])  # 只含这一行的键值，不与其它行混
         trace_map: dict[str, dict[str, Any]] = {}
         unmatched_tables: list[str] = []
@@ -1044,18 +1027,31 @@ def trace_sampling(
                 trace_map[table.table_name] = result
                 unmatched_tables.append(table.table_name)
             else:
+                trace_map[table.table_name] = result
                 unmatched_tables.append(table.table_name)
 
         score = 0
         for info in trace_map.values():
-            if info.get("matched_by") == "random":
+            if (
+                not info.get("matched_rows")
+                or not info.get("matched_by")
+                or info.get("matched_by") == "random"
+            ):
                 continue
             score += _SOURCE_WEIGHT.get(info.get("matched_source", ""), 1)
         if score > best_score:
             best_score, best_row = score, row
+            best_row_index = row_index
             best_trace_map, best_unmatched = trace_map, unmatched_tables
         if score >= max_possible:
             break  # 这一行已经以最高证据等级追全了每张表，没必要再试后面的候选行
 
     # 4. 组装报告（result_sample 只含被选中的这一条锚点行，与 trace_map 是同一条因果链）
-    return _build_trace_report([best_row], best_trace_map, best_unmatched, result_table.table_name)
+    return _build_trace_report(
+        [best_row],
+        best_trace_map,
+        best_unmatched,
+        result_table.table_name,
+        anchor_result_row_index=best_row_index,
+        candidate_result_rows=len(result_rows),
+    )

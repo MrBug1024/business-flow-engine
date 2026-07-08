@@ -44,12 +44,20 @@ def _tool_name(tool: Any) -> str | None:
 class ExcludeBuiltinToolsMiddleware(AgentMiddleware):
     """请求发给模型前，剥离 deepagents 自动挂载的内置工具。"""
 
+    def __init__(self, allow: set[str] | None = None) -> None:
+        super().__init__()
+        self.allow = allow or set()
+
+    def _blocked(self, tool: Any) -> bool:
+        name = _tool_name(tool)
+        return bool(name and name in DEEPAGENTS_BUILTIN_TOOLS and name not in self.allow)
+
     def wrap_model_call(
         self,
         request: ModelRequest,
         handler: Callable[[ModelRequest], ModelResponse],
     ) -> ModelResponse:
-        filtered = [t for t in request.tools if _tool_name(t) not in DEEPAGENTS_BUILTIN_TOOLS]
+        filtered = [t for t in request.tools if not self._blocked(t)]
         return handler(request.override(tools=filtered))
 
     async def awrap_model_call(
@@ -57,5 +65,5 @@ class ExcludeBuiltinToolsMiddleware(AgentMiddleware):
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelResponse:
-        filtered = [t for t in request.tools if _tool_name(t) not in DEEPAGENTS_BUILTIN_TOOLS]
+        filtered = [t for t in request.tools if not self._blocked(t)]
         return await handler(request.override(tools=filtered))

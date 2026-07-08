@@ -4,10 +4,9 @@ v1.0.3 通用化重构：
 * 工作流从 7 步压缩为 **6 步**：上传(含标角色) → 数据链路追踪 → 推关联(含字段语义)
   → 推流程(含节点能力) → 生成技能 → 执行（含校验）。无审批 Gate。
 * 字段语义成为画像核心：`ColumnMeta` 新增 `semantic` / `semantic_role`，作为关联推导与
-  模板算子参数选择的依据。
-* 规则范式重构：不再逐条解析规则为关键词字典；改为蒸馏 `RuleSchemaMapping`——只学
-  「规则表的列角色 + 规则字段→业务字段映射 + 分派值→模板算子」，规则在运行时按行迭代，
-  几万条也撑得住。
+  结构性执行策略参数选择的依据。
+* 知识表范式重构：不再逐条解析规则为关键词字典；只学习
+  「知识表的列角色 + 知识字段→业务字段映射 + 分派值说明」，真实判断在运行时读原文后推理。
 * 流程节点丰富化：`FlowStep` 新增 `purpose / capability / data_in / data_out / template_kind`，
   让节点说清「该做什么、能做什么、数据怎么变化」，不再是文件名连线。
 * 框架场景无关：表名 / 字段 / 规则 / 输出格式只作为「数据」存在于知识包，绝不写进逻辑。
@@ -238,7 +237,7 @@ class FlowStep(BaseModel):
       * capability   —— 能做什么 / 输出什么样的数据（给人看的）
       * data_in      —— 输入数据的"画像式"说明（哪些表/字段）
       * data_out     —— 输出数据的"画像式"说明
-      * template_kind—— 走哪种执行方式（结构性算子 aggregate/join/... 或 knowledge_driven_join）
+      * template_kind——兼容字段，保存结构性执行策略名（aggregate/join/sql/...）
       * sql / params —— 可执行的转换逻辑（DuckDB）
     节点串联成管线，上一节点的 `output` 作为下一节点的输入。
     """
@@ -252,7 +251,7 @@ class FlowStep(BaseModel):
     capability: str = ""                               # 能做什么 / 输出什么
     data_in: list[str] = Field(default_factory=list)   # 输入数据画像（可读串）
     data_out: list[str] = Field(default_factory=list)  # 输出数据画像（可读串）
-    template_kind: str = ""                            # 使用的模板算子名
+    template_kind: str = ""                            # 兼容字段：结构性执行策略名
 
     # ---- 执行相关 ----
     input_tables: list[str] = Field(default_factory=list)
@@ -446,6 +445,7 @@ class CreateScenarioRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1)
+    conversation_id: str = ""
 
 
 class TableRoleRequest(BaseModel):

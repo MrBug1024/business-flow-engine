@@ -76,10 +76,10 @@ def _is_nl_column(col_name: str, sample_values: list) -> bool:
 
 
 def _detect_pattern(text: str) -> tuple[str, list[str]]:
-    """对单条规则文本识别最可能的处理模式。
+    """对单条知识文本识别最明显的文本信号。
 
     Returns:
-        (pattern_name, matched_signals)
+        (signal_name, matched_signals)
     """
     if not text:
         return "keyword", []
@@ -127,7 +127,7 @@ def _load_knowledge_table(scenario: Scenario) -> tuple[str, list[str], list[dict
 
 
 def analyze_nl_rules(scenario: Scenario) -> dict[str, Any]:
-    """分析知识表的 NL 规则，返回规则模式统计和 dispatch_map 候选。"""
+    """分析知识表的 NL 文本信号，返回只供理解的统计摘要。"""
     table_name, nl_cols, rows = _load_knowledge_table(scenario)
 
     if not rows:
@@ -202,7 +202,7 @@ def format_nl_analysis(analysis: dict[str, Any]) -> str:
         f"- NL 描述列：{analysis.get('nl_columns', [])}",
         f"- 分派键列：{analysis.get('dispatch_column', '（未识别）')}",
         "",
-        "规则模式分布（用于选择 template_kind）：",
+        "文本信号分布（仅供理解知识文本，不驱动执行）：",
     ]
     breakdown = analysis.get("pattern_breakdown", {})
     for pat, items in sorted(breakdown.items(), key=lambda x: -len(x[1])):
@@ -211,12 +211,12 @@ def format_nl_analysis(analysis: dict[str, Any]) -> str:
         lines.append(f"  - {pat}（{len(items)} 条）：示例={example}，信号词={signals}")
 
     lines.append("")
-    lines.append("建议 dispatch_map（分派键值 → 处理模式）：")
+    lines.append("候选分派说明（分派键值 → 文本信号）：")
     dkv = analysis.get("dispatch_key_values", {})
     if dkv:
         for k, v in list(dkv.items())[:20]:
             lines.append(f"  \"{k}\" → \"{v}\"")
     else:
-        lines.append("  （未识别分派键，建议设 template_kind=keyword 作为通用兜底）")
+        lines.append("  （未识别分派键，仅保留文本信号供人工/LLM理解）")
 
     return "\n".join(lines)

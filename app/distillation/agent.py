@@ -1,4 +1,4 @@
-"""业务流蒸馏 Agent（v1.0.5：蒸馏专属，与验证执行彻底分离）。
+"""业务流蒸馏 Agent（蒸馏专属，与执行/验证彻底分离）。
 
 职责：仅负责逆向推导（关联→流程→技能生成），不参与执行/验证。
 提示词从 prompts/distillation/system.md 加载。
@@ -45,7 +45,7 @@ def build_agent(scenario: Scenario):
     )
 
     skills_line = (
-        f"已落盘技能：{len(scenario.skills)} 个（含主技能与节点子技能）✅ 蒸馏完成，验证请切换验证通道"
+        f"已落盘技能：{len(scenario.skills)} 个（含主技能与节点子技能）✅ 蒸馏完成，发布配置在技能页，执行/验证请切换 Agent 平台"
         if scenario.skills else "已落盘技能：无"
     )
 
@@ -56,7 +56,7 @@ def build_agent(scenario: Scenario):
         f"数据链路追踪：{trace_line}\n关联+字段语义：{rel_line}\n业务流程：{flow_line}\n"
         f"{skills_line}\n当前状态：{scenario.status.value}\n\n"
         "⚠️ 本通道仅用于蒸馏（推导+生成技能），不提供执行/验证功能。"
-        "执行验证请切换到「验证通道」。"
+        "发布配置请到技能页查看；执行/验证请切换到「Agent 平台」。"
     )
     return create_deep_agent(
         model=llm,

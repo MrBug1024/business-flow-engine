@@ -8,7 +8,7 @@
   ③ 推流程后 —— detect_literal_params：节点参数是否把某条具体记录的字面值硬编码了？
 
 知识驱动产出的执行结果不再由平台侧统一比对/诊断——真实业务规则的判断逻辑千差万别，
-是否命中、命中得对不对，交给验证通道里读到规则原文的 LLM 现场判断（见
+是否命中、命中得对不对，交给 Agent 平台里读到规则原文的 LLM 现场判断（见
 verification_agent.py），不是平台预置一套通用比对公式能覆盖的。
 """
 
@@ -67,9 +67,9 @@ def _fail(message: str, **details: Any) -> ValidationResult:
 def validate_trace_connectivity(trace_report: dict[str, Any]) -> ValidationResult:
     """检查追踪采样的关联性是否足够支持 AI 推导。
 
-    PASS:    有至少一个 key 值在多个表中匹配到行（有因果关联）
-    WARNING: 有表完全追不上（部分关联）
-    FAIL:    所有表都追不上，或总行数 < 5（关联性严重不足）
+    PASS:    至少有一张非结果表通过键值追踪到因果行
+    WARNING: 有部分表未追踪到因果行
+    FAIL:    所有非结果表都追踪不到因果行
 
     Args:
         trace_report: trace_sampling() 返回的报告
@@ -93,20 +93,15 @@ def validate_trace_connectivity(trace_report: dict[str, Any]) -> ValidationResul
             total_rows=total_rows,
         )
 
-    if total_rows < 5:
-        return _fail(
-            f"样本关联性严重不足（总行数 {total_rows} < 5），建议检查数据是否正确上传",
-            total_rows=total_rows,
-        )
-
-    # 统计通过关键 key 匹配（非随机）的表数
+    # 统计通过关键 key 匹配（非随机）的表数。追踪样本允许很小：
+    # 一条结果锚点 + 若干真实关联行，比多张表各取前几行更可靠。
     high_conf_tables = [
         t for t, info in trace_map.items()
         if info.get("trace_confidence") in ("high", "medium")
         and info.get("matched_by") != "random"
     ]
 
-    if len(unmatched) > 0 and len(high_conf_tables) == 0:
+    if len(high_conf_tables) == 0:
         return _fail(
             f"所有业务表都无法关联追踪，以下表追不上：{unmatched}",
             unmatched_tables=unmatched,
@@ -115,7 +110,7 @@ def validate_trace_connectivity(trace_report: dict[str, Any]) -> ValidationResul
 
     if unmatched:
         return _warn(
-            f"以下表未能通过键值关联追踪，退化为随机采样：{unmatched}",
+            f"以下表未能通过键值关联追踪，未作为推导样本：{unmatched}",
             unmatched_tables=unmatched,
             high_confidence_tables=high_conf_tables,
             total_rows=total_rows,

@@ -5,7 +5,7 @@
 /data/
 
 # 系统数据（用户库等，SQLite 落盘，随项目自管理）
-/system/
+# /system/
 
 # 前端构建产物与依赖
 /frontend/node_modules/
@@ -17,7 +17,11 @@ __pycache__/
 *.egg-info/
 .venv/
 .pytest_cache/
-
+.tmp/
 # IDE
 .idea/
 .vscode/
+.cache/
+.claude/
+.agents/
+.test/

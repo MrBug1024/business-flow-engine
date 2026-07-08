@@ -21,14 +21,23 @@
         <div v-else class="row ai">
           <div class="avatar"><BrandMark :size="28" /></div>
           <div class="msg-group">
-            <div v-if="m.thinking" class="thinking"><el-icon><MagicStick /></el-icon>{{ m.thinking }}</div>
+            <div v-if="m.thinking" class="traces">
+              <details>
+                <summary>
+                  <el-icon><MagicStick /></el-icon>
+                  AI 思考过程
+                </summary>
+                <pre class="thinking-body">{{ m.thinking }}</pre>
+              </details>
+            </div>
             <div v-if="m.tools && m.tools.length" class="traces">
               <details>
                 <summary>
                   <el-icon><Operation /></el-icon>
-                  执行轨迹 · {{ m.tools.length }} 次工具调用
+                  工具 / Skill / 子 Agent 调用 · {{ m.tools.length }} 次
                 </summary>
                 <div v-for="(t, ti) in m.tools" :key="ti" class="trace-step">
+                  <span class="trace-kind">{{ traceKind(t.name) }}</span>
                   <span class="trace-name mono">{{ ti + 1 }}. {{ t.name }}({{ (t.args_summary || '').slice(0, 160) }})</span>
                   <div class="trace-res mono">→ {{ (t.result_summary || '').slice(0, 260) }}</div>
                 </div>
@@ -43,10 +52,30 @@
       <div v-if="streaming" class="row ai">
         <div class="avatar"><BrandMark :size="28" /></div>
         <div class="msg-group">
-          <div v-for="(t, ti) in liveTools" :key="'lt' + ti" class="live-tool">
-            <el-icon><Tools /></el-icon>
-            <span class="mono">{{ t.name }}</span>
-            <span v-if="t.result" class="live-ok mono">✔ {{ t.result.slice(0, 120) }}</span>
+          <div v-if="liveThinking" class="traces live-trace">
+            <details open>
+              <summary>
+                <el-icon><MagicStick /></el-icon>
+                AI 思考中
+              </summary>
+              <pre class="thinking-body">{{ liveThinking }}</pre>
+            </details>
+          </div>
+          <div v-if="liveTools.length" class="traces live-trace">
+            <details open>
+              <summary>
+                <el-icon><Tools /></el-icon>
+                工具 / Skill / 子 Agent 调用 · {{ liveTools.length }} 次
+              </summary>
+              <div v-for="(t, ti) in liveTools" :key="'lt' + ti" class="trace-step live">
+                <span class="trace-kind">{{ traceKind(t.name) }}</span>
+                <span class="trace-name mono">{{ ti + 1 }}. {{ t.name }}({{ (t.args || '').slice(0, 160) }})</span>
+                <div class="trace-res mono">
+                  <template v-if="t.result">→ {{ t.result.slice(0, 260) }}</template>
+                  <template v-else>执行中...</template>
+                </div>
+              </div>
+            </details>
           </div>
           <div v-if="statusLine" class="status-line"><span class="spinner" />{{ statusLine }}</div>
           <div v-if="liveContent" class="bubble ai" v-html="render(liveContent)" />
@@ -69,6 +98,19 @@
     </div>
 
     <div class="composer">
+      <div v-if="attachmentsUploadPath" class="attachments">
+        <input ref="fileInput" type="file" multiple class="hidden-file" @change="onAttachmentUpload" />
+        <el-button size="small" text :icon="Upload" :loading="uploadingAttachments" @click="fileInput?.click()">
+          附件
+        </el-button>
+        <span v-if="!attachments.length" class="attachment-hint">当前会话无附件</span>
+        <span v-for="f in attachments" :key="f.name" class="attachment-chip">
+          {{ f.name }}
+        </span>
+        <el-button v-if="attachments.length && attachmentsClearPath" size="small" text :icon="Close" @click="clearAttachments">
+          清空
+        </el-button>
+      </div>
       <div class="composer-box" :class="{ focused }">
         <el-input
           v-model="draft" type="textarea" :autosize="{ minRows: 1, maxRows: 6 }"
@@ -89,11 +131,11 @@
 <script setup lang="ts">
 import { ref, nextTick, watch, onMounted } from 'vue'
 import { ElMessageBox } from 'element-plus'
-import { ChatDotRound, Delete, MagicStick, Operation, Tools, Promotion, VideoPause } from '@element-plus/icons-vue'
+import { ChatDotRound, Close, Delete, MagicStick, Operation, Tools, Promotion, Upload, VideoPause } from '@element-plus/icons-vue'
 import { marked } from 'marked'
 import { http } from '@/api/http'
 import { streamSSE, type SSEEvent } from '@/api/sse'
-import type { ChatMessage, Interaction, ToolTrace } from '@/api/types'
+import type { AttachmentFile, ChatMessage, Interaction, ToolTrace } from '@/api/types'
 import QuestionPanel from './QuestionPanel.vue'
 import BrandMark from './BrandMark.vue'
 
@@ -107,6 +149,11 @@ const props = defineProps<{
   emptyTitle?: string
   emptySub?: string
   quicks?: { label: string; text: string }[]
+  requestPayload?: Record<string, any>
+  doneRefreshResource?: string
+  attachmentsPath?: string
+  attachmentsUploadPath?: string
+  attachmentsClearPath?: string
 }>()
 const emit = defineEmits<{ (e: 'refresh', resource: string): void; (e: 'status', status: string): void }>()
 
@@ -115,15 +162,25 @@ const draft = ref('')
 const streaming = ref(false)
 const focused = ref(false)
 const liveContent = ref('')
+const liveThinking = ref('')
 const statusLine = ref('')
-const liveTools = ref<{ name: string; result?: string }[]>([])
+const liveTools = ref<{ name: string; args?: string; result?: string }[]>([])
 const pendingInteraction = ref<Interaction | null>(null)
+const attachments = ref<AttachmentFile[]>([])
+const uploadingAttachments = ref(false)
+const fileInput = ref<HTMLInputElement>()
 const scroller = ref<HTMLElement>()
 let abort: (() => void) | null = null
 
 marked.setOptions({ breaks: true })
 function render(text: string) {
   try { return marked.parse(text || '') as string } catch { return text }
+}
+
+function traceKind(name: string) {
+  if (name === 'task') return '子 Agent'
+  if (name.includes('__')) return 'Skill'
+  return '工具'
 }
 
 async function loadHistory() {
@@ -140,8 +197,21 @@ async function scrollBottom() {
   if (scroller.value) scroller.value.scrollTop = scroller.value.scrollHeight
 }
 
-watch(() => props.reloadKey, loadHistory)
-onMounted(loadHistory)
+watch(
+  () => [props.reloadKey, props.historyPath, props.attachmentsPath],
+  () => { loadHistory(); loadAttachments() },
+)
+onMounted(() => { loadHistory(); loadAttachments() })
+
+async function loadAttachments() {
+  if (!props.attachmentsPath) return
+  try {
+    const { data } = await http.get(props.attachmentsPath)
+    attachments.value = data.files || []
+  } catch {
+    attachments.value = []
+  }
+}
 
 function send(preset?: string) {
   const text = (preset ?? draft.value).trim()
@@ -151,11 +221,12 @@ function send(preset?: string) {
   messages.value.push({ id: 'u' + Date.now(), role: 'user', content: text })
   streaming.value = true
   liveContent.value = ''
+  liveThinking.value = ''
   statusLine.value = '已提交，AI 正在处理…'
   liveTools.value = []
   scrollBottom()
 
-  abort = streamSSE(props.chatPath, { message: text }, onEvent, {
+  abort = streamSSE(props.chatPath, { message: text, ...(props.requestPayload || {}) }, onEvent, {
     onDone: finalize,
     onError: () => { statusLine.value = ''; finalize() },
   })
@@ -164,7 +235,9 @@ function send(preset?: string) {
 function onEvent(ev: SSEEvent) {
   switch (ev.type) {
     case 'thinking':
+      liveThinking.value += ev.delta || ''
       statusLine.value = 'AI 推理中…'
+      scrollBottom()
       break
     case 'content':
       liveContent.value += ev.delta || ''
@@ -175,7 +248,7 @@ function onEvent(ev: SSEEvent) {
       statusLine.value = ev.message || `执行中…（已 ${ev.elapsed || '?'}s）`
       break
     case 'tool_call':
-      liveTools.value.push({ name: ev.name || '' })
+      liveTools.value.push({ name: ev.name || '', args: ev.args || '' })
       statusLine.value = `正在执行 ${ev.name || '工具'}…`
       scrollBottom()
       break
@@ -202,19 +275,26 @@ function onEvent(ev: SSEEvent) {
 }
 
 function finalize() {
-  if (liveContent.value || liveTools.value.length) {
+  if (liveContent.value || liveThinking.value || liveTools.value.length) {
     messages.value.push({
       id: 'a' + Date.now(),
       role: 'assistant',
       content: liveContent.value,
-      tools: liveTools.value.map((t) => ({ name: t.name, result_summary: t.result || '' } as ToolTrace)),
+      thinking: liveThinking.value,
+      tools: liveTools.value.map((t) => ({
+        name: t.name,
+        args_summary: t.args || '',
+        result_summary: t.result || '',
+      } as ToolTrace)),
     })
   }
   liveContent.value = ''
+  liveThinking.value = ''
   statusLine.value = ''
   liveTools.value = []
   streaming.value = false
   abort = null
+  if (props.doneRefreshResource) emit('refresh', props.doneRefreshResource)
   scrollBottom()
 }
 
@@ -235,7 +315,29 @@ async function clearHistory() {
     await ElMessageBox.confirm('确定清空对话历史？', '提示', { type: 'warning' })
     await http.delete(props.clearPath)
     messages.value = []
+    if (props.doneRefreshResource) emit('refresh', props.doneRefreshResource)
   } catch { /* cancelled */ }
+}
+
+async function onAttachmentUpload(e: Event) {
+  const fl = (e.target as HTMLInputElement).files
+  if (!fl || !fl.length || !props.attachmentsUploadPath) return
+  uploadingAttachments.value = true
+  try {
+    const form = new FormData()
+    Array.from(fl).forEach((f) => form.append('files', f))
+    await http.post(props.attachmentsUploadPath, form)
+    await loadAttachments()
+  } finally {
+    uploadingAttachments.value = false
+    if (fileInput.value) fileInput.value.value = ''
+  }
+}
+
+async function clearAttachments() {
+  if (!props.attachmentsClearPath) return
+  await http.delete(props.attachmentsClearPath)
+  await loadAttachments()
 }
 
 defineExpose({ reload: loadHistory, send })
@@ -313,8 +415,36 @@ defineExpose({ reload: loadHistory, send })
 .traces summary::-webkit-details-marker { display: none; }
 .traces summary:hover { color: var(--text-1); border-color: var(--border-strong); }
 .trace-step { padding: 6px 10px; border-left: 2px solid var(--brand-soft-2); margin: 6px 0 6px 8px; }
+.trace-step.live { border-left-color: var(--info); }
+.trace-kind {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 6px;
+  margin-right: 6px;
+  border-radius: var(--r-xs);
+  background: var(--brand-soft);
+  color: var(--brand);
+  font-size: var(--text-xs);
+  font-weight: 700;
+}
 .trace-name { font-size: var(--text-sm); color: var(--text-2); }
 .trace-res { color: var(--success); margin-top: 3px; font-size: var(--text-xs); }
+.thinking-body {
+  margin: 6px 0 0 8px;
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  color: var(--text-2);
+  background: var(--code-bg);
+  border-left: 2px solid var(--warning);
+  border-radius: var(--r-xs);
+  padding: 8px 10px;
+}
+.live-trace summary { border-color: color-mix(in srgb, var(--info) 30%, transparent); }
 
 /* Live -------------------------------------------------------------------- */
 .live-tool {
@@ -341,6 +471,30 @@ defineExpose({ reload: loadHistory, send })
 
 /* Composer ---------------------------------------------------------------- */
 .composer { padding: 12px 18px 16px; flex-shrink: 0; }
+.attachments {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.hidden-file { display: none; }
+.attachment-hint {
+  font-size: var(--text-xs);
+  color: var(--text-3);
+}
+.attachment-chip {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-xs);
+  color: var(--info);
+  background: var(--info-soft);
+  border: 1px solid color-mix(in srgb, var(--info) 24%, transparent);
+  border-radius: var(--r-full);
+  padding: 3px 9px;
+}
 .composer-box {
   background: var(--surface); border: 1px solid var(--border);
   border-radius: var(--r-lg); padding: 6px 6px 6px;

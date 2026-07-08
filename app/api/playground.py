@@ -1,120 +1,222 @@
-"""通用第三方沙盒接口（Playground）——按用户隔离。
-
-把「验证通道」升级为「默认第三方 Agent 平台 + 配置面板」：
-- catalog：能力市场（当前用户拥有的、已生成能力包的场景）
-- mounts：安装/卸载能力（等价于第三方宿主安装一个业务 Skill）
-- config：某能力的能力卡片 + Skill 安装信息 + MCP 兼容配置片段（配置面板）
-- uploads：给某已挂载场景上传测试数据（复用场景的 verify_uploads 目录）
-- chat：通用沙盒流式对话（Agent 不预置业务知识，自主发现 + 决策）
-"""
+"""Independent Agent platform API."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 
+from app.domain.models import ChatMessage, ChatRequest
+from app.playground import resources as pg_resources
 from app.playground import service as pg
 from ..auth.deps import get_current_user
 from ..auth.models import PublicUser
-from app.domain.models import ChatMessage, ChatRequest
-from app.domain.storage import store
 
 router = APIRouter(prefix="/playground", tags=["playground"])
 
-_ALLOWED_SUFFIX = {".csv", ".tsv", ".xlsx", ".xls", ".json"}
+_ATTACHMENT_SUFFIX = {".csv", ".tsv", ".xlsx", ".xls", ".json", ".txt", ".md", ".pdf", ".doc", ".docx"}
 _SSE_HEADERS = {"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
 
 
-def _require_owned(scenario_id: str, user: PublicUser) -> None:
-    sc = store.get(scenario_id)
-    if sc is None or sc.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="场景不存在")
+@router.get("/resources")
+def list_resources(user: PublicUser = Depends(get_current_user)) -> dict:
+    return pg_resources.all_resources(user.id)
 
 
-@router.get("/catalog")
-def get_catalog(user: PublicUser = Depends(get_current_user)) -> dict:
-    """能力市场：列出当前用户拥有的、已生成 Skill 能力包的场景（含是否已挂载）。"""
-    return {"items": pg.catalog(user.id), "mounted": pg.get_mounts(user.id)}
+@router.get("/conversations")
+def list_conversations(user: PublicUser = Depends(get_current_user)) -> dict:
+    return {"conversations": pg.list_conversations(user.id)}
 
 
-@router.get("/mounts")
-def list_mounts(user: PublicUser = Depends(get_current_user)) -> dict:
-    return {"mounted": pg.get_mounts(user.id)}
-
-
-@router.post("/mounts/{scenario_id}")
-def mount_scenario(scenario_id: str, user: PublicUser = Depends(get_current_user)) -> dict:
-    _require_owned(scenario_id, user)
-    pkg_dir = Path(store.skills_dir(scenario_id))
-    if not (pkg_dir / "main_skill").exists() or not (pkg_dir / "mcp.json").exists():
-        raise HTTPException(status_code=400, detail="该场景尚未生成标准 Skill 能力包，无法挂载")
-    return {"mounted": pg.mount(user.id, scenario_id)}
-
-
-@router.delete("/mounts/{scenario_id}")
-def unmount_scenario(scenario_id: str, user: PublicUser = Depends(get_current_user)) -> dict:
-    return {"mounted": pg.unmount(user.id, scenario_id)}
-
-
-@router.get("/mounts/{scenario_id}/config")
-def get_mount_config(
-    scenario_id: str, request: Request, user: PublicUser = Depends(get_current_user)
+@router.post("/conversations")
+def create_conversation(
+    payload: dict | None = Body(default=None),
+    user: PublicUser = Depends(get_current_user),
 ) -> dict:
-    _require_owned(scenario_id, user)
-    cfg = pg.mount_config(scenario_id, pg.public_base_url(request))
-    if not cfg:
-        raise HTTPException(status_code=404, detail="能力包不存在或未生成 Skill 描述符")
-    return cfg
+    item = pg.create_conversation(user.id, str((payload or {}).get("title") or ""))
+    return {"item": item, "conversations": pg.list_conversations(user.id)}
+
+
+@router.delete("/conversations/{conversation_id}")
+def delete_conversation(
+    conversation_id: str,
+    user: PublicUser = Depends(get_current_user),
+) -> dict:
+    return {"conversations": pg.delete_conversation(user.id, conversation_id)}
+
+
+@router.post("/skills")
+async def install_skill(
+    files: list[UploadFile] = File(...),
+    paths: list[str] = Form(default=[]),
+    name: str = Form(default=""),
+    user: PublicUser = Depends(get_current_user),
+) -> dict:
+    try:
+        item = await pg_resources.install_skill_from_files(user.id, files, paths=paths, name=name)
+        pg.save_agent_config(user.id, pg.get_agent_config(user.id))
+        return {"item": item, **pg_resources.all_resources(user.id)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/skills/{skill_id}")
+def delete_skill(skill_id: str, user: PublicUser = Depends(get_current_user)) -> dict:
+    pg_resources.delete_skill(user.id, skill_id)
+    pg.save_agent_config(user.id, pg.get_agent_config(user.id))
+    return pg_resources.all_resources(user.id)
+
+
+@router.post("/sandboxes")
+def save_sandbox(
+    payload: dict | None = Body(default=None),
+    user: PublicUser = Depends(get_current_user),
+) -> dict:
+    try:
+        item = pg_resources.public_sandbox_resource(pg_resources.save_sandbox(user.id, payload or {}))
+        return {"item": item, **pg_resources.all_resources(user.id)}
+    except (ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/sandboxes/{sandbox_id}")
+def delete_sandbox(sandbox_id: str, user: PublicUser = Depends(get_current_user)) -> dict:
+    try:
+        pg_resources.delete_sandbox(user.id, sandbox_id)
+        pg.save_agent_config(user.id, pg.get_agent_config(user.id))
+        return pg_resources.all_resources(user.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/sandboxes/{sandbox_id}/install")
+def install_sandbox_dependencies(
+    sandbox_id: str,
+    payload: dict | None = Body(default=None),
+    user: PublicUser = Depends(get_current_user),
+) -> dict:
+    try:
+        cfg = (payload or {}).get("agent_config") or pg.get_agent_config(user.id)
+        item = pg_resources.public_sandbox_resource(
+            pg_resources.install_sandbox_dependencies(user.id, sandbox_id, cfg)
+        )
+        return {"item": item, **pg_resources.all_resources(user.id)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/mcps")
+async def save_mcp(
+    payload: dict | None = Body(default=None),
+    user: PublicUser = Depends(get_current_user),
+) -> dict:
+    try:
+        item = await pg_resources.save_mcp(user.id, payload or {})
+        pg.save_agent_config(user.id, pg.get_agent_config(user.id))
+        return {"item": item, **pg_resources.all_resources(user.id)}
+    except (ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/mcps/{mcp_id}")
+def delete_mcp(mcp_id: str, user: PublicUser = Depends(get_current_user)) -> dict:
+    pg_resources.delete_mcp(user.id, mcp_id)
+    pg.save_agent_config(user.id, pg.get_agent_config(user.id))
+    return pg_resources.all_resources(user.id)
+
+
+@router.post("/llms")
+def save_llm(
+    payload: dict | None = Body(default=None),
+    user: PublicUser = Depends(get_current_user),
+) -> dict:
+    try:
+        item = pg_resources.save_llm(user.id, payload or {})
+        return {"item": item, **pg_resources.all_resources(user.id)}
+    except (ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/llms/{llm_id}")
+def delete_llm(llm_id: str, user: PublicUser = Depends(get_current_user)) -> dict:
+    pg_resources.delete_llm(user.id, llm_id)
+    pg.save_agent_config(user.id, pg.get_agent_config(user.id))
+    return pg_resources.all_resources(user.id)
 
 
 @router.post("/chat")
 async def playground_chat(
     req: ChatRequest, user: PublicUser = Depends(get_current_user)
 ) -> StreamingResponse:
-    """通用沙盒流式对话（SSE）。基于当前用户挂载集合构建通用 Agent。"""
     return StreamingResponse(
-        pg.stream_chat(user.id, req.message.strip()),
+        pg.stream_chat(user.id, req.message.strip(), req.conversation_id),
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
     )
 
 
 @router.get("/messages", response_model=list[ChatMessage])
-def get_messages(user: PublicUser = Depends(get_current_user)) -> list[ChatMessage]:
-    return pg.get_messages(user.id)
+def get_messages(
+    conversation_id: str = Query(default=""),
+    user: PublicUser = Depends(get_current_user),
+) -> list[ChatMessage]:
+    return pg.get_messages(user.id, conversation_id)
 
 
 @router.delete("/messages")
-def clear_messages(user: PublicUser = Depends(get_current_user)) -> dict:
-    pg.clear_messages(user.id)
-    return {"message": "已清空沙盒对话历史"}
-
-
-@router.post("/scenarios/{scenario_id}/uploads")
-async def upload_test_data(
-    scenario_id: str, files: list[UploadFile], user: PublicUser = Depends(get_current_user)
+def clear_messages(
+    conversation_id: str = Query(default=""),
+    user: PublicUser = Depends(get_current_user),
 ) -> dict:
-    """给某已挂载场景上传测试数据（存入该场景的 verify_uploads/，沙盒执行时优先使用）。"""
-    _require_owned(scenario_id, user)
-    dest_dir = Path(store.verify_uploads_dir(scenario_id))
+    pg.clear_messages(user.id, conversation_id)
+    return {"message": "已清空 Agent 平台对话历史"}
+
+
+@router.get("/agent-config")
+def get_agent_config(user: PublicUser = Depends(get_current_user)) -> dict:
+    return pg.get_agent_config(user.id)
+
+
+@router.put("/agent-config")
+def save_agent_config(
+    payload: dict | None = Body(default=None),
+    user: PublicUser = Depends(get_current_user),
+) -> dict:
+    return pg.save_agent_config(user.id, payload or {})
+
+
+@router.get("/attachments")
+def list_attachments(
+    conversation_id: str = Query(default=""),
+    user: PublicUser = Depends(get_current_user),
+) -> dict:
+    return {"files": pg.list_attachments(user.id, conversation_id)}
+
+
+@router.post("/attachments")
+async def upload_attachments(
+    files: list[UploadFile] = File(...),
+    conversation_id: str = Query(default=""),
+    user: PublicUser = Depends(get_current_user),
+) -> dict:
+    dest_dir = pg.attachments_dir(user.id, conversation_id)
     saved = []
     for upload in files:
-        suffix = "." + upload.filename.rsplit(".", 1)[-1].lower() if "." in upload.filename else ""
-        if suffix not in _ALLOWED_SUFFIX:
-            raise HTTPException(status_code=400, detail=f"不支持的文件类型：{upload.filename}")
-        (dest_dir / upload.filename).write_bytes(await upload.read())
-        saved.append(upload.filename)
-    return {"message": f"已为场景上传 {len(saved)} 个测试文件", "files": saved}
+        filename = Path(upload.filename or "").name
+        suffix = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        if not filename or suffix not in _ATTACHMENT_SUFFIX:
+            raise HTTPException(status_code=400, detail=f"不支持的附件类型：{filename}")
+        dest = dest_dir / filename
+        dest.write_bytes(await upload.read())
+        saved.append(filename)
+    return {"message": f"已上传 {len(saved)} 个附件", "files": saved}
 
 
-@router.get("/scenarios/{scenario_id}/uploads")
-def list_test_data(scenario_id: str, user: PublicUser = Depends(get_current_user)) -> dict:
-    _require_owned(scenario_id, user)
-    dest_dir = Path(store.verify_uploads_dir(scenario_id))
-    files = sorted(
-        f.name for f in dest_dir.iterdir()
-        if f.is_file() and f.suffix.lower() in _ALLOWED_SUFFIX
-    ) if dest_dir.exists() else []
-    return {"files": files, "using_test_data": bool(files)}
+@router.delete("/attachments")
+def clear_attachments(
+    conversation_id: str = Query(default=""),
+    user: PublicUser = Depends(get_current_user),
+) -> dict:
+    removed = pg.clear_attachments(user.id, conversation_id)
+    return {"message": f"已清空 {removed} 个附件"}

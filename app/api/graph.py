@@ -38,13 +38,13 @@ def get_trace_sample(scenario_id: str, result_table: Optional[str] = None) -> di
     """暴露「追踪驱动采样」的真实计算结果，供前端逐表核对：
 
     推导关联/流程时喂给 AI 的样本，到底是不是「结果表第 N 行 → 业务表对应行 →
-    规则表对应行」这样有真实因果链路的数据，还是退化成了各表独立随机抽的、
-    互相之间毫无关系的行。
+    规则表对应行」这样有真实因果链路的数据；追不到的表不会被随机行补齐。
 
     返回结构（与 trace_sampling.trace_sampling() 一致）：
         result_table / result_sample：追踪入口（结果表样本行）
         trace_map：{表名: {matched_rows, matched_by, trace_confidence, warning?}}
-            matched_by == "random" 即表示这张表没追到任何因果关联，是随机兜底
+            matched_rows 仅包含追踪命中的因果行；未命中表会保留 warning 但 matched_rows 为空。
+            旧数据中的 matched_by == "random" 不应作为推导样本
         unmatched_tables：完全追不上的表
         trace_summary：一句话摘要
         degraded：True 表示整体降级为随机采样（通常因为没有结果表）

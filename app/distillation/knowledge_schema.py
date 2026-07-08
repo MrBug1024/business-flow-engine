@@ -9,8 +9,7 @@
 核心思想（延续 v1.0.3，v1.0.7 修正执行方式）：
   值千变万化，唯一不变的是结构。这里只学**结构**，不学"每条规则具体怎么判断"：
     ① 知识表的列角色（分派列 / 条目编号列 / 自然语言条件列 / 参数列）
-    ② 分派值 → 一句话人类可读说明（如「重复」→ co_occurrence 这类标签仅供人快速
-       了解知识表全貌，不是执行器要挑选的算子名，不驱动任何执行）
+    ② 分派值 → 一句话人类可读说明（只帮助理解知识表全貌，不作为执行器要挑选的算子名）
     ③ 知识字段语义 → 业务表字段的对应关系
   真实业务规则可能有成百上千条、判断逻辑千差万别，不可能在蒸馏阶段为每条规则
   预先固化 SQL/判断条件——这件事留给运行时读到规则原文的 LLM 现场推理、现场查询。
@@ -65,18 +64,8 @@ _NON_ITEM_ENTITY_HINTS = ("机构", "单位", "人员", "部门", "科室", "医
 # （创建/更新/经办时间）——两者都会通过"日期/时间"命名 hint 命中，但都不是事件时间。
 _NON_EVENT_TIME_HINTS = ("创建", "更新", "出生", "经办")
 
-# 通用分派值 → 处理模式（启发式默认，AI 可覆盖/扩展）
-# 不含领域特定术语（"违规"等）
-_DEFAULT_PATTERN_BY_KEYWORD: tuple[tuple[tuple[str, ...], str], ...] = (
-    (("重复", "捆绑", "联用", "分解"), "co_occurrence"),
-    (("超量", "超标", "超限", "限量", "超过", "超出"), "threshold"),
-    (("互斥", "已含", "不应", "排除"), "exclusive_conflict"),
-    (("频次", "频率", "次数", "多次", "重复使用"), "frequency_overflow"),
-    (("集合", "差集", "交集", "比对", "名单"), "set_compare"),
-    (("时序", "顺序", "流程", "步骤"), "sequence_detect"),
-    (("映射", "翻译", "对照", "换算", "查找"), "lookup"),
-    (("汇总", "聚合", "统计", "合计"), "aggregate"),
-)
+# dispatch_map 的值只是一句人读说明。不要把历史数据中的分派值猜成固定执行模式。
+_DEFAULT_DISPATCH_DESCRIPTION = "按知识行原文现场理解，不预置处理模式"
 
 
 def _match_hints(col: str, hints: tuple[str, ...]) -> bool:
@@ -164,11 +153,8 @@ def _dispatch_key_values(
 
 
 def _guess_pattern(value: str) -> str:
-    """根据分派值的字面，猜一个默认处理模式（完全领域无关）。"""
-    for kws, pattern in _DEFAULT_PATTERN_BY_KEYWORD:
-        if any(k in value for k in kws):
-            return pattern
-    return "keyword"  # 兜底：未识别时先用关键词命中（运行时由 AI/用户精化）
+    """为分派值生成说明；不根据字面猜执行模式。"""
+    return _DEFAULT_DISPATCH_DESCRIPTION
 
 
 def infer_knowledge_schema(scenario: Scenario) -> KnowledgeSchemaMapping | None:
@@ -186,7 +172,7 @@ def infer_knowledge_schema(scenario: Scenario) -> KnowledgeSchemaMapping | None:
     parameter_cols = role_map["parameter"]
     condition_cols = role_map["condition"]
 
-    # 默认分派映射（启发式，AI 可覆盖）
+    # 默认分派映射：仅保留分派值清单和人读说明，不猜执行模式。
     dispatch_map: dict[str, str] = {}
     if dispatch_key:
         for v in _dispatch_key_values(knowledge_table, dispatch_key):

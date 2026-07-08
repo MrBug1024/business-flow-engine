@@ -48,7 +48,7 @@ def _format_knowledge_schema(ks: KnowledgeSchemaMapping | RuleSchemaMapping | No
         if ks.dispatch_map:
             mapping = "；".join(f"{k}→{v}" for k, v in list(ks.dispatch_map.items())[:10])
             suffix = f"（共 {len(ks.dispatch_map)} 种）" if len(ks.dispatch_map) > 10 else ""
-            lines.append(f"- 分派值→处理模式：{mapping}{suffix}")
+            lines.append(f"- 分派值→说明（不驱动执行）：{mapping}{suffix}")
         if ks.condition_columns:
             lines.append(f"- 自然语言条件列：{ks.condition_columns}")
         if ks.parameter_columns:
@@ -62,7 +62,7 @@ def _format_knowledge_schema(ks: KnowledgeSchemaMapping | RuleSchemaMapping | No
         lines.append(f"- 规则编号列：{ks.rule_id_column or '（未识别）'}")
         if ks.discriminator_to_template:
             mapping = "；".join(f"{k}→{v}" for k, v in ks.discriminator_to_template.items())
-            lines.append(f"- 分派值→处理模式：{mapping}")
+            lines.append(f"- 分派值→说明（不驱动执行）：{mapping}")
         if ks.nl_description_columns:
             lines.append(f"- 自然语言条件列：{ks.nl_description_columns}")
         if ks.parameter_columns:
@@ -158,8 +158,8 @@ def build_metadata_report(scenario: Scenario, use_trace_sampling: bool = False) 
                     n = len(rows)
                     warning = info.get("warning", "")
 
-                    if by == "random":
-                        lines.append(f"\n  - 「{tbl_name}」⚠️ 随机采样 {n} 行（{warning}）")
+                    if not by or by == "random":
+                        lines.append(f"\n  - 「{tbl_name}」⚠️ 未追踪到稳定因果行（{warning or '不作为推导样本'}）")
                     else:
                         lines.append(
                             f"\n  - 「{tbl_name}」通过「{by}」追踪 {n} 行（置信度:{conf}）"

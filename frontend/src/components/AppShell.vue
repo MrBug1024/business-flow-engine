@@ -2,10 +2,11 @@
   <div class="shell">
     <header class="topbar">
       <div class="brand">
-        <BrandMark :size="30" />
+        <!-- <BrandMark :size="30" /> -->
+         <img src="/logo.png" alt="Brand Logo" width="40" height="40" />
         <div class="brand-text">
-          <span class="brand-name">业务流逆向引擎</span>
-          <span class="brand-tag">Reverse-Engineering Engine</span>
+          <span class="brand-name">零号.奇点工坊</span>
+          <span class="brand-tag">Zero Singularity Workshop</span>
         </div>
       </div>
 
@@ -14,7 +15,7 @@
           <el-icon><Cpu /></el-icon><span>蒸馏工作台</span>
         </router-link>
         <router-link to="/sandbox" class="nav-item" active-class="active">
-          <el-icon><Box /></el-icon><span>第三方沙盒</span>
+          <el-icon><Box /></el-icon><span>Agent 平台</span>
         </router-link>
       </nav>
 

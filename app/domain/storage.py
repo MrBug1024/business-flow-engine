@@ -5,7 +5,7 @@
     data/scenarios/<scenario_id>/
         meta.json          业务场景元信息（名称、状态、表结构、关联、流程、技能索引）
         chat.jsonl         蒸馏通道对话记录
-        verify_chat.jsonl  验证通道对话记录（独立，与蒸馏通道隔离）
+        verify_chat.jsonl  兼容旧验证接口的对话记录（独立，与蒸馏通道隔离）
         uploads/<file>     上传的业务数据表
         skills/<skill_id>/ 生成的技能（SKILL.md + scripts/）
         outputs/<file>     产出复刻文件
@@ -49,9 +49,9 @@ class ScenarioStore:
         return path
 
     def verify_uploads_dir(self, scenario_id: str) -> Path:
-        """验证通道专用的「新业务数据」目录，与蒸馏通道的 uploads/ 完全分开。
+        """兼容旧验证接口的「新业务数据」目录，与蒸馏通道的 uploads/ 完全分开。
 
-        验证通道的意义是证明技能包能在**新数据**上跑通，而不是复读蒸馏阶段
+        验证执行的意义是证明技能包能在**新数据**上跑通，而不是复读蒸馏阶段
         用过的同一批文件——两者必须是物理上不同的目录。
         """
         path = self.scenario_dir(scenario_id) / "verify_uploads"
@@ -72,7 +72,7 @@ class ScenarioStore:
     def release_dir(self, scenario_id: str) -> Path:
         """第三方发布包目录。
 
-        验证沙盒和下载发布物都从这里读取，避免验证时使用平台内部 skills/
+        Agent 平台和下载发布物都从这里读取，避免执行时使用平台内部 skills/
         目录，而第三方安装时使用另一套结构。
         """
         path = self.scenario_dir(scenario_id) / "release"
@@ -168,7 +168,7 @@ class ScenarioStore:
                     continue
             return messages
 
-    # ------------------------------------------------------- 验证通道对话记录
+    # ------------------------------------------------------- 兼容旧验证接口对话记录
     def append_verify_message(self, scenario_id: str, message: ChatMessage) -> None:
         with self._lock:
             vf = self._verify_chat_file(scenario_id)

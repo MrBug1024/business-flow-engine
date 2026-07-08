@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     github_client_id: str = ""
     github_client_secret: str = ""
 
-    # ===== 验证通道执行保护 =====
+    # ===== Agent 执行保护 =====
     # 单轮对话的总时长上限（秒）：超过后强制终止本轮并明确告知用户，
     # 避免"长时间无反馈、也无结果"的静默挂死
     verify_turn_timeout: int = 600

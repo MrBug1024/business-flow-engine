@@ -45,10 +45,10 @@ def build_verify_tools(scenario_id: str) -> list[StructuredTool]:
         return d.exists() and any(f.suffix.lower() in _DATA_SUFFIXES for f in d.iterdir())
 
     def _uploads_dir() -> Path:
-        """验证通道的业务数据目录：优先用户在验证通道里新上传的测试数据
+        """旧验证接口的业务数据目录：优先用户在旧验证入口上传的验证数据
         （verify_uploads/），没有的话才退回蒸馏阶段的 uploads/。
 
-        这两个目录物理隔离：验证通道要证明的是"技能包能在新数据上跑通"，
+        这两个目录物理隔离：验证执行要证明的是"技能包能在新数据上跑通"，
         而不是反复读同一批蒸馏时用过的文件。
         """
         verify_dir = Path(store.verify_uploads_dir(scenario_id))
@@ -395,7 +395,7 @@ def build_verify_tools(scenario_id: str) -> list[StructuredTool]:
 
         # 只加载 SQL 里实际引用到的表。历史版本在这里把场景内**所有**表每次都全量
         # 重读一遍（且用的是无缓存的 openpyxl 慢路径）——一张几十万行的 Excel 单次
-        # 就要读几分钟，Agent 每条规则又要查好几次，正是验证通道"慢/卡/无反馈"的
+        # 就要读几分钟，Agent 每条规则又要查好几次，正是旧验证入口"慢/卡/无反馈"的
         # 头号根因。现在改为：SQL 引用哪张表才加载哪张，且走 load_full_frame_cached
         # （calamine 快速引擎 + 表头自动识别 + 进程内 mtime 缓存，重复查询秒回）。
         all_names = [t.get("table_name", "") for t in tables_meta if t.get("table_name")]
