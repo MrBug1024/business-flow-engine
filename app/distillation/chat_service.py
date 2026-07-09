@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 import uuid
 from typing import AsyncIterator, Optional
 
@@ -13,6 +15,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from app.distillation import clarifications, inference, transform_builder
 from app.distillation.agent import build_agent
+from app.core.config import settings
 from app.core.llm import get_llm
 from app.domain import scenario_state
 from app.domain.models import (
@@ -35,6 +38,52 @@ _TOOL_STATUS_MAP = {
     "deduce_relations": ScenarioStatus.RELATIONS_DEDUCED,
     "deduce_flow": ScenarioStatus.FLOW_DEDUCED,
     "generate_skills": ScenarioStatus.SKILLS_GENERATED,
+}
+
+_DETERMINISTIC_WORKFLOW_KEYWORDS = {
+    "trace": (
+        "数据链路追踪",
+        "链路追踪",
+        "追踪链路",
+        "追踪样本",
+        "步骤2",
+        "步骤二",
+        "第二步",
+        "trace_data_links",
+    ),
+    "relations": (
+        "推导关联关系",
+        "推导表关联",
+        "推导关系",
+        "推导er",
+        "步骤3",
+        "步骤三",
+        "第三步",
+        "deduce_relations",
+    ),
+    "flow": (
+        "推导业务流程",
+        "推导流程",
+        "步骤4",
+        "步骤四",
+        "第四步",
+        "deduce_flow",
+    ),
+    "skills": (
+        "生成技能",
+        "生成技能库",
+        "固化技能",
+        "步骤5",
+        "步骤五",
+        "第五步",
+        "generate_skills",
+    ),
+    "metadata": (
+        "提取元数据",
+        "扫描结构",
+        "元数据蓝图",
+        "extract_metadata",
+    ),
 }
 
 
@@ -63,13 +112,29 @@ async def stream_chat(scenario: Scenario, user_message: str) -> AsyncIterator[st
         ChatMessage(id=_new_msg_id(), role=ChatRole.USER, content=user_message),
     )
 
-    if get_llm() is not None:
+    if _should_use_deterministic_workflow(user_message):
+        gen = _stream_heuristic(scenario, user_message)
+    elif get_llm() is not None:
         gen = _stream_with_agent(scenario, user_message)
     else:
         gen = _stream_heuristic(scenario, user_message)
 
-    async for frame in gen:
-        yield frame
+    try:
+        async for frame in gen:
+            yield frame
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        message = f"AI 处理出错：{exc}"
+        yield sse("error", message=message)
+        store.append_message(
+            scenario.id,
+            ChatMessage(
+                id=_new_msg_id(),
+                role=ChatRole.ASSISTANT,
+                content=f"⚠️ {message}",
+            ),
+        )
     yield sse_done()
 
 
@@ -81,6 +146,7 @@ async def _stream_with_agent(scenario: Scenario, user_message: str) -> AsyncIter
     final_content: list[str] = []
     final_thinking: list[str] = []
     tool_traces: list[ToolTrace] = []
+    sent_interaction = False
 
     history = store.get_messages(scenario.id)
     lc_messages = []
@@ -125,8 +191,12 @@ async def _stream_with_agent(scenario: Scenario, user_message: str) -> AsyncIter
                 yield sse("tool_result", name=name, result=result_summary)
                 if tool_traces and tool_traces[-1].name == name:
                     tool_traces[-1].result_summary = result_summary
-                if name in TOOL_REFRESH_MAP:
-                    yield sse("refresh", resource=TOOL_REFRESH_MAP[name])
+                refresh_targets = TOOL_REFRESH_MAP.get(name)
+                if refresh_targets:
+                    if isinstance(refresh_targets, str):
+                        refresh_targets = [refresh_targets]
+                    for resource in refresh_targets:
+                        yield sse("refresh", resource=resource)
                 if name in _TOOL_STATUS_MAP:
                     # 只在工具明确返回 ✅ 时才推送状态变更，避免失败时误报
                     tool_output_str = str(output)
@@ -143,10 +213,24 @@ async def _stream_with_agent(scenario: Scenario, user_message: str) -> AsyncIter
                     interaction = _step_interaction(name, result_obj)
                     if interaction:
                         yield sse("interaction", interaction=interaction)
+                        sent_interaction = True
+                if not sent_interaction:
+                    fallback_interaction = _text_interaction(name, str(output))
+                    if fallback_interaction:
+                        yield sse("interaction", interaction=fallback_interaction)
+                        sent_interaction = True
 
         for ev_type, ev_text in parser.flush():
             (final_thinking if ev_type == "thinking" else final_content).append(ev_text)
             yield sse(ev_type, delta=ev_text)
+
+        if not sent_interaction:
+            fallback_interaction = _text_interaction(
+                "assistant_confirm", "".join(final_content)
+            )
+            if fallback_interaction:
+                yield sse("interaction", interaction=fallback_interaction)
+                sent_interaction = True
 
     except Exception as exc:  # noqa: BLE001
         err_str = str(exc)
@@ -216,9 +300,9 @@ def _step_interaction(tool_name: str, result_obj) -> Optional[dict]:
     label = "关联推导" if tool_name == "deduce_relations" else "业务流程推导"
     questions: list[dict] = []
 
-    clarifications = list(getattr(result_obj, "clarifications", None) or [])
-    if clarifications:
-        for i, c in enumerate(clarifications[:8]):
+    clarification_items = list(getattr(result_obj, "clarifications", None) or [])
+    if clarification_items:
+        for i, c in enumerate(clarification_items[:8]):
             questions.append({
                 "id": getattr(c, "id", "") or f"{tool_name}_q{i}",
                 "question": c.question,
@@ -249,16 +333,39 @@ def _step_interaction(tool_name: str, result_obj) -> Optional[dict]:
     }
 
 
+def _text_interaction(context: str, text: str) -> Optional[dict]:
+    clarification_items = clarifications.build_clarifications_from_text(
+        text, context=context
+    )
+    if not clarification_items:
+        return None
+    questions = []
+    for i, c in enumerate(clarification_items[:6]):
+        questions.append({
+            "id": getattr(c, "id", "") or f"{context}_q{i}",
+            "question": c.question,
+            "options": list(c.options or []),
+            "allow_custom": bool(c.allow_custom),
+            "multi_select": bool(c.multi_select),
+        })
+    return {
+        "type": "confirm",
+        "title": f"需要你确认 {len(questions)} 项后再继续",
+        "context": f"{context}_confirm",
+        "questions": questions,
+    }
+
+
 # ===========================================================================
 # 启发式降级路径
 # ===========================================================================
 _INTENT_KEYWORDS = {
-    "trace":     ("数据链路追踪", "链路追踪", "追踪链路", "追踪样本", "因果链", "trace"),
-    "relations": ("关联", "关系", "ER", "字段语义", "字段含义", "推导关联"),
-    "flow":      ("流程", "推导流程", "业务流程", "节点", "管线"),
-    "skills":    ("技能", "skill", "技能库", "固化", "生成技能"),
+    "trace":     ("数据链路追踪", "链路追踪", "追踪链路", "追踪样本", "因果链", "trace", "trace_data_links"),
+    "relations": ("关联", "关系", "ER", "推导er", "字段语义", "字段含义", "推导关联", "deduce_relations"),
+    "flow":      ("流程", "推导流程", "业务流程", "节点", "管线", "deduce_flow"),
+    "skills":    ("技能", "skill", "技能库", "固化", "生成技能", "generate_skills"),
     "execute":   ("执行", "复刻", "产出结果", "跑一下", "运行", "校验", "验证", "对照", "比对"),
-    "metadata":  ("元数据", "结构", "扫描", "蓝图", "概览"),
+    "metadata":  ("元数据", "结构", "扫描", "蓝图", "概览", "extract_metadata"),
 }
 
 
@@ -268,6 +375,51 @@ def _detect_intent(message: str) -> str:
         if any(kw in message or kw in low for kw in kws):
             return intent
     return "general"
+
+
+def _compact_workflow_text(text: str) -> str:
+    return "".join(
+        ch
+        for ch in text.lower()
+        if not ch.isspace() and ch not in "，。、“”‘’：:；;,./?？!！-—_()（）[]【】"
+    )
+
+
+def _should_use_deterministic_workflow(message: str) -> bool:
+    """Route explicit workflow step commands to backend execution, not LLM choice."""
+    text = (message or "").strip()
+    low = text.lower()
+    compact = _compact_workflow_text(text)
+    if not text:
+        return False
+    for kws in _DETERMINISTIC_WORKFLOW_KEYWORDS.values():
+        for kw in kws:
+            kw_low = kw.lower()
+            if kw in text or kw_low in low or _compact_workflow_text(kw) in compact:
+                return True
+    return False
+
+
+async def _heartbeat_until(task: asyncio.Task, label: str) -> AsyncIterator[str]:
+    start = time.monotonic()
+    interval = min(10, max(3, int(settings.verify_heartbeat_interval)))
+    timeout = max(interval, int(settings.verify_turn_timeout))
+
+    while not task.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=interval)
+        except asyncio.TimeoutError:
+            elapsed = time.monotonic() - start
+            if elapsed >= timeout:
+                task.cancel()
+                raise TimeoutError(
+                    f"{label}超过 {timeout} 秒仍未完成，已停止等待。请检查 LLM/网络或缩小数据范围后重试。"
+                )
+            yield sse(
+                "heartbeat",
+                elapsed=int(elapsed),
+                message=f"{label}仍在执行，已 {int(elapsed)} 秒；不是卡死，正在等待模型或数据处理返回。",
+            )
 
 
 async def _stream_heuristic(scenario: Scenario, user_message: str) -> AsyncIterator[str]:
@@ -288,8 +440,15 @@ async def _stream_heuristic(scenario: Scenario, user_message: str) -> AsyncItera
         yield sse("tool_call", name="trace_data_links", args="追踪驱动采样：结果表锚点→业务/知识表对应行")
         from app.distillation import trace_sampling  # noqa: PLC0415
         from app.domain import validators  # noqa: PLC0415
-        report = trace_sampling.trace_sampling(scenario)
-        check = validators.validate_trace_connectivity(report)
+
+        def run_trace():
+            traced = trace_sampling.trace_sampling(scenario)
+            return traced, validators.validate_trace_connectivity(traced)
+
+        task = asyncio.create_task(asyncio.to_thread(run_trace))
+        async for frame in _heartbeat_until(task, "数据链路追踪"):
+            yield frame
+        report, check = task.result()
         report["connectivity_check"] = check.to_dict()
         scenario.trace_chain = report
         scenario_state.invalidate_after_trace(scenario)
@@ -322,15 +481,29 @@ async def _stream_heuristic(scenario: Scenario, user_message: str) -> AsyncItera
             return
         yield sse("thinking", delta="推导字段业务语义 + 表关联……")
         yield sse("tool_call", name="deduce_relations", args="启发式：字段语义+关联推导")
-        result = inference.infer_relations(scenario)
+        task = asyncio.create_task(asyncio.to_thread(inference.infer_relations, scenario))
+        async for frame in _heartbeat_until(task, "推导关联关系"):
+            yield frame
+        result = task.result()
         scenario.relations = result
         scenario_state.invalidate_after_relations(scenario)
+        try:
+            from app.distillation import trace_sampling  # noqa: PLC0415
+            refreshed_trace = trace_sampling.trace_sampling(scenario)
+            scenario.trace_chain = refreshed_trace
+            scenario.relations.trace_chain = refreshed_trace
+        except Exception:  # noqa: BLE001
+            pass
         domain = transform_builder.build_domain_knowledge(scenario)
         scenario.domain_knowledge = domain
         store.save(scenario)
         yield sse("tool_result", name="deduce_relations", result=result.summary)
+        yield sse("refresh", resource="trace")
         yield sse("refresh", resource="relations")
         yield sse("status", status=scenario.status.value)
+        interaction = _step_interaction("deduce_relations", result)
+        if interaction:
+            yield sse("interaction", interaction=interaction)
         n_sem = sum(len(v) for v in (result.field_semantics or {}).values())
         lines = "\n".join(
             f"- {r.from_table}.{r.from_column} → {r.to_table}.{r.to_column}（{r.confidence:.0%}）"
@@ -347,7 +520,10 @@ async def _stream_heuristic(scenario: Scenario, user_message: str) -> AsyncItera
         else:
             yield sse("thinking", delta="基于（表角色+字段语义+关联+知识结构）反推业务流程节点……")
             yield sse("tool_call", name="deduce_flow", args="启发式：业务流程推导")
-            result = inference.infer_flow(scenario)
+            task = asyncio.create_task(asyncio.to_thread(inference.infer_flow, scenario))
+            async for frame in _heartbeat_until(task, "推导业务流程"):
+                yield frame
+            result = task.result()
             if not result.flow_steps:
                 yield sse("tool_result", name="deduce_flow", result="未生成流程节点")
                 yield emit_content(
@@ -365,6 +541,9 @@ async def _stream_heuristic(scenario: Scenario, user_message: str) -> AsyncItera
             yield sse("tool_result", name="deduce_flow", result=result.summary)
             yield sse("refresh", resource="flow")
             yield sse("status", status=scenario.status.value)
+            interaction = _step_interaction("deduce_flow", result)
+            if interaction:
+                yield sse("interaction", interaction=interaction)
             steps_text = "\n".join(
                 f"- 步骤{s.step_id} {s.step_name}（{s.template_kind or s.operation}）\n"
                 f"  • 该做什么：{s.purpose}\n  • 能做什么：{s.capability}"
@@ -382,7 +561,10 @@ async def _stream_heuristic(scenario: Scenario, user_message: str) -> AsyncItera
             yield sse("thinking", delta="按流程节点固化为技能：每个节点一个 skill，外加主技能串联……")
             yield sse("tool_call", name="generate_skills", args="启发式：生成技能")
             try:
-                materialized = materialize_skills(scenario)
+                task = asyncio.create_task(asyncio.to_thread(materialize_skills, scenario))
+                async for frame in _heartbeat_until(task, "生成技能"):
+                    yield frame
+                materialized = task.result()
             except Exception as exc:  # noqa: BLE001
                 import traceback
                 tb = traceback.format_exc()

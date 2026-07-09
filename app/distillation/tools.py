@@ -40,8 +40,8 @@ from app.domain.storage import store
 TOOL_REFRESH_MAP = {
     "set_table_role": "tables",
     "trace_data_links": "trace",
-    "deduce_relations": "relations",
-    "correct_relation": "relations",
+    "deduce_relations": ["trace", "relations"],
+    "correct_relation": ["relations", "trace"],
     "deduce_flow": "flow",
     "refine_flow_step": "flow",
     "generate_skills": "skills",
@@ -166,6 +166,12 @@ def build_tools(scenario_id: str) -> list[StructuredTool]:
         result = inference.infer_relations(scenario)
         scenario.relations = result
         scenario_state.invalidate_after_relations(scenario)
+        try:
+            refreshed_trace = _ts.trace_sampling(scenario)
+            scenario.trace_chain = refreshed_trace
+            scenario.relations.trace_chain = refreshed_trace
+        except Exception:  # noqa: BLE001
+            pass
         _refresh_domain_and_outputs(scenario)
         store.save(scenario)
         lines = "；".join(
@@ -233,6 +239,8 @@ def build_tools(scenario_id: str) -> list[StructuredTool]:
             from_columns=from_cols, to_columns=to_cols,
         )
 
+        scenario_state.invalidate_after_relations(scenario)
+
         # 强制用这条人工确认的关联重新搜一遍真实数据，刷新保存的因果链样本
         try:
             scenario.trace_chain = _ts.trace_sampling(scenario)
@@ -241,7 +249,6 @@ def build_tools(scenario_id: str) -> list[StructuredTool]:
         except Exception as exc:  # noqa: BLE001
             refresh_note = f"⚠️ 因果链刷新失败（{exc}），关联本身已保存为人工确认。"
 
-        scenario_state.invalidate_after_relations(scenario)
         store.save(scenario)
         cols_note = (
             f"（复合键：{relation.from_columns} ↔ {relation.to_columns}）"

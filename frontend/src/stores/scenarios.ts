@@ -28,8 +28,15 @@ export const useScenarioStore = defineStore('scenarios', {
       this.current = data
       return data
     },
-    async create(name: string, description = '') {
+    async create(name: string, description: string) {
       const { data } = await http.post('/scenarios', { name, description })
+      await this.loadList()
+      return data as Scenario
+    },
+    async updateDescription(description: string) {
+      if (!this.currentId) return null
+      const { data } = await http.patch(`/scenarios/${this.currentId}`, { description })
+      this.current = data
       await this.loadList()
       return data as Scenario
     },

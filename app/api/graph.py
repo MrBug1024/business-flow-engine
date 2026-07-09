@@ -134,13 +134,13 @@ def confirm_relation(scenario_id: str, req: RelationConfirmRequest) -> RelationR
         from_columns=req.from_columns, to_columns=req.to_columns, relation_type=req.relation_type,
     )
 
+    scenario_state.invalidate_after_relations(scenario)
     try:
         scenario.trace_chain = trace_sampling.trace_sampling(scenario)
         scenario.relations.trace_chain = scenario.trace_chain
     except Exception:  # noqa: BLE001
         pass
 
-    scenario_state.invalidate_after_relations(scenario)
     store.save(scenario)
     return scenario.relations
 

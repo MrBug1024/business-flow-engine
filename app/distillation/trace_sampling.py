@@ -200,6 +200,7 @@ def _duckdb_full_query(
     trace_keys: dict[str, Any],
     max_rows: int,
     knowledge_mode: bool = False,
+    allow_weak_fallbacks: bool = False,
 ) -> dict[str, Any] | None:
     """用 DuckDB 对完整 CSV/TSV 文件做 WHERE 过滤采样。
 
@@ -264,6 +265,9 @@ def _duckdb_full_query(
                             "trace_confidence": "high",
                         }
 
+        if not allow_weak_fallbacks:
+            return None
+
         # 优先级 2：分类值匹配
         for trace_col, values in trace_keys.get("category_values", {}).items():
             for mc in available_cols:
@@ -315,21 +319,6 @@ def _duckdb_full_query(
                             "matched_by": mc,
                             "trace_confidence": "low",
                         }
-
-        # 优先级 5：值扫描（不依赖列名相似度，逐列尝试 IN 匹配所有结果行的非平凡值）
-        # 解决：结果表列名与业务/规则表列名完全不同时，前4个策略全部失败的问题
-        all_vals = trace_keys.get("all_values", [])
-        if all_vals:
-            val_set = set(all_vals)
-            for mc in available_cols:
-                df = _try_query(_build_in_clause(mc, val_set))
-                if df is not None and len(df) <= max_rows:
-                    return {
-                        "matched_rows": _sanitize_rows(df.to_dict("records")),
-                        "matched_by": f"值扫描:{mc}",
-                        "matched_values": sorted(all_vals[:10]),
-                        "trace_confidence": "medium",
-                    }
 
         return None  # 未匹配，调用方记录为未追踪
 
@@ -405,23 +394,11 @@ def _extract_trace_keys(result_rows: list[dict[str, Any]]) -> dict[str, Any]:
                 if 1 < len(v) <= 20 and v not in text_fragments:
                     text_fragments.append(v)
 
-    # 全值集合：不依赖列名相似度，直接对目标表所有列做值扫描（兜底策略）
-    all_values: list[str] = []
-    seen: set[str] = set()
-    for row in result_rows:
-        for v in row.values():
-            s = str(v).strip()
-            if s and s.lower() not in ("nan", "none", "", "null") and 2 <= len(s) <= 30:
-                if s not in seen:
-                    seen.add(s)
-                    all_values.append(s)
-
     return {
         "id_values": id_values,
         "category_values": category_values,
         "time_ranges": time_ranges,
         "text_fragments": text_fragments[:10],
-        "all_values": all_values[:25],
     }
 
 
@@ -562,7 +539,8 @@ def _trace_business_table(
         header_row = table_io.resolve_header_row(str(path))
         sep = table_io._csv_sep(path)
         result = _duckdb_full_query(
-            str(path), header_row, sep, trace_keys, max_rows, knowledge_mode=False
+            str(path), header_row, sep, trace_keys, max_rows, knowledge_mode=False,
+            allow_weak_fallbacks=False,
         )
         if result is not None:
             return result
@@ -584,7 +562,10 @@ def _trace_business_table(
     def _str_col(col: str):
         return df[col].astype(str).str.strip()
 
-    # Excel/JSON/MD 走到这里，df 已是整表——逐级尝试匹配（CSV 已在路径 A 返回，不会到这）
+    # Excel/JSON/MD 走到这里，df 已是整表。业务表只接受严格 key-like 证据：
+    # 明确关系键优先；没有关系键时，只用结果锚点里的 ID/key 列去匹配名称相近的目标列。
+    # 不再用分类、时间、文本片段或全列值扫描兜底，避免把偶然相同的描述/状态/名称值
+    # 当成因果链路样本。
     # 优先级 1：ID 精确匹配
     for trace_col, values in trace_keys.get("id_values", {}).items():
         for mc in cols:
@@ -598,73 +579,6 @@ def _trace_business_table(
                         "matched_values": sorted(values),
                         "trace_confidence": "high",
                     }
-
-    # 优先级 2：分类值匹配
-    for trace_col, values in trace_keys.get("category_values", {}).items():
-        for mc in cols:
-            if _col_name_overlap(trace_col, mc):
-                mask = _str_col(mc).isin(values)
-                matched = df[mask].head(max_rows)
-                if not matched.empty:
-                    return {
-                        "matched_rows": _sanitize_rows(matched.to_dict("records")),
-                        "matched_by": mc,
-                        "matched_values": sorted(values),
-                        "trace_confidence": "medium",
-                    }
-
-    # 优先级 3：时间范围
-    for _trace_col, (start, end) in trace_keys.get("time_ranges", {}).items():
-        time_cols = [c for c in cols if _is_time_col(c)]
-        for tc in time_cols:
-            sc = _str_col(tc)
-            mask = (sc >= start) & (sc <= end)
-            matched = df[mask].head(max_rows)
-            if not matched.empty:
-                return {
-                    "matched_rows": _sanitize_rows(matched.to_dict("records")),
-                    "matched_by": tc,
-                    "trace_confidence": "medium",
-                }
-
-    # 优先级 4：文本片段
-    text_frags = trace_keys.get("text_fragments", [])
-    if text_frags:
-        text_cols = [c for c in cols if df[c].dtype == object or df[c].dtype.kind in ("O", "U")]
-        for tc in text_cols:
-            sc = _str_col(tc)
-            for frag in text_frags:
-                if len(frag) < 2:
-                    continue
-                try:
-                    mask = sc.str.contains(re.escape(frag), na=False)
-                    matched = df[mask].head(max_rows)
-                    if not matched.empty:
-                        return {
-                            "matched_rows": _sanitize_rows(matched.to_dict("records")),
-                            "matched_by": tc,
-                            "trace_confidence": "low",
-                        }
-                except Exception:  # noqa: BLE001
-                    continue
-
-    # 优先级 5：值扫描（不依赖列名相似度，逐列尝试精确匹配所有结果行的非平凡值）
-    all_vals = trace_keys.get("all_values", [])
-    if all_vals:
-        val_set = set(all_vals)
-        for mc in cols:
-            try:
-                mask = _str_col(mc).isin(val_set)
-                matched = df[mask].head(max_rows)
-                if not matched.empty:
-                    return {
-                        "matched_rows": _sanitize_rows(matched.to_dict("records")),
-                        "matched_by": f"值扫描:{mc}",
-                        "matched_values": sorted(all_vals[:10]),
-                        "trace_confidence": "medium",
-                    }
-            except Exception:  # noqa: BLE001
-                continue
 
     # 全失败：未追踪。不要用随机样本冒充链路样本。
     return _no_trace_result("⚠️ 未找到与结果锚点关联的业务行；该表不作为推导样本。")
@@ -700,7 +614,8 @@ def _trace_knowledge_table(
         header_row = table_io.resolve_header_row(str(path))
         sep = table_io._csv_sep(path)
         result = _duckdb_full_query(
-            str(path), header_row, sep, trace_keys, max_rows, knowledge_mode=True
+            str(path), header_row, sep, trace_keys, max_rows, knowledge_mode=True,
+            allow_weak_fallbacks=True,
         )
         if result is not None:
             return result
@@ -754,24 +669,6 @@ def _trace_knowledge_table(
                         }
                 except Exception:  # noqa: BLE001
                     continue
-
-    # 策略 3：值扫描（不依赖列名，直接对所有列做精确值匹配）
-    all_vals = trace_keys.get("all_values", [])
-    if all_vals:
-        val_set = set(all_vals)
-        for mc in cols:
-            try:
-                mask = _str_col(mc).isin(val_set)
-                matched = df[mask].head(max_rows)
-                if not matched.empty:
-                    return {
-                        "matched_rows": _sanitize_rows(matched.to_dict("records")),
-                        "matched_by": f"值扫描:{mc}",
-                        "matched_values": sorted(all_vals[:10]),
-                        "trace_confidence": "medium",
-                    }
-            except Exception:  # noqa: BLE001
-                continue
 
     # 全失败：未追踪。不要用随机样本冒充链路样本。
     return _no_trace_result("⚠️ 未找到与结果锚点关联的知识行；该表不作为推导样本。")
@@ -981,9 +878,12 @@ def trace_sampling(
                     if res_col in row and row[res_col] not in (None, "")
                     and str(row[res_col]).strip().lower() not in ("nan", "none", "null")
                 ]
-                if pairs:
+                if len(pairs) == len(ks["pairs"]):
                     key_matches.append({**ks, "pairs": pairs})
 
+            has_confirmed = any(
+                k["source"] == "confirmed" for k in keysets_by_table.get(table.table_name, [])
+            )
             is_knowledge = table.role in (TableRole.RULE.value, "knowledge")
             if is_knowledge:
                 result = _trace_knowledge_table(table, trace_keys, max_rows=10, key_matches=key_matches)
@@ -1008,18 +908,13 @@ def trace_sampling(
                     result = {**result, "matched_rows": narrowed, "warning": warning,
                               "composite_suggested": True, "composite_columns": composite_cols}
 
-            # 诚实反馈：该表存在人工确认的关联、但确认的关联键在此锚点行上没追到行时，
-            # 明确告知样本来自降级匹配，而不是让用户误以为看到的就是确认关联的结果。
-            has_confirmed = any(
-                k["source"] == "confirmed" for k in keysets_by_table.get(table.table_name, [])
-            )
-            if (has_confirmed and result.get("matched_source") != "confirmed"
-                    and result.get("matched_rows")):
-                note = ("⚠️ 该表存在人工确认的关联，但按确认的关联键在此锚点行上未命中任何行；"
-                        "以下样本来自降级匹配，仅供参考。请核对确认的关联列与锚点值是否存在"
-                        "格式差异（空格/类型/大小写等）。")
-                prev = result.get("warning") or ""
-                result = {**result, "warning": (prev + " " + note).strip()}
+            # 用户确认过的关系是最高优先级。如果确认键未命中，不能再退回其它弱匹配
+            # 生成看似相关但实际违背用户修正意见的样本。
+            if has_confirmed and result.get("matched_source") != "confirmed":
+                result = _no_trace_result(
+                    "⚠️ 已存在人工确认的关联，但按确认的关联键未命中这条结果锚点；"
+                    "未使用其它弱匹配样本。请核对字段值格式或换一条结果样本重试。"
+                )
 
             if result.get("matched_rows") and result.get("matched_by") != "random":
                 trace_map[table.table_name] = result

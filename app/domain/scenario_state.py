@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from app.domain.models import Scenario, ScenarioStatus
+from app.domain.models import RelationResult, Scenario, ScenarioStatus
 
 
 def invalidate_from_tables(scenario: Scenario) -> None:
@@ -24,7 +24,13 @@ def invalidate_from_tables(scenario: Scenario) -> None:
 
 def invalidate_after_trace(scenario: Scenario) -> None:
     """链路追踪变化后，清空关联及其后的产物。"""
-    scenario.relations = None
+    confirmed = []
+    if scenario.relations:
+        confirmed = [r for r in scenario.relations.relations if r.confirmed]
+    scenario.relations = (
+        RelationResult(relations=confirmed, trace_chain=scenario.trace_chain)
+        if confirmed else None
+    )
     scenario.flow = None
     scenario.domain_knowledge = None
     scenario.outputs = []

@@ -25,6 +25,7 @@
                 <span v-if="cur" class="status-pill" :class="statusTone">{{ statusLabel }}</span>
               </div>
               <div class="spacer" />
+              <el-button v-if="cur" plain :icon="EditPen" @click="openBusinessContext">业务说明</el-button>
               <el-button v-if="cur" type="primary" plain :icon="Upload" @click="uploadOpen = true">上传数据</el-button>
             </header>
 
@@ -85,7 +86,27 @@
         </Pane>
       </Splitpanes>
 
-      <UploadDialog v-if="cur" v-model="uploadOpen" :scenario-id="cur.id" @uploaded="refresh" />
+      <UploadDialog v-if="cur" v-model="uploadOpen" :scenario-id="cur.id" @uploaded="onUploaded" />
+
+      <el-dialog v-model="businessContextOpen" title="编辑业务说明" width="540px">
+        <p class="context-tip">
+          请用普通业务语言说明：这个业务是做什么的、主要有什么数据、最后要产出什么结果。
+        </p>
+        <el-input
+          v-model="businessContextDraft"
+          type="textarea"
+          :rows="5"
+          maxlength="2000"
+          show-word-limit
+          placeholder="例如：根据业务明细和规则/标准表，判断哪些记录命中规则，并输出命中原因、编号和处理结果。"
+        />
+        <template #footer>
+          <el-button @click="businessContextOpen = false">稍后再说</el-button>
+          <el-button type="primary" :disabled="!businessContextDraft.trim()" @click="saveBusinessContext">
+            保存说明
+          </el-button>
+        </template>
+      </el-dialog>
     </div>
   </AppShell>
 </template>
@@ -94,7 +115,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { Splitpanes, Pane } from 'splitpanes'
 import {
-  DArrowLeft, DArrowRight, Upload, Files, Grid, Share, MagicStick, Promotion, ChatDotRound,
+  DArrowLeft, DArrowRight, Upload, Files, Grid, Share, MagicStick, Promotion, ChatDotRound, EditPen,
 } from '@element-plus/icons-vue'
 import AppShell from '@/components/AppShell.vue'
 import ScenarioSidebar from '@/components/ScenarioSidebar.vue'
@@ -113,6 +134,8 @@ const diagramMode = ref<'relations' | 'flow'>('relations')
 const chatRef = ref<InstanceType<typeof ChatPanel> | null>(null)
 const collapsed = ref(false)
 const uploadOpen = ref(false)
+const businessContextOpen = ref(false)
+const businessContextDraft = ref('')
 
 const leftSize = 18
 const chatSize = 34
@@ -148,6 +171,19 @@ async function onSelect(id: string) {
 }
 async function refresh() {
   await store.refreshCurrent()
+}
+async function onUploaded() {
+  await refresh()
+}
+function openBusinessContext() {
+  businessContextDraft.value = cur.value?.description || ''
+  businessContextOpen.value = true
+}
+async function saveBusinessContext() {
+  const text = businessContextDraft.value.trim()
+  if (!text) return
+  await store.updateDescription(text)
+  businessContextOpen.value = false
 }
 async function onRefresh(resource: string) {
   await store.refreshCurrent()
@@ -212,4 +248,5 @@ function askAi(text: string) {
 .tab-body > * { height: 100%; }
 
 .chat-ph { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: var(--text-3); background: var(--bg-app); }
+.context-tip { margin: 0 0 12px; color: var(--text-2); line-height: 1.7; font-size: var(--text-base); }
 </style>

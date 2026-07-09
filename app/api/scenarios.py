@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from ..auth.deps import get_current_user
 from ..auth.models import PublicUser
-from app.domain.models import CreateScenarioRequest, Scenario
+from app.domain.models import CreateScenarioRequest, Scenario, UpdateScenarioRequest
 from app.domain.storage import store
 from .deps import get_owned_scenario_or_404
 
@@ -22,14 +22,32 @@ def list_scenarios(user: PublicUser = Depends(get_current_user)) -> list[Scenari
 def create_scenario(
     req: CreateScenarioRequest, user: PublicUser = Depends(get_current_user)
 ) -> Scenario:
+    description = req.description.strip()
+    if not description:
+        raise HTTPException(status_code=400, detail="请先填写业务说明。")
     return store.create(
-        name=req.name.strip(), description=req.description.strip(), owner_id=user.id
+        name=req.name.strip(), description=description, owner_id=user.id
     )
 
 
 @router.get("/scenarios/{scenario_id}", response_model=Scenario)
 def get_scenario(scenario: Scenario = Depends(get_owned_scenario_or_404)) -> Scenario:
     return scenario
+
+
+@router.patch("/scenarios/{scenario_id}", response_model=Scenario)
+def update_scenario(
+    req: UpdateScenarioRequest,
+    scenario: Scenario = Depends(get_owned_scenario_or_404),
+) -> Scenario:
+    if req.name is not None:
+        scenario.name = req.name.strip()
+    if req.description is not None:
+        description = req.description.strip()
+        if not description:
+            raise HTTPException(status_code=400, detail="业务说明不能为空。")
+        scenario.description = description
+    return store.save(scenario)
 
 
 @router.delete("/scenarios/{scenario_id}")

@@ -29,6 +29,13 @@ export function streamSSE(
 ): () => void {
   const ctrl = new AbortController()
   const token = getToken()
+  let settled = false
+
+  function finish() {
+    if (settled) return
+    settled = true
+    opts.onDone?.()
+  }
 
   fetchEventSource(`/api${path}`, {
     method: 'POST',
@@ -41,24 +48,35 @@ export function streamSSE(
     openWhenHidden: true,
     onmessage(msg) {
       const raw = (msg.data || '').trim()
-      if (!raw || raw === '[DONE]') return
+      if (!raw) return
+      if (raw === '[DONE]') {
+        finish()
+        ctrl.abort()
+        return
+      }
       try {
-        onEvent(JSON.parse(raw) as SSEEvent)
+        const ev = JSON.parse(raw) as SSEEvent
+        if (ev.type === 'done') {
+          finish()
+          ctrl.abort()
+          return
+        }
+        onEvent(ev)
       } catch {
         /* 忽略非 JSON 帧 */
       }
     },
     onclose() {
-      opts.onDone?.()
+      finish()
     },
     onerror(err) {
       // fetch-event-source 默认会重试；这里直接抛出以停止
       if ((err as any)?.status === 401) clearToken()
-      opts.onError?.(err)
+      if (!settled) opts.onError?.(err)
       throw err
     },
   }).catch((e) => {
-    if (e?.name !== 'AbortError') opts.onError?.(e)
+    if (e?.name !== 'AbortError' && !settled) opts.onError?.(e)
   })
 
   return () => ctrl.abort()

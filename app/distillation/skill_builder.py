@@ -1566,17 +1566,26 @@ def _write_main_skill_md(skill_dir: Path, scenario: Scenario,
     md = _skill_frontmatter(
         "scenario-main",
         (
-            f"Execute the {scenario.name} business scenario outputs. Use when an agent needs packaged outputs "
-            f"and knowledge-row inspection for {scenario.name} business data."
+            f"[严禁自行实现] Run the {scenario.name} business scenario via skill_executor.py only. "
+            f"DO NOT read skill configs/scripts or create your own scripts to bypass the executor. "
+            f"Use when an agent needs packaged outputs and knowledge-row inspection for {scenario.name} business data."
             if has_knowledge else
-            f"Execute the {scenario.name} business scenario outputs. Use when an agent needs deterministic "
-            f"pipeline processing for {scenario.name} business data."
+            f"[严禁自行实现] Run the {scenario.name} business scenario via skill_executor.py only. "
+            f"DO NOT read skill configs/scripts or create your own scripts to bypass the executor. "
+            f"Use when an agent needs deterministic pipeline processing for {scenario.name} business data."
         ),
     ) + f"""
 
 # 主技能
 
 **执行模式**：{mode_desc}
+
+## 🚨 重要：禁止自行实现
+
+本能力包的所有业务操作（表结构查询、数据查询、规则判断、结果产出）**只能通过 skill_executor.py 执行器完成**。
+- **禁止**读取 `main_skill/` 下的 JSON/配置文件来替代运行执行器。
+- **禁止**临时创建 Python/SQL 脚本或使用 shell 重写业务逻辑。
+- **禁止**自行推理或编造表结构、字段名、关联关系——必须运行执行器获取。
 
 ## 接口
 
@@ -1600,7 +1609,7 @@ python scripts/skill_executor.py {first_id} /data ./out
 ```
 
 ## 上下文资源
-- 所有结构化信息（表结构、字段语义、关联关系、产出规格、知识表配置）**已通过 action tools 提供**，
+- 所有结构化信息（表结构、字段语义、关联关系、产出规格、知识表配置）**已通过 skill_executor.py 提供**，
   不应直接读取 JSON 配置文件。
 - 宿主 Agent 平台负责附件上传、文件预览和结果文件下载。
 """
@@ -2033,11 +2042,6 @@ def _write_manifest(
         "execution_mode": mode,
         "has_knowledge_table": bool(dispatch.get("knowledge_table")),
         "knowledge_table": dispatch.get("knowledge_table", ""),
-        # MCP 能力包指针；Skill-only 发布物由 release builder 单独生成。
-        "mcp": {
-            "descriptor": "mcp.json",
-            "config_example": "mcp_config.example.json",
-        },
         "skills": skills_index,
         "outputs": outputs_summary,
         "tools": tools_def,
@@ -2127,18 +2131,49 @@ def _write_subagent_system_prompt(
     此 prompt 是自包含的——粘贴到任何第三方 Agent 平台（Claude Desktop、
     Cursor、Cline 等）或本平台的 agent_config.json 中都无需再手动修改。
     """
-    required_tables = "、".join(card.get("required_tables") or []) or "调用 describe_schema 获取表结构"
-    tool_descriptions = "\n".join(
-        f"- `{t.get('name', '')}`：{t.get('description', '')[:150]}"
-        for t in tools if t.get("name")
-    ) or "（无可用业务动作）"
-    tool_names = [t.get("name", "") for t in tools if t.get("name")]
-    tool_list_bullet = "\n".join(f"  - `{name}`" for name in tool_names)
+    required_tables = "、".join(card.get("required_tables") or []) or "（运行 skill_executor.py 查看表结构）"
     when = "\n".join(f"- {item}" for item in card.get("when_to_use", [])) or "- 用户诉求明确落入本业务场景"
     not_for = "\n".join(f"- {item}" for item in card.get("not_for", [])) or "- 与本场景无关的任务"
     has_knowledge = bool(card.get("knowledge_table"))
 
+    # 从 tools 构造自然语言能力描述（不含 MCP 工具名）
+    action_descriptions = []
+    for t in tools:
+        name = t.get("name", "")
+        desc = t.get("description", "")
+        # 提取工具描述中 "：" 之前的部分作为能力标签
+        label = desc.split("：")[0][:40] if "：" in desc else desc.split("。")[0][:40]
+        if label and "严禁" not in label:
+            action_descriptions.append(f"- **{label}**")
+        elif name:
+            action_descriptions.append(f"- 支持 `{name}` 对应操作")
+    if not action_descriptions:
+        action_descriptions.append("- 运行 `main_skill/scripts/skill_executor.py` 完成业务处理和查询")
+    actions_text = "\n".join(action_descriptions)
+
+    # 附加的工具脚本（条件性存在）
+    extra_scripts = []
+    if has_knowledge:
+        extra_scripts.append("  - 知识搜索：`skill_knowledge_search/scripts/search_knowledge.py`")
+        extra_scripts.append("  - 知识列表：`skill_knowledge_search/scripts/list_knowledge.py`")
+    extra_scripts_text = "\n".join(extra_scripts)
+
     prompt = f"""# {scenario.name} 子 Agent System Prompt
+
+## 🚨 绝对禁止：严禁自行实现业务逻辑
+
+**本技能包的所有业务操作只能通过运行 `main_skill/scripts/skill_executor.py` 完成。这是唯一合法的执行路径。**
+
+禁止以下行为（无论在哪个 Agent 平台）：
+1. **禁止**使用 `read_file` 读取技能目录下的 JSON/配置文件来获取业务信息。
+2. **禁止**临时创建 Python/SQL 脚本或使用 shell/terminal/execute 运行自定义代码。
+3. **禁止**自行推理或编造表结构、字段名、关联关系——必须通过执行器脚本获取。
+4. **禁止**读取 `main_skill/` 下的 `domain_knowledge.json`、`output_specs.json`、`dispatch_config.json`。
+5. 所有业务操作必须通过运行 `skill_executor.py` 或专用工具脚本完成。
+
+> ⚠️ 技能包中的 JSON 和配置文件是给执行器内部使用的。直接读取会导致信息不完整或不一致。
+
+---
 
 你是 `{skill_name}` 业务场景子 Agent，只负责处理「{scenario.name}」相关任务。
 
@@ -2156,28 +2191,24 @@ def _write_subagent_system_prompt(
 
 附件上传、文件预览、结果文件下载由宿主 Agent 平台负责。不要假设本 Skill 可以直接写宿主平台目录。
 
-## 🛑 工具使用纪律（硬性约束）
+## 📋 使用步骤
 
-当前已注册以下可直接调用的业务 action 工具：
+1. **先读 `main_skill/SKILL.md`** 了解本技能完整用法、数据表结构和可用产出。
+2. **运行执行器查看可用产出**：`python main_skill/scripts/skill_executor.py`
+3. **执行目标产出**：`python main_skill/scripts/skill_executor.py <产出ID> /data ./out`
+4. **（可选）自定义 SQL 查询**：`python skill_query_data/scripts/query_data.py --sql "SELECT * FROM \\"表名\\" LIMIT 10" --data_dir /data`
+{extra_scripts_text}
+5. 所有输出结果需要处理后向用户汇报。
 
-{tool_list_bullet}
-
-你必须严格遵守以下纪律：
-
-1. **必须优先调用已注册的 action tools** 完成所有业务操作。所有业务信息（表结构、字段语义、知识条目、关联关系、产出规格）一律通过 action tools 获取。
-2. **禁止**使用 `read_file` 或其他内置文件工具读取技能包目录下的 JSON/配置/脚本文件（如 `domain_knowledge.json`、`output_specs.json`、`dispatch_config.json` 等）来替代调用 action tools。
-3. **禁止**临时创建 Python/SQL 脚本或使用 shell/execute 重写业务逻辑——所有业务处理都必须通过上述 action tools 完成。
-4. **禁止**直接推理或编造表结构、字段名、关联关系——必须先用 `describe_schema` 获取准确结构。
-5. 涉及业务数据查询时，先用 `describe_schema` 确认表名和字段，再用对应的 action tool 执行。
-
-## 可用业务动作
-
-{tool_descriptions}
+## 🛑 绝对禁止的操作
+- **禁止**用 `read_file` 读取 `main_skill/` 下任何 JSON 文件来替代运行执行器
+- **禁止**自己编写 Python/SQL 脚本或用 shell 执行未在此列出的命令
+- **禁止**自行推理表结构、字段名、关联关系——必须运行脚本获取
 
 ## 工作方式
 1. 先确认用户诉求是否匹配本业务场景，不匹配则交还主 Agent。
-2. 先调用 action tools 获取能力说明和 schema，再判断需要哪些表、字段、知识条目和流程节点。""" + (
-    "3. 知识/规则驱动任务要先通过 action tools 定位规则原文，再结合业务数据逐条判断。"
+2. 运行 `skill_executor.py --help` 或读 SKILL.md 了解能力说明和 schema。""" + (
+    "3. 知识/规则驱动任务先运行搜索脚本定位规则原文，再结合业务数据逐条判断。"
     if has_knowledge else
     "3. 按流程节点和表间关系处理业务数据，不假设存在额外知识/规则表。"
 ) + """
@@ -2219,6 +2250,7 @@ def _synthesize_capability_card(
     purposes = [s.purpose for s in steps if s.purpose]
 
     # ---- summary：一句话说清这个能力包干什么 ----
+    ban_note = "【严禁自行实现】本能力包的所有操作必须通过提供的 MCP 工具完成，禁止读取脚本/配置文件自行实现。"
     if scenario.description:
         summary = f"『{name}』业务能力：{scenario.description}"
     elif purposes:
@@ -2227,6 +2259,7 @@ def _synthesize_capability_card(
         summary = f"『{name}』业务能力包（{mode} 模式）"
     if output_names:
         summary += f"。产出：{'、'.join(output_names[:3])}"
+    summary += f"。{ban_note}"
 
     # ---- when_to_use：触发判据 ----
     when_to_use = [f"用户要处理与「{name}」直接相关的业务需求"]
@@ -2284,11 +2317,17 @@ def _mcp_tool_defs(ns: str, card: dict, scenario: Scenario) -> list[dict]:
     has_knowledge = bool(card.get("knowledge_table"))
     trigger = f"（本工具属于「{name}」能力包；仅当用户诉求匹配该能力时才调用）"
 
+    BAN_DIY = (
+        "【严禁自行实现】不要读取技能目录中的任何脚本/配置文件，"
+        "不要自己写 Python/SQL 脚本，不要用 shell 执行命令。"
+        "所有业务数据操作必须通过本工具完成。"
+    )
+
     def tool(action: str, desc: str, props: dict, required: list[str]) -> dict:
         return {
             "name": f"{ns}__{action}",
             "action": action,
-            "description": desc + trigger,
+            "description": desc + " " + BAN_DIY + trigger,
             "inputSchema": {"type": "object", "properties": props, "required": required},
         }
 
@@ -2415,30 +2454,20 @@ def _write_mcp_descriptor(
     sse_url = f"{base}/api/mcp/{scenario.id}/sse"
 
     # ---- mcp.json：能力卡片 + 命名空间化业务动作定义（兼容工具宿主）----
+    # mcp.json 用于内部运行时加载工具定义，不暴露 server 地址（防止第三方 MCP 自动部署）
     mcp_doc = {
         "protocol": "mcp",
         "spec_version": "2024-11-05",
         "scenario_id": scenario.id,
         **card,
-        # 兼容：远程 HTTP(SSE) 交付，仅用于平台托管验证或支持 MCP 的宿主桥接
-        "server": {
-            "transport": "sse",
-            "url": sse_url,
-            "note": "开发/测试用本服务实际访问地址；正式环境在 .env 配 MCP_PUBLIC_BASE_URL",
-        },
-        # 兼容：离线场景可用 stdio 本地起服务（需能访问本包目录）
-        "server_stdio_fallback": {
-            "transport": "stdio",
-            "command": "python",
-            "args": ["-m", "app.runtime.mcp_server", "--pkg", pkg_abs],
-        },
         "tools": tools,
     }
     (skill_dir / "mcp.json").write_text(
         json.dumps(mcp_doc, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    # ---- mcp_config.example.json：兼容 MCP 宿主的配置片段（远程 URL 化）----
+    # ---- _mcp_config.example.json：兼容 MCP 宿主的配置片段（远程 URL 化）----
+    # 以下划线开头避免 Cursor/Cline 等平台自动检测为 MCP 配置
     config_example = {
         "mcpServers": {
             f"bfe-{ns}": {
@@ -2447,7 +2476,7 @@ def _write_mcp_descriptor(
             }
         }
     }
-    (skill_dir / "mcp_config.example.json").write_text(
+    (skill_dir / "_mcp_config.example.json").write_text(
         json.dumps(config_example, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 

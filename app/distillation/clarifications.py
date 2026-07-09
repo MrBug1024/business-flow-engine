@@ -72,6 +72,33 @@ def normalized_question_texts(clarifications: Iterable[Clarification]) -> list[s
     return [c.question for c in clarifications]
 
 
+def build_clarifications_from_text(
+    text: str,
+    *,
+    context: str = "assistant",
+    max_items: int = 6,
+) -> list[Clarification]:
+    """从普通回复文本里兜底提取待确认问题，转成结构化交互项。
+
+    这不是语义推理，只是防漏网：当模型把本该走弹窗的问题写进正文时，
+    后端仍补发 `interaction`，让用户可以点选或自定义回答。
+    """
+    candidates: list[str] = []
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        line = re.sub(r"^[-*•\d.、\s]+", "", line).strip()
+        if not line or len(line) < 8 or len(line) > 240:
+            continue
+        if line.startswith(("```", "|", "#")):
+            continue
+        if not _looks_like_confirmation(line):
+            continue
+        candidates.append(line)
+        if len(candidates) >= max_items:
+            break
+    return build_clarifications(candidates, context=context, max_items=max_items)
+
+
 def _to_clarification(question: str) -> tuple[str, Clarification | None]:
     if _is_noise(question):
         return _normal_key(question), None
@@ -156,6 +183,16 @@ def _to_clarification(question: str) -> tuple[str, Clarification | None]:
         ],
         allow_custom=True,
     )
+
+
+def _looks_like_confirmation(line: str) -> bool:
+    if _is_noise(line):
+        return False
+    if any(token in line for token in ("是否", "是不是", "怎么处理", "如何处理", "请确认", "需要确认")):
+        return True
+    if line.endswith(("？", "?")) and any(token in line for token in ("吗", "哪", "要不要", "是否")):
+        return True
+    return False
 
 
 def _parse_relation_question(question: str) -> _RelationQuestion | None:

@@ -28,19 +28,31 @@
       </div>
     </div>
 
-    <el-dialog v-model="createDialog" title="新建业务场景" width="440px">
-      <el-input v-model="newName" placeholder="场景名称（如：医保审计）" size="large" style="margin-bottom: 12px" />
-      <el-input v-model="newDesc" type="textarea" :rows="2" placeholder="一句话描述（可选）" />
+    <el-dialog v-model="createDialog" title="新建业务场景" width="560px">
+      <div class="create-form">
+        <label class="field-label">场景名称</label>
+        <el-input v-model="newName" placeholder="例如：医保审计" size="large" maxlength="120" />
+        <label class="field-label">业务说明</label>
+        <p class="field-tip">说明这个业务是做什么的、主要有什么数据、最后要产出什么结果。</p>
+        <el-input
+          v-model="newDesc"
+          type="textarea"
+          :rows="5"
+          maxlength="2000"
+          show-word-limit
+          placeholder="例如：审计员根据规则表，从就诊、结算、项目明细等业务数据中识别违规记录，并输出违规原因、规则依据和处理结果。"
+        />
+      </div>
       <template #footer>
         <el-button @click="createDialog = false">取消</el-button>
-        <el-button type="primary" :disabled="!newName.trim()" @click="doCreate">创建</el-button>
+        <el-button type="primary" :disabled="!canCreate" @click="doCreate">创建</el-button>
       </template>
     </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { Plus, Delete, FolderOpened } from '@element-plus/icons-vue'
 import { ElMessageBox } from 'element-plus'
 import { useScenarioStore } from '@/stores/scenarios'
@@ -52,6 +64,7 @@ const emit = defineEmits<{ (e: 'select', id: string): void }>()
 const createDialog = ref(false)
 const newName = ref('')
 const newDesc = ref('')
+const canCreate = computed(() => Boolean(newName.value.trim() && newDesc.value.trim()))
 
 const STATUS: Record<string, string> = {
   created: '未开始', tables_uploaded: '已上传', trace_sampled: '已追踪', relations_deduced: '已推关联',
@@ -68,6 +81,7 @@ function statusLabel(s: Scenario) {
 }
 
 async function doCreate() {
+  if (!canCreate.value) return
   const sc = await store.create(newName.value.trim(), newDesc.value.trim())
   createDialog.value = false
   newName.value = ''
@@ -129,4 +143,8 @@ async function remove(s: Scenario) {
   transition: all var(--dur) var(--ease);
 }
 .del:hover { background: var(--danger-soft); color: var(--danger); }
+
+.create-form { display: flex; flex-direction: column; gap: 10px; }
+.field-label { font-size: var(--text-sm); font-weight: 700; color: var(--text-1); }
+.field-tip { margin: -4px 0 0; color: var(--text-3); font-size: var(--text-sm); line-height: 1.6; }
 </style>

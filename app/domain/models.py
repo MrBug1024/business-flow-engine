@@ -440,7 +440,12 @@ class ChatMessage(BaseModel):
 # ===========================================================================
 class CreateScenarioRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
-    description: str = ""
+    description: str = Field(..., min_length=1, max_length=2000)
+
+
+class UpdateScenarioRequest(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    description: Optional[str] = Field(default=None, max_length=2000)
 
 
 class ChatRequest(BaseModel):
