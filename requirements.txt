@@ -1,29 +1,21 @@
-# 业务流逆向工程引擎 —— 基础依赖（严格遵循文档指定版本）
-langchain>=1.3.0
+# Agent runtime and durable checkpoints
+langchain==1.3.4
 langgraph==1.2.4
-langchain-openai==1.2.1
-deepagents==0.6.8
+langgraph-checkpoint-sqlite==3.1.0
+deepagents==0.6.7
 
-# Web 服务与流式响应（SSE）
-fastapi>=0.115.0
-uvicorn>=0.32.0
-sse-starlette>=2.3.0
-python-multipart>=0.0.9
+# Web API and uploads
+fastapi==0.115.6
+uvicorn==0.32.1
+python-multipart==0.0.20
+httpx==0.27.2
 
-# 配置与数据处理
-pydantic>=2.10.0
-pydantic-settings>=2.7.0
-python-dotenv>=1.0.0
-pandas>=2.2.0
-openpyxl>=3.1.0
-python-calamine>=0.7.0  # 大 Excel 表整表加载用（关联/追踪采样需要搜全表，实测比 openpyxl 快 5倍+）
-duckdb>=1.1.0  # 技能运行时：在新数据上跑 SQL 模板（规范 Section 7）
+# Configuration and validation
+pydantic==2.13.4
+pydantic-settings==2.7.0
+python-dotenv==1.0.1
+jsonschema==4.23.0
+PyYAML==6.0.2
 
-# MCP 标准接入：把蒸馏出的业务场景能力作为 stdio MCP Server 交付给第三方 Agent 宿主零改动挂载
-mcp>=1.2.0
-langchain-mcp-adapters>=0.1.0
-
-# 鉴权与用户体系（系统数据用内嵌 SQLite；OAuth 授权码流程用 httpx 手写，无需 authlib）
-PyJWT>=2.8.0
-bcrypt>=4.0.0
-email-validator>=2.0.0  # pydantic EmailStr 校验用
+# Standards-based MCP client
+mcp==1.28.1

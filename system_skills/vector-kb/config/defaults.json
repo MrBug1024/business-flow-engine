@@ -1,0 +1,6 @@
+{
+  "base_url": "http://10.0.10.2:8100",
+  "library_id": "yibao_shenji",
+  "api_key": "",
+  "timeout_seconds": 30
+}

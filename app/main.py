@@ -1,9 +1,4 @@
-"""FastAPI 应用装配（v1.1.0：前后端分离）。
-
-- `/`         → 新 Vue3 SPA（frontend/dist；未构建时回退提示）
-- `/legacy`   → 旧原生 HTML 前端（回退对照）
-- `/api/*`    → REST + SSE 接口（含鉴权 /api/auth/*、蒸馏、Agent 平台 /api/playground/*）
-"""
+"""FastAPI application for AI Business Studio."""
 
 from __future__ import annotations
 
@@ -11,55 +6,79 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__
-from .api import api_router
-from .api.mcp_http import register_mcp_routes
-from .auth.db import init_db
+from app import __version__
+from app.api import api_router
 from app.core.config import settings
+from app.studio.settings import studio_settings
 
-# 初始化系统数据库（用户/OAuth 身份表），幂等
-init_db()
 
 ROOT = Path(__file__).resolve().parent.parent
-DIST_DIR = ROOT / "frontend" / "dist"  # 新 Vue SPA 构建产物
+DIST_DIR = ROOT / "frontend" / "dist"
 
 app = FastAPI(
-    title="零号.奇点工坊",
+    title="AI Business Studio",
     description=(
-        "把历史业务数据逆向蒸馏成任意第三方 Agent 可零改动挂载的业务能力（MCP/Skill）。\n"
-        "前端：Vue3 SPA（/）；旧版：/legacy；接口：/api/*。"
+        "AI-native workspace with configurable models and dynamically discovered "
+        "Tool, Skill, and MCP capabilities."
     ),
     version=__version__,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[],
+    allow_origin_regex=r"^https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$",
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 app.include_router(api_router)
 
-# 远程 MCP 交付端点（/api/mcp/*）。须在挂载 SPA `/` 之前注册，避免被静态回退吞掉。
-register_mcp_routes(app)
-
 
 @app.get("/api/health")
 def health() -> dict:
+    active_model = studio_settings.active_model_config()
+    active_key = active_model.api_key.strip() or settings.openai_api_key.strip()
+    active_base_url = active_model.base_url.strip() or settings.openai_base_url.strip()
     return {
         "status": "ok",
         "version": __version__,
-        "llm_enabled": settings.llm_enabled,
-        "llm_model": settings.llm_model if settings.llm_enabled else None,
+        "llm_enabled": bool(active_key and active_base_url),
+        "llm_model": active_model.model,
         "frontend_built": DIST_DIR.exists(),
         "channels": {
             "spa": "/",
-            "legacy": "/legacy",
-            "auth_api": "/api/auth",
-            "playground_api": "/api/playground",
+            "studio_api": "/api/businesses",
+            "settings_api": "/api/settings",
         },
     }
+
+
+if DIST_DIR.exists():
+    assets_dir = DIST_DIR / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+
+@app.get("/", response_model=None)
+def spa_index():
+    index_file = DIST_DIR / "index.html"
+    if index_file.exists():
+        return FileResponse(index_file)
+    return HTMLResponse(
+        "<h1>AI Business Studio</h1><p>Frontend is not built yet. Run npm run build in frontend.</p>",
+        status_code=503,
+    )
+
+
+@app.get("/{full_path:path}", response_model=None)
+def spa_fallback(full_path: str):
+    if full_path.startswith("api/"):
+        return HTMLResponse('{"detail":"Not Found"}', status_code=404, media_type="application/json")
+    target = DIST_DIR / full_path
+    if target.exists() and target.is_file():
+        return FileResponse(target)
+    return spa_index()
