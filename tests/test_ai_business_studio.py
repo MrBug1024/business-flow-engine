@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import zipfile
 import pytest
 from deepagents.backends.protocol import ExecuteResponse, FileDownloadResponse, FileUploadResponse
 from deepagents.backends.sandbox import BaseSandbox
@@ -111,10 +113,14 @@ def test_ai_business_studio_agent_closed_loop(monkeypatch):
             assert stream.status_code == 200
             events = _sse_events("".join(stream.iter_text()))
         event_types = {event["type"] for event in events}
-        assert {"run_start", "reasoning", "model_call", "token", "done"} <= event_types
+        assert {"run_start", "token", "done"} <= event_types
+        assert not {"reasoning", "model_call"} & event_types
         done = next(event for event in events if event["type"] == "done")
         assert "## Workspace ready" in done["assistant_message"]["content"]
         assert done["run"]["events"]
+        assert not {"reasoning", "token"} & {
+            event["type"] for event in done["run"]["events"]
+        }
         assert "request_user_input" in observed_tools
         reloaded = client.get(f"/api/businesses/{business_id}").json()
         assert len(reloaded["context"]["source_files"]) == 1
@@ -166,6 +172,334 @@ def test_conflicting_legacy_description_is_preserved_as_backup(tmp_path):
     assert (local_store.workspace_dir(record.id) / "scenario.legacy.md").read_text(encoding="utf-8") == (
         "# Different legacy content\n"
     )
+
+
+def test_workspace_tree_hides_internal_field_evidence(tmp_path):
+    local_store = StudioStore(root=tmp_path)
+    record = local_store.create(name="Internal evidence boundary")
+    relation_root = local_store.workspace_dir(record.id) / "outputs" / "data-relations"
+    internal = relation_root / "_field-evidence"
+    internal.mkdir(parents=True)
+    (internal / "relations.mmd").write_text("flowchart LR\n  field_a --> field_b\n", encoding="utf-8")
+    (relation_root / "relations.mmd").write_text("flowchart TB\n  data --> result\n", encoding="utf-8")
+
+    tree = local_store.workspace_tree(record)
+
+    def paths(node):
+        result = {node.path}
+        for child in node.children:
+            result.update(paths(child))
+        return result
+
+    tree_paths = paths(tree)
+    assert "outputs/data-relations/relations.mmd" in tree_paths
+    assert "outputs/data-relations/_field-evidence" not in tree_paths
+    assert "outputs/data-relations/_field-evidence/relations.mmd" not in tree_paths
+
+
+def test_workspace_files_in_any_directory_have_bounded_previews():
+    openpyxl = pytest.importorskip("openpyxl")
+    created = client.post("/api/businesses", json={"name": "Workspace preview"}).json()
+    business_id = created["id"]
+    try:
+        preview_root = store.workspace_dir(business_id) / "outputs" / "nested"
+        preview_root.mkdir(parents=True)
+        (preview_root / "flow.mmd").write_text("flowchart LR\n  A --> B\n", encoding="utf-8")
+        (preview_root / "report.md").write_text("# Report\n\nEvidence is ready.\n", encoding="utf-8")
+        (preview_root / "rows.csv").write_text("name,status\nalpha,ready\nbeta,done\n", encoding="utf-8")
+        (preview_root / "document.pdf").write_bytes(b"%PDF-1.4\n% bounded fixture\n")
+        (preview_root / "image.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        (preview_root / "large.log").write_text("x" * (2 * 1024 * 1024 + 32), encoding="utf-8")
+        with zipfile.ZipFile(preview_root / "notes.docx", "w") as archive:
+            archive.writestr(
+                "word/document.xml",
+                '<w:document xmlns:w="urn:test"><w:body><w:p><w:r><w:t>Previewed Word content</w:t></w:r></w:p></w:body></w:document>',
+            )
+        with zipfile.ZipFile(preview_root / "slides.pptx", "w") as archive:
+            archive.writestr(
+                "ppt/slides/slide1.xml",
+                '<p:sld xmlns:p="urn:p" xmlns:a="urn:a"><p:cSld><a:t>Previewed slide content</a:t></p:cSld></p:sld>',
+            )
+        with zipfile.ZipFile(preview_root / "bundle.zip", "w") as archive:
+            archive.writestr("reports/result.json", "{}")
+        database = sqlite3.connect(preview_root / "evidence.sqlite3")
+        try:
+            database.execute("CREATE TABLE evidence(id TEXT, status TEXT)")
+            database.execute("INSERT INTO evidence VALUES ('E-1', 'ready')")
+            database.commit()
+        finally:
+            database.close()
+        workbook = openpyxl.Workbook()
+        worksheet = workbook.active
+        worksheet.title = "Results"
+        worksheet.append(["Audit results", None])
+        worksheet.merge_cells("A1:B1")
+        worksheet.append(["rule", "outcome"])
+        worksheet.append(["duplicate charge", "matched"])
+        workbook.save(preview_root / "results.xlsx")
+
+        mermaid = client.get(
+            f"/api/businesses/{business_id}/workspace/preview",
+            params={"path": "outputs/nested/flow.mmd"},
+        )
+        assert mermaid.status_code == 200, mermaid.text
+        assert mermaid.json()["kind"] == "mermaid"
+        assert "flowchart LR" in mermaid.json()["text"]
+        assert mermaid.json()["path"] == "outputs/nested/flow.mmd"
+
+        markdown = client.get(
+            f"/api/businesses/{business_id}/workspace/preview",
+            params={"path": "outputs/nested/report.md"},
+        ).json()
+        assert markdown["kind"] == "markdown"
+        assert markdown["raw_url"].startswith(f"/api/businesses/{business_id}/workspace/raw")
+
+        table = client.get(
+            f"/api/businesses/{business_id}/workspace/preview",
+            params={"path": "outputs/nested/rows.csv"},
+        ).json()
+        assert table["kind"] == "table"
+        assert table["columns"] == ["name", "status"]
+        assert table["sample_rows"][1] == {"name": "beta", "status": "done"}
+
+        spreadsheet = client.get(
+            f"/api/businesses/{business_id}/workspace/preview",
+            params={"path": "outputs/nested/results.xlsx"},
+        ).json()
+        assert spreadsheet["kind"] == "table"
+        assert spreadsheet["sheets"][0]["name"] == "Results"
+        assert spreadsheet["sheets"][0]["header_row"] == 2
+        assert spreadsheet["columns"] == ["rule", "outcome"]
+        assert spreadsheet["sample_rows"][0]["outcome"] == "matched"
+
+        pdf = client.get(
+            f"/api/businesses/{business_id}/workspace/preview",
+            params={"path": "outputs/nested/document.pdf"},
+        ).json()
+        assert pdf["kind"] == "pdf"
+
+        expected_previews = {
+            "outputs/nested/image.png": ("image", ""),
+            "outputs/nested/notes.docx": ("document", "Previewed Word content"),
+            "outputs/nested/slides.pptx": ("document", "Previewed slide content"),
+            "outputs/nested/bundle.zip": ("archive", "reports/result.json"),
+            "outputs/nested/evidence.sqlite3": ("database", "ready"),
+        }
+        for path, (kind, expected_text) in expected_previews.items():
+            response = client.get(
+                f"/api/businesses/{business_id}/workspace/preview",
+                params={"path": path},
+            )
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["kind"] == kind
+            assert expected_text in json.dumps(body, ensure_ascii=False)
+
+        large_text = client.get(
+            f"/api/businesses/{business_id}/workspace/preview",
+            params={"path": "outputs/nested/large.log"},
+        ).json()
+        assert large_text["kind"] == "text"
+        assert large_text["truncated"] is True
+        assert len(large_text["text"].encode("utf-8")) == 2 * 1024 * 1024
+
+        inline = client.get(
+            f"/api/businesses/{business_id}/workspace/raw",
+            params={"path": "outputs/nested/flow.mmd"},
+        )
+        assert inline.status_code == 200
+        assert inline.headers["content-disposition"].startswith("inline;")
+        download = client.get(
+            f"/api/businesses/{business_id}/workspace/raw",
+            params={"path": "outputs/nested/flow.mmd", "download": "true"},
+        )
+        assert download.headers["content-disposition"].startswith("attachment;")
+
+        traversal = client.get(
+            f"/api/businesses/{business_id}/workspace/preview",
+            params={"path": "../business.json"},
+        )
+        assert traversal.status_code == 400
+    finally:
+        client.delete(f"/api/businesses/{business_id}")
+
+
+def test_workspace_files_in_any_directory_can_be_deleted_without_regeneration():
+    created = client.post("/api/businesses", json={"name": "Workspace deletion"}).json()
+    business_id = created["id"]
+    try:
+        nested = store.workspace_dir(business_id) / "outputs" / "nested"
+        nested.mkdir(parents=True)
+        (nested / "result.json").write_text('{"status":"ready"}', encoding="utf-8")
+        upload = client.post(
+            f"/api/businesses/{business_id}/files",
+            files=[("files", ("source.csv", b"id,status\n1,ready\n", "text/csv"))],
+        )
+        assert upload.status_code == 200
+
+        arbitrary = client.delete(
+            f"/api/businesses/{business_id}/workspace/file",
+            params={"path": "outputs/nested/result.json"},
+        )
+        assert arbitrary.status_code == 200, arbitrary.text
+        assert arbitrary.json()["deleted"]["path"] == "outputs/nested/result.json"
+        assert not (nested / "result.json").exists()
+
+        registered = client.delete(
+            f"/api/businesses/{business_id}/workspace/file",
+            params={"path": "data/source.csv"},
+        )
+        assert registered.status_code == 200, registered.text
+        assert registered.json()["business"]["files"] == []
+
+        for path in ("context/business_context.json", "graphs/flow.mmd", "description.md"):
+            response = client.delete(
+                f"/api/businesses/{business_id}/workspace/file",
+                params={"path": path},
+            )
+            assert response.status_code == 200, response.text
+
+        reloaded = client.get(f"/api/businesses/{business_id}")
+        assert reloaded.status_code == 200
+        body = reloaded.json()
+        assert {
+            "context/business_context.json", "graphs/flow.mmd", "description.md",
+        } <= set(body["workspace_deleted_paths"])
+        assert not store.description_markdown_path(business_id).exists()
+        assert not (store.context_dir(business_id) / "business_context.json").exists()
+        assert not (store.graphs_dir(business_id) / "flow.mmd").exists()
+
+        tree = client.get(f"/api/businesses/{business_id}/workspace/tree").json()
+
+        def paths(node):
+            result = {node["path"]}
+            for child in node.get("children", []):
+                result.update(paths(child))
+            return result
+
+        tree_paths = paths(tree)
+        assert "description.md" not in tree_paths
+        assert "context/business_context.json" not in tree_paths
+        assert "graphs/flow.mmd" not in tree_paths
+        traversal = client.delete(
+            f"/api/businesses/{business_id}/workspace/file",
+            params={"path": "../business.json"},
+        )
+        assert traversal.status_code == 400
+    finally:
+        client.delete(f"/api/businesses/{business_id}")
+
+
+def test_long_agent_task_automatically_continues_in_a_fresh_run(monkeypatch):
+    observed_segments: list[tuple[int, str, bool]] = []
+
+    def segmented_agent(record, run, *, user_prompt=None, include_history=True, **_kwargs):
+        del record
+        observed_segments.append((run.segment_index, str(user_prompt or ""), include_history))
+        if run.segment_index == 1:
+            raise RuntimeError("maximum context length exceeded")
+        if run.segment_index == 2:
+            run.task_progress = {
+                "task_id": run.task_id,
+                "status": "continuing",
+                "objective": "推导数据关系",
+                "summary": "证据检查点已保存",
+                "work_items": [
+                    {"id": "prepare", "title": "准备证据", "status": "completed"},
+                    {"id": "synthesize", "title": "综合关系", "status": "pending"},
+                ],
+                "artifacts": ["/workspace/outputs/data-relations/synthesis-brief.json"],
+            }
+            yield {"type": "agent_progress", "action": "compact", **run.task_progress}
+            yield {"type": "token", "content": "我已经定位问题，下一步准备修复。"}
+            return
+        assert run.task_progress["status"] == "running"
+        run.task_progress = {
+            **run.task_progress,
+            "status": "completed",
+            "summary": "关系图谱已通过校验",
+            "work_items": [
+                {"id": "prepare", "title": "准备证据", "status": "completed"},
+                {"id": "synthesize", "title": "综合关系", "status": "completed"},
+            ],
+        }
+        yield {"type": "agent_progress", "action": "complete", **run.task_progress}
+        yield {
+            "type": "token",
+            "content": "任务已从工作区检查点继续并完成。",
+        }
+
+    monkeypatch.setattr("app.studio.orchestrator.run_agent", segmented_agent)
+    created = client.post("/api/businesses", json={"name": "Segmented task"}).json()
+    business_id = created["id"]
+    session_id = created["chat_sessions"][0]["id"]
+    try:
+        with client.stream(
+            "POST",
+            f"/api/businesses/{business_id}/chat/stream",
+            json={"message": "推导数据关系", "session_id": session_id},
+        ) as stream:
+            assert stream.status_code == 200
+            events = _sse_events("".join(stream.iter_text()))
+
+        assert not any(item["type"] == "error" for item in events)
+        handoffs = [item for item in events if item["type"] == "task_handoff"]
+        done = next(item for item in events if item["type"] == "done")
+        assert [item["segment_index"] for item in handoffs] == [2, 3]
+        assert done["run"]["segment_index"] == 3
+        assert done["run"]["continued_from_run_id"] == handoffs[-1]["from_run_id"]
+        assert done["assistant_message"]["content"] == "任务已从工作区检查点继续并完成。"
+        assert observed_segments[0] == (1, "推导数据关系", True)
+        assert observed_segments[1][0] == 2
+        assert "多阶段接力的目的只是避免上下文过长" in observed_segments[1][1]
+        assert "从第一个未完成的工作项继续" in observed_segments[1][1]
+        assert observed_segments[1][2] is False
+        assert observed_segments[2][0] == 3
+        assert observed_segments[2][2] is False
+
+        reloaded = store.require(business_id)
+        task_runs = [item for item in reloaded.runs if item.task_id == done["run"]["task_id"]]
+        assert len(task_runs) == 3
+        assert task_runs[0].status == "succeeded"
+        assert "fresh Agent run" in task_runs[0].summary
+        assistant_messages = [item for item in reloaded.messages if item.role == "assistant"]
+        assert [item.kind for item in assistant_messages] == ["progress", "final"]
+        assert assistant_messages[0].progress_action == "compact"
+    finally:
+        client.delete(f"/api/businesses/{business_id}")
+
+
+def test_model_call_safety_limit_does_not_create_more_task_segments(monkeypatch):
+    observed_segments: list[int] = []
+
+    def limited_agent(record, run, **_kwargs):
+        del record
+        observed_segments.append(run.segment_index)
+        raise RuntimeError("Model call limits exceeded: run limit (64/64)")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr("app.studio.orchestrator.run_agent", limited_agent)
+    created = client.post("/api/businesses", json={"name": "Bounded task"}).json()
+    business_id = created["id"]
+    session_id = created["chat_sessions"][0]["id"]
+    try:
+        with client.stream(
+            "POST",
+            f"/api/businesses/{business_id}/chat/stream",
+            json={"message": "推导数据关系", "session_id": session_id},
+        ) as stream:
+            events = _sse_events("".join(stream.iter_text()))
+
+        assert observed_segments == [1]
+        assert not any(item["type"] == "task_handoff" for item in events)
+        error = next(item for item in events if item["type"] == "error")
+        assert "Model call limits exceeded" in error["message"]
+        assert error["assistant_message"]["kind"] == "error"
+        assert "未达到最终验收标准" in error["assistant_message"]["content"]
+        reloaded = store.require(business_id)
+        assert [item.kind for item in reloaded.messages if item.role == "assistant"] == ["error"]
+    finally:
+        client.delete(f"/api/businesses/{business_id}")
 
 
 def test_capability_discovery_is_registry_and_skill_markdown_driven():
@@ -234,6 +568,176 @@ def test_user_input_tool_is_directory_discovered_and_protocol_driven():
         assert open_ended.output["options"] == []
     finally:
         client.delete(f"/api/businesses/{created['id']}")
+
+
+def test_task_progress_merges_business_steps_instead_of_appending_call_logs():
+    created = client.post("/api/businesses", json={"name": "Semantic progress"}).json()
+    business_id = created["id"]
+    try:
+        record = store.require(business_id)
+        session_id = record.chat_sessions[0].id
+        run = AIRun(
+            id="run-progress-test",
+            business_id=business_id,
+            session_id=session_id,
+            task_id="task-progress-test",
+            started_at=1,
+        )
+        record.runs.append(run)
+        capability = next(
+            item for item in discover_capabilities(record)
+            if item.function_name == "report_task_progress"
+        )
+
+        plan = execute_capability(
+            capability,
+            record,
+            {
+                "action": "plan",
+                "objective": "推导整个业务场景的数据关系",
+                "work_items": [
+                    {
+                        "id": "prepare-evidence",
+                        "title": "提取并压缩关系证据",
+                        "status": "running",
+                        "why": "先建立有界、可追溯的证据基础",
+                        "expected": "形成证据卡和综合简报",
+                    },
+                    {
+                        "id": "verify-deliver",
+                        "title": "校验并交付关系产物",
+                        "status": "pending",
+                        "expected": "生成 mmd、md 和 json",
+                    },
+                ],
+                "acceptance_criteria": ["最终状态为 complete"],
+                "message": "我会先形成证据简报，再综合并验收宏观关系图。",
+            },
+            run_id=run.id,
+            session_id=session_id,
+        )
+        update = execute_capability(
+            capability,
+            record,
+            {
+                "action": "update",
+                "work_item_id": "prepare-evidence",
+                "title": "提取并压缩关系证据",
+                "result": "已形成 24 张核心证据卡",
+                "verification": "prepare-status 为 ready_for_synthesis",
+                "next_step": "综合主链与分支",
+                "artifacts": ["/workspace/outputs/data-relations/synthesis-brief.json"],
+                "message": "5 份材料的证据简报已完成，接下来综合宏观数据关系。",
+            },
+            run_id=run.id,
+            session_id=session_id,
+        )
+
+        assert plan.output["work_item_count"] == 2
+        assert update.output["revision"] == 2
+        assert run.plan == ["提取并压缩关系证据", "校验并交付关系产物"]
+        assert run.task_progress["objective"] == "推导整个业务场景的数据关系"
+        assert run.task_progress["work_items"][0] == {
+            "id": "prepare-evidence",
+            "title": "提取并压缩关系证据",
+            "status": "completed",
+            "why": "先建立有界、可追溯的证据基础",
+            "expected": "形成证据卡和综合简报",
+            "result": "已形成 24 张核心证据卡",
+            "verification": "prepare-status 为 ready_for_synthesis",
+        }
+        progress_event = next(
+            event for event in update.emitted_events if event["type"] == "agent_progress"
+        )
+        assert len(progress_event["work_items"]) == 2
+        assert progress_event["artifacts"] == [
+            "/workspace/outputs/data-relations/synthesis-brief.json"
+        ]
+        assert progress_event["message"] == "5 份材料的证据简报已完成，接下来综合宏观数据关系。"
+    finally:
+        client.delete(f"/api/businesses/{business_id}")
+
+
+def test_semantic_progress_becomes_separate_durable_ai_messages(monkeypatch):
+    def staged_agent(record, run, **_kwargs):
+        del record
+        plan = {
+            "task_id": run.task_id,
+            "status": "planned",
+            "objective": "推导宏观数据关系",
+            "work_items": [
+                {"id": "evidence", "title": "形成证据", "status": "running"},
+                {"id": "synthesis", "title": "综合关系", "status": "pending"},
+            ],
+        }
+        run.task_progress = plan
+        yield {
+            "type": "agent_progress",
+            "action": "plan",
+            "message": "我会先盘点材料形成证据，再综合并校验宏观关系。",
+            **plan,
+        }
+        yield {
+            "type": "sandbox_command",
+            "call_id": "scan-1",
+            "name": "证据扫描",
+            "status": "succeeded",
+            "summary": "5 files covered",
+        }
+        update = {
+            **plan,
+            "status": "running",
+            "summary": "5 份材料已形成有界证据",
+            "next_step": "综合宏观关系",
+            "revision": 2,
+            "work_items": [
+                {"id": "evidence", "title": "形成证据", "status": "completed"},
+                {"id": "synthesis", "title": "综合关系", "status": "running"},
+            ],
+        }
+        run.task_progress = update
+        yield {
+            "type": "agent_progress",
+            "action": "update",
+            "work_item_id": "evidence",
+            "message": "已覆盖 5 份材料；字段联系只保留为证据，下一步综合宏观关系。",
+            **update,
+        }
+        run.task_progress = {**update, "status": "completed", "revision": 3}
+        yield {
+            "type": "agent_progress",
+            "action": "complete",
+            "message": "宏观关系图已通过验收。",
+            **run.task_progress,
+        }
+        yield {"type": "token", "content": "关系图、说明和 JSON 已生成。"}
+
+    monkeypatch.setattr("app.studio.orchestrator.run_agent", staged_agent)
+    created = client.post("/api/businesses", json={"name": "Multi-message task"}).json()
+    business_id = created["id"]
+    session_id = created["chat_sessions"][0]["id"]
+    try:
+        with client.stream(
+            "POST",
+            f"/api/businesses/{business_id}/chat/stream",
+            json={"message": "推导数据关系", "session_id": session_id},
+        ) as stream:
+            events = _sse_events("".join(stream.iter_text()))
+
+        progress_events = [item for item in events if item["type"] == "progress_message"]
+        assert [item["message"]["progress_action"] for item in progress_events] == [
+            "plan", "update",
+        ]
+        reloaded = store.require(business_id)
+        messages = [item for item in reloaded.messages if item.role == "assistant"]
+        assert [item.kind for item in messages] == ["progress", "progress", "final"]
+        assert messages[0].content.startswith("我会先盘点材料")
+        assert not any(item["type"] == "sandbox_command" for item in messages[0].activity_events)
+        assert any(item["type"] == "sandbox_command" for item in messages[1].activity_events)
+        assert messages[2].content == "关系图、说明和 JSON 已生成。"
+        assert messages[2].progress["status"] == "completed"
+    finally:
+        client.delete(f"/api/businesses/{business_id}")
 
 
 def test_thinking_markup_is_streamed_as_a_separate_channel():

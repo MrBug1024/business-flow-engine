@@ -8,10 +8,12 @@ from collections.abc import Iterator
 from pathlib import Path
 from time import time
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 
+from app.studio.file_preview import preview_workspace_file
 from app.studio.graphs import entity_graph, evidence_graph, flow_graph, lineage_graph
 from app.studio.models import (
     BusinessContext,
@@ -64,6 +66,57 @@ def get_business(business_id: str) -> BusinessRecord:
 def workspace_tree(business_id: str) -> WorkspaceNode:
     record = _record_or_404(business_id)
     return store.workspace_tree(record)
+
+
+@router.get("/businesses/{business_id}/workspace/preview")
+def preview_workspace_path(business_id: str, path: str) -> dict[str, Any]:
+    record = _record_or_404(business_id)
+    source, relative = _resolve_workspace_file(business_id, path)
+    payload = preview_workspace_file(source)
+    registered = next(
+        (
+            item
+            for item in record.files
+            if Path(item.storage_path).resolve() == source
+        ),
+        None,
+    )
+    encoded_path = quote(relative, safe="")
+    payload.update({
+        "path": relative,
+        "file": registered,
+        "raw_url": f"/api/businesses/{business_id}/workspace/raw?path={encoded_path}",
+        "download_url": f"/api/businesses/{business_id}/workspace/raw?path={encoded_path}&download=true",
+    })
+    return payload
+
+
+@router.get("/businesses/{business_id}/workspace/raw")
+def raw_workspace_path(business_id: str, path: str, download: bool = False) -> FileResponse:
+    _record_or_404(business_id)
+    source, _relative = _resolve_workspace_file(business_id, path)
+    return FileResponse(
+        source,
+        filename=source.name,
+        media_type=_guess_mime(source.name),
+        content_disposition_type="attachment" if download else "inline",
+    )
+
+
+@router.delete("/businesses/{business_id}/workspace/file")
+def delete_workspace_path(business_id: str, path: str) -> dict[str, Any]:
+    record = _record_or_404(business_id)
+    try:
+        deleted = store.delete_workspace_file(record, path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="无效的工作区文件路径。") from exc
+    if deleted is None:
+        raise HTTPException(status_code=404, detail="工作区文件不存在。")
+    return {
+        "ok": True,
+        "deleted": deleted,
+        "business": record.model_dump(mode="json"),
+    }
 
 
 @router.get("/businesses/{business_id}/description")
@@ -186,6 +239,10 @@ async def upload_business_files(
             uploaded_at=time(),
         )
         record.files.append(meta)
+        uploaded_path = f"data/{dest.name}"
+        record.workspace_deleted_paths = [
+            item for item in record.workspace_deleted_paths if item != uploaded_path
+        ]
         uploaded.append(meta)
 
     record.status = "files_uploaded"
@@ -308,7 +365,11 @@ def create_chat_session(
 @router.delete("/businesses/{business_id}/chat/sessions/{session_id}", response_model=BusinessRecord)
 def delete_chat_session(business_id: str, session_id: str) -> BusinessRecord:
     record = _record_or_404(business_id)
-    clear_runtime_thread(business_id, session_id)
+    clear_runtime_thread(
+        business_id,
+        session_id,
+        tuple(item.id for item in record.runs if item.session_id == session_id),
+    )
     deleted = store.delete_chat_session(record, session_id)
     if deleted is None:
         raise HTTPException(status_code=404, detail="Chat session not found.")
@@ -321,7 +382,11 @@ def delete_chat_session(business_id: str, session_id: str) -> BusinessRecord:
 )
 def clear_chat_session(business_id: str, session_id: str) -> BusinessRecord:
     record = _record_or_404(business_id)
-    clear_runtime_thread(business_id, session_id)
+    clear_runtime_thread(
+        business_id,
+        session_id,
+        tuple(item.id for item in record.runs if item.session_id == session_id),
+    )
     session = store.clear_chat_session(record, session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Chat session not found.")
@@ -486,6 +551,21 @@ def _safe_filename(filename: str) -> str:
     if not cleaned:
         return "upload.bin"
     return cleaned[:180]
+
+
+def _resolve_workspace_file(business_id: str, requested_path: str) -> tuple[Path, str]:
+    workspace = store.workspace_dir(business_id).resolve()
+    normalized = requested_path.replace("\\", "/").strip("/")
+    relative = Path(normalized)
+    if not normalized or "\x00" in normalized or relative.is_absolute() or ".." in relative.parts:
+        raise HTTPException(status_code=400, detail="无效的工作区文件路径。")
+    try:
+        source = (workspace / relative).resolve()
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="无效的工作区文件路径。") from exc
+    if workspace not in source.parents or not source.is_file():
+        raise HTTPException(status_code=404, detail="工作区文件不存在。")
+    return source, source.relative_to(workspace).as_posix()
 
 
 def _preview_sheets(sheets: list[dict[str, Any]]) -> list[dict[str, Any]]:

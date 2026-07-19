@@ -7,6 +7,7 @@ import pytest
 from deepagents.backends.protocol import ExecuteResponse, FileDownloadResponse, FileUploadResponse
 from deepagents.backends.sandbox import BaseSandbox
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.sqlite import SqliteSaver
 
@@ -20,11 +21,12 @@ from app.studio.execution_ledger import (
 from app.studio.llm import ModelStreamEvent, ModelToolCall
 from app.studio.graph_runtime import (
     StudioGraphRuntime,
+    _StudioSummarizationMiddleware,
     _runtime_tool_failed,
     _skill_for_sandbox_command,
 )
 from app.studio.model_adapter import StudioChatModel
-from app.studio.models import AIRun, BusinessContext, BusinessRecord
+from app.studio.models import AIRun, BusinessContext, BusinessRecord, ChatMessage
 
 
 class _FakeSandboxBackend(BaseSandbox):
@@ -482,23 +484,11 @@ def test_graph_runtime_maps_a_complete_tool_loop_to_stable_studio_events(
     assert [item["status"] for item in tool_events] == ["running", "succeeded"]
     assert tool_events[-1]["output"] == "Context loaded"
     assert tool_events[-1]["replayed"] is False
-    assert {item["type"] for item in events} >= {
-        "model_call",
-        "reasoning",
-        "tool_call",
-        "context_read",
-        "token",
-    }
+    assert {item["type"] for item in events} >= {"tool_call", "context_read", "token"}
+    assert not {"model_call", "reasoning"} & {item["type"] for item in events}
     assert "".join(
         str(item.get("content") or "") for item in events if item["type"] == "token"
     ) == "The context is loaded."
-    model_events = [item for item in events if item["type"] == "model_call"]
-    assert [item["status"] for item in model_events] == [
-        "running",
-        "succeeded",
-        "running",
-        "succeeded",
-    ]
     assert run.tool_invocations == [
         {
             "call_id": "call-context-1",
@@ -510,7 +500,7 @@ def test_graph_runtime_maps_a_complete_tool_loop_to_stable_studio_events(
     ]
 
 
-def test_graph_runtime_appends_each_new_user_turn_to_an_existing_thread(
+def test_graph_runtime_isolates_each_agent_run_from_previous_tool_context(
     tmp_path,
     monkeypatch,
 ):
@@ -561,11 +551,11 @@ def test_graph_runtime_appends_each_new_user_turn_to_an_existing_thread(
 
     assert observed_messages == [
         ["first request"],
-        ["first request", "turn complete", "second request"],
+        ["second request"],
     ]
 
 
-def test_graph_runtime_appends_new_turns_with_the_production_sqlite_checkpointer(
+def test_graph_runtime_isolates_runs_with_the_production_sqlite_checkpointer(
     tmp_path,
     monkeypatch,
 ):
@@ -613,8 +603,84 @@ def test_graph_runtime_appends_new_turns_with_the_production_sqlite_checkpointer
 
     assert observed_messages == [
         ["first request"],
-        ["first request", "turn complete", "second request"],
+        ["second request"],
     ]
+
+
+def test_graph_runtime_bounds_user_visible_chat_history_without_tool_transcripts(
+    tmp_path,
+    monkeypatch,
+):
+    observed: list[dict] = []
+
+    def model_turn(record, messages, requested_model, tools):
+        del record, requested_model, tools
+        observed.extend(item for item in messages if item.get("role") != "system")
+        yield ModelStreamEvent(kind="content", content="bounded")
+        yield ModelStreamEvent(kind="completed")
+
+    _configure_runtime_dependencies(monkeypatch, [], lambda capability, record, arguments: _result())
+    runtime = StudioGraphRuntime(
+        checkpointer=InMemorySaver(),
+        ledger=ToolExecutionLedger(tmp_path / "tool-ledger.sqlite3"),
+        model_turn=model_turn,
+    )
+    record = _business_record()
+    record.messages = [
+        ChatMessage(
+            id=f"message-{index}",
+            session_id="session-test",
+            role="assistant" if index % 2 else "user",
+            content=f"history-{index}:" + (str(index % 10) * 5_000),
+            created_at=float(index),
+        )
+        for index in range(20)
+    ]
+
+    list(
+        runtime.stream(
+            record,
+            _run(run_id="run-bounded-history"),
+            requested_model=None,
+            user_prompt="current objective",
+            include_history=True,
+        )
+    )
+
+    history_content = "".join(str(item.get("content") or "") for item in observed[:-1])
+    assert len(history_content) <= 32_000
+    assert "Earlier message content omitted by context budget" in history_content
+    assert observed[-1]["role"] == "user"
+    assert observed[-1]["content"] == "current objective"
+
+
+def test_context_summarization_emits_one_semantic_compaction_event():
+    events: list[dict] = []
+
+    class Runtime:
+        @staticmethod
+        def stream_writer(event):
+            events.append(event)
+
+    middleware = _StudioSummarizationMiddleware(
+        FakeListChatModel(responses=["Objective and verified checkpoint preserved."]),
+        trigger=("tokens", 200),
+        keep=("messages", 2),
+    )
+    state = {
+        "messages": [
+            HumanMessage(id=f"message-{index}", content=f"part-{index}:" + ("x" * 1000))
+            for index in range(6)
+        ]
+    }
+
+    update = middleware.before_model(state, Runtime())
+
+    assert update and update["messages"]
+    assert len(events) == 1
+    assert events[0]["type"] == "context_compaction"
+    assert events[0]["status"] == "completed"
+    assert events[0]["token_count_before"] >= 200
 
 
 def test_graph_runtime_returns_tool_failure_to_the_model_for_recovery(
@@ -1033,11 +1099,13 @@ def test_failed_continuation_can_retry_from_its_durable_graph_checkpoint(
     question["answer"] = "Continue"
     resume_payload = {question["id"]: "Continue"}
 
+    failed_continuation = _run(run_id="run-retry-failed")
+    failed_continuation.resumed_from_run_id = "run-retry-source"
     with pytest.raises(ConnectionError, match="continuation provider failure"):
         list(
             runtime.stream(
                 record,
-                _run(run_id="run-retry-failed"),
+                failed_continuation,
                 requested_model=None,
                 user_prompt=None,
                 resume_payload=resume_payload,
@@ -1045,10 +1113,12 @@ def test_failed_continuation_can_retry_from_its_durable_graph_checkpoint(
         )
     assert continuation_attempts == 3
 
+    retry_continuation = _run(run_id="run-retry-success")
+    retry_continuation.resumed_from_run_id = "run-retry-source"
     retry_events = list(
         runtime.stream(
             record,
-            _run(run_id="run-retry-success"),
+            retry_continuation,
             requested_model=None,
             user_prompt=None,
             resume_payload=resume_payload,

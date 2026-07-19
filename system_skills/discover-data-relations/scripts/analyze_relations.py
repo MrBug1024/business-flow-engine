@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""CLI entry point for progressive, evidence-backed relationship discovery."""
+"""CLI entry point for scenario-level, evidence-backed relationship discovery."""
 
-from progressive_engine import main
+from scenario_engine import main
 
 
 if __name__ == "__main__":

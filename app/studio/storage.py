@@ -228,6 +228,7 @@ class StudioStore:
         self._ensure_workspace(record)
         path = self.description_markdown_path(record.id)
         path.write_text(content, encoding="utf-8")
+        _clear_workspace_tombstone(record, DESCRIPTION_FILENAME)
         record.description = content[:4000]
         _append_requirement_from_description(record, content)
         self.create_version(record, "Updated description.md", "edit_description_markdown", actor="user")
@@ -346,6 +347,13 @@ class StudioStore:
         content: str,
         run_id: str | None = None,
         session_id: str | None = None,
+        *,
+        task_id: str = "",
+        kind: str = "standard",
+        progress_action: str = "",
+        work_item_id: str = "",
+        progress: dict[str, Any] | None = None,
+        activity_events: list[dict[str, Any]] | None = None,
     ) -> ChatMessage:
         session = self.require_chat_session(record, session_id)
         message = ChatMessage(
@@ -355,6 +363,12 @@ class StudioStore:
             content=content,
             created_at=now(),
             run_id=run_id,
+            task_id=task_id,
+            kind=kind,  # type: ignore[arg-type]
+            progress_action=progress_action,
+            work_item_id=work_item_id,
+            progress=progress or {},
+            activity_events=activity_events or [],
         )
         record.messages.append(message)
         session.updated_at = message.created_at
@@ -371,7 +385,83 @@ class StudioStore:
 
     def append_package(self, record: BusinessRecord, package: PackageRecord) -> PackageRecord:
         record.packages.append(package)
+        try:
+            relative = Path(package.storage_path).resolve().relative_to(
+                self.workspace_dir(record.id).resolve()
+            ).as_posix()
+            _clear_workspace_tombstone(record, relative)
+        except (OSError, ValueError):
+            pass
         return package
+
+    def delete_workspace_file(self, record: BusinessRecord, requested_path: str) -> dict[str, Any] | None:
+        with self._lock:
+            workspace = self.workspace_dir(record.id).resolve()
+            normalized = requested_path.replace("\\", "/").strip("/")
+            relative = Path(normalized)
+            if not normalized or "\x00" in normalized or relative.is_absolute() or ".." in relative.parts:
+                raise ValueError("Invalid workspace file path.")
+            try:
+                target = (workspace / relative).resolve()
+            except (OSError, ValueError) as exc:
+                raise ValueError("Invalid workspace file path.") from exc
+            if workspace not in target.parents:
+                raise ValueError("Invalid workspace file path.")
+            if not target.is_file():
+                return None
+
+            relative_path = target.relative_to(workspace).as_posix()
+            registered = next(
+                (
+                    item
+                    for item in record.files
+                    if _same_resolved_file(Path(item.storage_path), target)
+                ),
+                None,
+            )
+            package = next(
+                (
+                    item
+                    for item in record.packages
+                    if _same_resolved_file(Path(item.storage_path), target)
+                ),
+                None,
+            )
+            target.unlink()
+            record.workspace_deleted_paths = sorted(
+                {*record.workspace_deleted_paths, relative_path}
+            )
+            if registered is not None:
+                record.files = [item for item in record.files if item.id != registered.id]
+                record.context.source_files = [
+                    item
+                    for item in record.context.source_files
+                    if item.get("id") != registered.id
+                ]
+                record.context.tool_usages = [
+                    item
+                    for item in record.context.tool_usages
+                    if item.get("source_file_id") != registered.id
+                ]
+            if package is not None:
+                record.packages = [item for item in record.packages if item.id != package.id]
+            if relative_path == DESCRIPTION_FILENAME:
+                record.description = ""
+            evidence_ids = [registered.id] if registered is not None else []
+            self.create_version(
+                record,
+                f"Deleted workspace file {relative_path}",
+                "delete_workspace_file",
+                actor="user",
+                evidence_ids=evidence_ids,
+            )
+            self.save(record)
+            return {
+                "path": relative_path,
+                "filename": target.name,
+                "registered_file_id": registered.id if registered is not None else None,
+                "package_id": package.id if package is not None else None,
+            }
 
     def delete_file(self, record: BusinessRecord, file_id: str) -> Any | None:
         match = next((item for item in record.files if item.id == file_id), None)
@@ -445,17 +535,18 @@ class StudioStore:
         self.settings_dir(record.id)
         changed = _migrate_legacy_description_file(workspace)
         description = self.description_markdown_path(record.id)
-        if not description.exists():
+        if not description.exists() and DESCRIPTION_FILENAME not in record.workspace_deleted_paths:
             description.write_text(_description_markdown(record), encoding="utf-8")
             changed = True
         return changed
 
     def _write_workspace_artifacts(self, record: BusinessRecord) -> None:
         context_payload = record.context.model_dump(mode="json")
-        (self.context_dir(record.id) / "business_context.json").write_text(
-            json.dumps(context_payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        if "context/business_context.json" not in record.workspace_deleted_paths:
+            (self.context_dir(record.id) / "business_context.json").write_text(
+                json.dumps(context_payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
         graph_builders = {
             "entity.mmd": entity_graph,
             "flow.mmd": flow_graph,
@@ -463,16 +554,22 @@ class StudioStore:
             "evidence.mmd": evidence_graph,
         }
         for filename, builder in graph_builders.items():
-            (self.graphs_dir(record.id) / filename).write_text(builder(record.context)["mermaid"], encoding="utf-8")
+            relative = f"graphs/{filename}"
+            if relative not in record.workspace_deleted_paths:
+                (self.graphs_dir(record.id) / filename).write_text(
+                    builder(record.context)["mermaid"],
+                    encoding="utf-8",
+                )
         capability_state = {
             "skills": record.context.skill_references,
             "mcp": record.context.mcp_references,
             "tools": record.context.tool_usages,
         }
-        (self.settings_dir(record.id) / "capabilities.json").write_text(
-            json.dumps(capability_state, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        if "settings/capabilities.json" not in record.workspace_deleted_paths:
+            (self.settings_dir(record.id) / "capabilities.json").write_text(
+                json.dumps(capability_state, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
 
 def _description_markdown(record: BusinessRecord) -> str:
@@ -564,10 +661,28 @@ def _replace_legacy_description_sources(value: Any) -> bool:
     return changed
 
 
+def _same_resolved_file(candidate: Path, target: Path) -> bool:
+    try:
+        return candidate.resolve() == target
+    except OSError:
+        return False
+
+
+def _clear_workspace_tombstone(record: BusinessRecord, relative_path: str) -> None:
+    normalized = relative_path.replace("\\", "/").strip("/")
+    record.workspace_deleted_paths = [
+        item for item in record.workspace_deleted_paths if item != normalized
+    ]
+
+
 def _tree_node(path: Path, base: Path, root_name: str | None = None) -> WorkspaceNode:
     relative = "" if path == base else path.relative_to(base).as_posix()
     if path.is_dir():
-        children = [_tree_node(child, base) for child in sorted(path.iterdir(), key=_sort_key)]
+        children = [
+            _tree_node(child, base)
+            for child in sorted(path.iterdir(), key=_sort_key)
+            if child.name != "_field-evidence"
+        ]
         return WorkspaceNode(
             name=root_name or path.name,
             path=relative,
@@ -604,16 +719,24 @@ def _file_icon(suffix: str, name: str) -> str:
         return "scenario"
     if suffix in {".md", ".markdown"}:
         return "markdown"
-    if suffix in {".csv", ".xlsx", ".xls"}:
+    if suffix in {".csv", ".tsv", ".xlsx", ".xls", ".parquet"}:
         return "table"
-    if suffix in {".json"}:
+    if suffix in {".json", ".jsonl", ".ndjson", ".yaml", ".yml"}:
         return "json"
     if suffix in {".mmd"}:
         return "graph"
-    if suffix in {".zip"}:
+    if suffix in {".zip", ".tar", ".tgz", ".gz", ".bz2", ".xz"}:
         return "package"
-    if suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+    if suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}:
         return "image"
+    if suffix in {".sqlite", ".sqlite3", ".db"}:
+        return "database"
+    if suffix in {".mp4", ".webm", ".mov", ".m4v"}:
+        return "video"
+    if suffix in {".mp3", ".wav", ".ogg", ".m4a", ".flac"}:
+        return "audio"
+    if suffix in {".pdf", ".docx", ".pptx"}:
+        return "document"
     return "file"
 
 

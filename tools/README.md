@@ -32,7 +32,8 @@ example.metadata = {"studio": {"retry_safe": True, "protocol": "custom"}}
 ```
 
 `retry_safe` controls crash recovery in the execution ledger. Protocol values
-are reserved for platform interaction adapters; ordinary tools should omit it.
+are reserved for platform interaction adapters such as `user_input` and
+`task_progress`; ordinary tools should omit it.
 
 Skills are not installed as Tools. Standard `SKILL.md` packages are discovered by
 DeepAgents `SkillsMiddleware`; each complete package is mapped read-only at

@@ -23,6 +23,7 @@ from langchain.agents import create_agent
 from langchain.agents.middleware import (
     ModelCallLimitMiddleware,
     ModelRetryMiddleware,
+    SummarizationMiddleware,
     wrap_tool_call,
 )
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
@@ -48,7 +49,6 @@ from app.studio.skill_middleware import ReloadingSkillsMiddleware
 from app.studio.storage import new_id, store
 
 
-MAX_MODEL_CALLS = 10
 SKILL_SOURCE = "/skills/"
 SKILLS_PROMPT = SKILLS_SYSTEM_PROMPT + """
 
@@ -62,7 +62,37 @@ SKILLS_PROMPT = SKILLS_SYSTEM_PROMPT + """
   Use absolute Skill paths or `cd /skills/<name>` so executions can be attributed to
   the active Skill.
 """
+CONTEXT_SUMMARY_PROMPT = """You compress execution context for an ongoing AI Business
+Studio task. Preserve only information needed to continue accurately. Do not invent
+business steps. Return these concise sections: USER OBJECTIVE, AGREEMENTS AND
+ASSUMPTIONS, ACTIVE WORK ITEM AND WHY, VERIFIED RESULTS, ARTIFACTS/CHECKPOINTS,
+BLOCKERS, NEXT STEP. Preserve exact workspace paths, identifiers, validation errors,
+and user decisions. Omit repetitive tool transcripts and superseded attempts.
+
+<messages>
+{messages}
+</messages>"""
 _BUSINESS_LOCKS: defaultdict[str, threading.RLock] = defaultdict(threading.RLock)
+
+
+class _StudioSummarizationMiddleware(SummarizationMiddleware):
+    """Emit one semantic event when LangChain actually compacts message history."""
+
+    def before_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        messages = state.get("messages", []) if isinstance(state, dict) else []
+        token_count = self.token_counter(messages)
+        update = super().before_model(state, runtime)
+        if update:
+            runtime.stream_writer(
+                {
+                    "type": "context_compaction",
+                    "status": "completed",
+                    "title": "上下文已自动压缩",
+                    "summary": "保留目标、共识、已验证结果、产物和下一步，继续同一任务。",
+                    "token_count_before": token_count,
+                }
+            )
+        return update
 
 
 @dataclass(slots=True)
@@ -184,18 +214,36 @@ class StudioGraphRuntime:
             middleware=[
                 skills_middleware,
                 filesystem_middleware,
+                _StudioSummarizationMiddleware(
+                    model,
+                    trigger=("tokens", max(4_000, settings.agent_context_summarize_tokens)),
+                    keep=(
+                        "tokens",
+                        max(
+                            2_000,
+                            min(
+                                settings.agent_context_keep_tokens,
+                                settings.agent_context_summarize_tokens // 2,
+                            ),
+                        ),
+                    ),
+                    summary_prompt=CONTEXT_SUMMARY_PROMPT,
+                ),
                 ModelRetryMiddleware(max_retries=2, on_failure="error"),
-                ModelCallLimitMiddleware(run_limit=MAX_MODEL_CALLS, exit_behavior="error"),
+                ModelCallLimitMiddleware(
+                    run_limit=max(1, settings.agent_model_call_limit),
+                    exit_behavior="error",
+                ),
                 tool_middleware,
             ],
             checkpointer=self.checkpointer,
             name="ai_business_studio",
         )
 
-        thread_id = self.thread_id(record.id, run.session_id or run.id)
+        thread_id = self.thread_id(record.id, self.checkpoint_id(run))
         config = {
             "configurable": {"thread_id": thread_id},
-            "recursion_limit": 64,
+            "recursion_limit": max(16, settings.agent_graph_recursion_limit),
         }
         snapshot = agent.get_state(config)
         has_checkpoint = bool(snapshot.values)
@@ -217,106 +265,79 @@ class StudioGraphRuntime:
                 )
             }
 
-        model_call_index = 0
-        active_model_call: dict[str, Any] | None = None
-        try:
-            for chunk in agent.stream(
-                graph_input,
-                config,
-                stream_mode=["messages", "updates", "custom"],
-                durability="sync",
-                version="v2",
-            ):
-                chunk_type = chunk.get("type")
-                if chunk_type == "custom":
-                    data = chunk.get("data")
-                    if isinstance(data, dict) and data.get("type"):
-                        yield data
-                    continue
+        for chunk in agent.stream(
+            graph_input,
+            config,
+            stream_mode=["messages", "updates", "custom"],
+            durability="sync",
+            version="v2",
+        ):
+            chunk_type = chunk.get("type")
+            if chunk_type == "custom":
+                data = chunk.get("data")
+                if isinstance(data, dict) and data.get("type"):
+                    yield data
+                continue
 
-                if chunk_type == "messages":
-                    data = chunk.get("data")
-                    if not isinstance(data, tuple) or not data:
-                        continue
-                    message = data[0]
-                    metadata = data[1] if len(data) > 1 and isinstance(data[1], dict) else {}
-                    if metadata.get("langgraph_node") != "model" or not isinstance(
-                        message, (AIMessage, AIMessageChunk)
-                    ):
-                        continue
-                    if active_model_call is None:
-                        active_model_call = {
-                            "call_id": f"model_{run.id}_{model_call_index}",
-                            "started": perf_counter(),
-                            "iteration": model_call_index + 1,
-                        }
-                        yield {
-                            "type": "model_call",
-                            "kind": "model",
-                            "call_id": active_model_call["call_id"],
-                            "name": run.model,
-                            "status": "running",
-                            "iteration": active_model_call["iteration"],
-                        }
-                    reasoning = str(message.additional_kwargs.get("reasoning_content") or "")
-                    if reasoning:
-                        yield {
-                            "type": "reasoning",
-                            "kind": "reasoning",
-                            "status": "streaming",
-                            "content": reasoning,
-                        }
-                    content = _message_text(message.content)
-                    if content:
-                        yield {"type": "token", "content": content}
-                    if _message_is_final(message):
-                        yield _finished_model_event(run, active_model_call, "succeeded")
-                        active_model_call = None
-                        model_call_index += 1
+            if chunk_type == "messages":
+                data = chunk.get("data")
+                if not isinstance(data, tuple) or not data:
                     continue
+                message = data[0]
+                metadata = data[1] if len(data) > 1 and isinstance(data[1], dict) else {}
+                if metadata.get("langgraph_node") != "model" or not isinstance(
+                    message, (AIMessage, AIMessageChunk)
+                ):
+                    continue
+                content = _message_text(message.content)
+                if content:
+                    yield {"type": "token", "content": content}
+                continue
 
-                if chunk_type != "updates":
-                    continue
-                updates = chunk.get("data")
-                if not isinstance(updates, dict) or "__interrupt__" not in updates:
-                    continue
-                if active_model_call is not None:
-                    yield _finished_model_event(run, active_model_call, "succeeded")
-                    active_model_call = None
-                    model_call_index += 1
-                run.status = "waiting_for_user"
-                run.summary = "Waiting for user confirmation."
-                store.save(record)
-                interrupts = updates.get("__interrupt__") or []
-                values = [getattr(item, "value", None) for item in interrupts]
-                question_ids = [
-                    str(question_id)
-                    for value in values
-                    if isinstance(value, dict)
-                    for question_id in value.get("question_ids", [])
-                    if question_id
-                ]
-                if not question_ids:
-                    hitl_questions = _ensure_hitl_questions(record, run, values)
-                    question_ids = [str(item["id"]) for item in hitl_questions]
-                    for question in hitl_questions:
-                        yield {"type": "question", "question": question}
-                yield {
-                    "type": "waiting_for_user",
-                    "status": "waiting_for_user",
-                    "question_ids": question_ids,
-                }
-        except Exception as exc:
-            if active_model_call is not None:
-                failed = _finished_model_event(run, active_model_call, "failed")
-                failed["error"] = str(exc)
-                yield failed
-            raise
+            if chunk_type != "updates":
+                continue
+            updates = chunk.get("data")
+            if not isinstance(updates, dict) or "__interrupt__" not in updates:
+                continue
+            run.status = "waiting_for_user"
+            run.summary = "Waiting for user confirmation."
+            store.save(record)
+            interrupts = updates.get("__interrupt__") or []
+            values = [getattr(item, "value", None) for item in interrupts]
+            question_ids = [
+                str(question_id)
+                for value in values
+                if isinstance(value, dict)
+                for question_id in value.get("question_ids", [])
+                if question_id
+            ]
+            if not question_ids:
+                hitl_questions = _ensure_hitl_questions(record, run, values)
+                question_ids = [str(item["id"]) for item in hitl_questions]
+                for question in hitl_questions:
+                    yield {"type": "question", "question": question}
+            yield {
+                "type": "waiting_for_user",
+                "status": "waiting_for_user",
+                "question_ids": question_ids,
+            }
 
-    def clear_thread(self, business_id: str, session_id: str) -> None:
-        thread_id = self.thread_id(business_id, session_id)
-        self.checkpointer.delete_thread(thread_id)
-        self.ledger.delete_scope(thread_id)
+    def clear_thread(
+        self,
+        business_id: str,
+        session_id: str,
+        run_ids: Sequence[str] = (),
+    ) -> None:
+        execution_ids = {session_id}
+        execution_ids.update(str(run_id) for run_id in run_ids if run_id)
+        for execution_id in execution_ids:
+            thread_id = self.thread_id(business_id, execution_id)
+            self.checkpointer.delete_thread(thread_id)
+            self.ledger.delete_scope(thread_id)
+
+    @staticmethod
+    def checkpoint_id(run: AIRun) -> str:
+        return run.resumed_from_run_id or run.id
 
     @staticmethod
     def thread_id(business_id: str, session_id: str) -> str:
@@ -340,7 +361,7 @@ class StudioGraphRuntime:
                 message = "; ".join(item.message for item in validation_errors[:4])
                 invocation.error = message
                 raise ToolException(f"Invalid capability arguments: {message}")
-            scope = self.thread_id(record.id, run.session_id or run.id)
+            scope = self.thread_id(record.id, self.checkpoint_id(run))
             try:
                 result, replayed = self.ledger.execute_once(
                     scope=scope,
@@ -663,17 +684,43 @@ def _input_messages(
 ) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     if include_history and run.session_id:
-        history = [item for item in record.messages if item.session_id == run.session_id][-20:]
+        history = [
+            item
+            for item in record.messages
+            if item.session_id == run.session_id and item.role in {"user", "assistant", "system"}
+        ][-max(1, settings.agent_history_message_limit):]
         if history and user_prompt and history[-1].role == "user" and history[-1].content == user_prompt:
             history = history[:-1]
-        messages.extend(
-            {"role": item.role, "content": item.content}
-            for item in history
-            if item.role in {"user", "assistant", "system"}
-        )
+        messages.extend(_bounded_history_messages(history, settings.agent_history_character_limit))
     if user_prompt:
         messages.append({"role": "user", "content": user_prompt})
     return messages
+
+
+def _bounded_history_messages(history: Sequence[Any], character_limit: int) -> list[dict[str, str]]:
+    remaining = max(1_000, int(character_limit))
+    selected: list[dict[str, str]] = []
+    for item in reversed(history):
+        if remaining <= 0:
+            break
+        content = str(item.content or "")
+        content = _bounded_message_content(content, min(12_000, remaining))
+        if not content:
+            continue
+        selected.append({"role": str(item.role), "content": content})
+        remaining -= len(content)
+    selected.reverse()
+    return selected
+
+
+def _bounded_message_content(content: str, limit: int) -> str:
+    if len(content) <= limit:
+        return content
+    marker = "\n\n[Earlier message content omitted by context budget]\n\n"
+    available = max(0, limit - len(marker))
+    head = available // 3
+    tail = available - head
+    return content[:head] + marker + content[-tail:]
 
 
 def _message_text(content: Any) -> str:
@@ -688,24 +735,6 @@ def _message_text(content: Any) -> str:
         elif isinstance(block, dict) and block.get("type") in {"text", "output_text"}:
             parts.append(str(block.get("text") or ""))
     return "".join(parts)
-
-
-def _message_is_final(message: AIMessage | AIMessageChunk) -> bool:
-    if isinstance(message, AIMessage) and not isinstance(message, AIMessageChunk):
-        return True
-    return getattr(message, "chunk_position", None) == "last"
-
-
-def _finished_model_event(run: AIRun, active: dict[str, Any], status: str) -> dict[str, Any]:
-    return {
-        "type": "model_call",
-        "kind": "model",
-        "call_id": active["call_id"],
-        "name": run.model,
-        "status": status,
-        "iteration": active["iteration"],
-        "duration_ms": round((perf_counter() - active["started"]) * 1000),
-    }
 
 
 def _skill_resource_for_call(

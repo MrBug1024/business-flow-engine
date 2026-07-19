@@ -27,6 +27,15 @@ class Settings(BaseSettings):
     llm_model: str = "MiniMax-M2"
     llm_temperature: float = 0.0
     llm_parallel_tool_calls: bool = False
+    # Safety ceilings, not workflow targets. Context summarization normally keeps a
+    # task inside one run; a fresh run is reserved for a real context boundary.
+    agent_model_call_limit: int = 64
+    agent_graph_recursion_limit: int = 512
+    agent_auto_continuation_limit: int = 4
+    agent_context_summarize_tokens: int = 96_000
+    agent_context_keep_tokens: int = 24_000
+    agent_history_message_limit: int = 12
+    agent_history_character_limit: int = 32_000
     data_dir: str = "data"
 
     host: str = "127.0.0.1"

@@ -1,5 +1,5 @@
 <template>
-  <details v-if="events.length || plan.length || active" class="agent-activity" :open="active">
+  <details v-if="visible" class="agent-activity" :open="active || (hasSemantic && !compact)">
     <summary>
       <span class="activity-state" :class="{ active }">
         <el-icon v-if="active" class="spin"><Loading /></el-icon>
@@ -11,79 +11,87 @@
     </summary>
 
     <div class="activity-body">
-      <ol v-if="plan.length" class="agent-plan">
-        <li v-for="(item, index) in plan" :key="`${item}-${index}`">
-          <span>{{ index + 1 }}</span>
-          <p>{{ item }}</p>
-        </li>
-      </ol>
-
-      <section v-if="reasoning" class="reasoning-block">
-        <header>
-          <el-icon><Opportunity /></el-icon>
-          <strong>{{ labels.reasoning }}</strong>
-        </header>
-        <p>{{ reasoning }}</p>
+      <section v-if="latestProgress?.objective" class="task-overview">
+        <span>{{ labels.objective }}</span>
+        <strong>{{ latestProgress.objective }}</strong>
+        <p v-if="latestProgress.summary">{{ latestProgress.summary }}</p>
       </section>
 
-      <ol v-if="activityRows.length" class="call-list">
-        <li
-          v-for="row in activityRows"
-          :key="row.key"
-          class="activity-item"
-          :class="[row.kind === 'skill' ? 'skill-activity' : 'standalone-event', row.event.type]"
-        >
-          <template v-if="row.kind === 'skill'">
-            <div class="event-row skill-event-row">
-              <span class="call-icon" :class="row.event.type">
-                <el-icon :class="{ spin: row.event.status === 'running' }">
-                  <component :is="eventIcon(row.event)" />
-                </el-icon>
-              </span>
-              <div class="event-copy">
-                <strong :title="eventLabel(row.event)">{{ eventLabel(row.event) }}</strong>
-                <span class="event-description">{{ eventDescription(row.event) }}</span>
-              </div>
-              <em :class="row.event.status">{{ statusLabel(row.event.status) }}</em>
-            </div>
-
-            <ol v-if="row.children.length" class="skill-children" :aria-label="labels.skillSteps">
-              <li
-                v-for="child in row.children"
-                :key="eventKey(child)"
-                class="skill-child"
-                :class="child.type"
-              >
-                <div class="event-row child-event-row">
-                  <span class="call-icon" :class="child.type">
-                    <el-icon :class="{ spin: child.status === 'running' }">
-                      <component :is="eventIcon(child)" />
-                    </el-icon>
-                  </span>
-                  <div class="event-copy">
-                    <strong :title="eventLabel(child)">{{ eventLabel(child) }}</strong>
-                    <span class="event-description">{{ eventDescription(child) }}</span>
-                  </div>
-                  <em :class="child.status">{{ statusLabel(child.status) }}</em>
-                </div>
-              </li>
-            </ol>
-          </template>
-
-          <div v-else class="event-row">
-            <span class="call-icon" :class="row.event.type">
-              <el-icon :class="{ spin: row.event.status === 'running' }">
-                <component :is="eventIcon(row.event)" />
-              </el-icon>
-            </span>
-            <div class="event-copy">
-              <strong :title="eventLabel(row.event)">{{ eventLabel(row.event) }}</strong>
-              <span class="event-description">{{ eventDescription(row.event) }}</span>
-            </div>
-            <em :class="row.event.status">{{ statusLabel(row.event.status) }}</em>
+      <ol v-if="workItemRows.length" class="work-items" :aria-label="labels.workItems">
+        <li v-for="item in workItemRows" :key="item.id" :class="item.status">
+          <span class="work-status">
+            <el-icon :class="{ spin: item.status === 'running' }">
+              <component :is="statusIcon(item.status)" />
+            </el-icon>
+          </span>
+          <div class="work-copy">
+            <header>
+              <strong>{{ item.title }}</strong>
+              <em>{{ statusLabel(item.status) }}</em>
+            </header>
+            <p v-if="item.why">{{ item.why }}</p>
+            <p v-if="item.expected" class="expected">
+              {{ labels.expected }}：{{ item.expected }}
+            </p>
+            <p v-if="item.result" class="result">{{ item.result }}</p>
+            <p v-if="item.verification" class="verification">
+              {{ labels.verification }}：{{ item.verification }}
+            </p>
           </div>
         </li>
       </ol>
+
+      <section v-else-if="active" class="planning-state" aria-live="polite">
+        <el-icon class="spin"><Loading /></el-icon>
+        <span>{{ labels.planning }}</span>
+      </section>
+
+      <section v-if="continuityNotice" class="continuity-notice">
+        <el-icon><Refresh /></el-icon>
+        <div>
+          <strong>{{ continuityNotice.title }}</strong>
+          <p>{{ continuityNotice.summary }}</p>
+        </div>
+      </section>
+
+      <section v-if="artifacts.length" class="artifact-list" :aria-label="labels.artifacts">
+        <header>
+          <el-icon><Document /></el-icon>
+          <strong>{{ labels.artifacts }}</strong>
+        </header>
+        <ul>
+          <li v-for="artifact in artifacts" :key="artifact"><code>{{ artifact }}</code></li>
+        </ul>
+      </section>
+
+      <details v-if="technicalGroups.length" class="technical-trace">
+        <summary>
+          <span>{{ labels.technicalDetails }}</span>
+          <em>{{ labels.mergedCalls(technicalCallCount) }}</em>
+        </summary>
+
+        <ol class="call-list">
+          <li
+            v-for="group in technicalGroups"
+            :key="group.key"
+            class="activity-item"
+            :class="group.event.type"
+          >
+            <div class="event-row">
+              <span class="call-icon" :class="group.event.type">
+                <el-icon :class="{ spin: group.status === 'running' }">
+                  <component :is="eventIcon(group.event)" />
+                </el-icon>
+              </span>
+              <div class="event-copy">
+                <strong :title="group.label">{{ group.label }}</strong>
+                <span class="event-description">{{ group.description }}</span>
+              </div>
+              <em :class="group.status">{{ statusLabel(group.status) }}</em>
+            </div>
+          </li>
+        </ol>
+      </details>
     </div>
   </details>
 </template>
@@ -94,30 +102,34 @@ import {
   ArrowRight,
   CircleCheck,
   Connection,
-  Cpu,
   Document,
   Loading,
   MagicStick,
   Monitor,
   Opportunity,
+  Refresh,
   Tools,
+  Warning,
 } from '@element-plus/icons-vue'
 
 type TraceEvent = Record<string, any> & { type: string }
-type SkillActivityRow = {
-  kind: 'skill'
-  key: string
-  index: number
-  event: TraceEvent
-  children: TraceEvent[]
+type WorkItem = {
+  id: string
+  title: string
+  status: string
+  why: string
+  expected: string
+  result: string
+  verification: string
 }
-type StandaloneActivityRow = {
-  kind: 'event'
+type TechnicalGroup = {
   key: string
-  index: number
+  label: string
+  description: string
+  count: number
+  status: string
   event: TraceEvent
 }
-type ActivityRow = SkillActivityRow | StandaloneActivityRow
 
 const TRACE_TYPES = new Set([
   'tool_call',
@@ -127,20 +139,21 @@ const TRACE_TYPES = new Set([
   'skill_load',
   'skill_call',
   'mcp_call',
-  'model_call',
   'context_read',
 ])
-const SKILL_CHILD_TYPES = new Set(['skill_resource', 'sandbox_command', 'tool_call', 'mcp_call'])
+const HIDDEN_TECHNICAL_FUNCTIONS = new Set(['report_task_progress', 'request_user_input'])
 
 const props = withDefaults(defineProps<{
   plan?: string[]
   events?: any[]
   active?: boolean
+  compact?: boolean
   language?: 'zh' | 'en'
 }>(), {
   plan: () => [],
   events: () => [],
   active: false,
+  compact: false,
   language: 'zh',
 })
 
@@ -148,16 +161,25 @@ const copy = {
   zh: {
     working: '正在处理',
     completed: '工作过程',
-    reasoning: '思考摘要',
-    skillSteps: 'Skill 内部步骤',
+    workItems: '任务工作项',
+    objective: '任务目标',
+    expected: '预期结果',
+    artifacts: '成果文件',
+    planning: '正在理解目标并制定执行计划',
+    technicalDetails: '运行明细',
+    mergedCalls: (count: number) => `已归并 ${count} 条`,
+    verification: '验收',
+    nextStep: '下一步',
+    noSemantic: '等待 AI 给出任务进展',
     calling: '正在调用...',
     completedCall: '调用完成',
     activatingSkill: '正在加载完整 Skill 包...',
     activatedSkill: '完整 Skill 已激活',
     readingResource: '正在读取 Skill 资源...',
     resourceRead: 'Skill 资源已读取',
-    runningCommand: '正在隔离沙箱中执行...',
-    commandCompleted: '沙箱命令已完成',
+    runningCommand: '正在隔离环境中执行...',
+    commandCompleted: '隔离命令已完成',
+    compacted: '上下文已自动压缩，继续同一任务',
     unnamed: '未命名',
     types: {
       tool_call: 'Tool',
@@ -167,25 +189,35 @@ const copy = {
       skill_load: 'Skill',
       skill_call: 'Skill',
       mcp_call: 'MCP',
-      model_call: 'Model',
       context_read: 'Context',
     } as Record<string, string>,
     statuses: {
+      planned: '已计划',
+      pending: '等待中',
       running: '进行中',
       succeeded: '完成',
       completed: '完成',
       loaded: '已加载',
       failed: '失败',
       cancelled: '已取消',
-      pending: '等待中',
+      blocked: '待确认',
       streaming: '生成中',
+      continuing: '继续中',
     } as Record<string, string>,
   },
   en: {
     working: 'Working',
     completed: 'Process',
-    reasoning: 'Reasoning summary',
-    skillSteps: 'Steps within this Skill',
+    workItems: 'Task work items',
+    objective: 'Objective',
+    expected: 'Expected',
+    artifacts: 'Deliverables',
+    planning: 'Understanding the objective and preparing a plan',
+    technicalDetails: 'Run details',
+    mergedCalls: (count: number) => `${count} entries merged`,
+    verification: 'Verification',
+    nextStep: 'Next',
+    noSemantic: 'Waiting for task progress',
     calling: 'Calling...',
     completedCall: 'Completed',
     activatingSkill: 'Loading the complete Skill package...',
@@ -194,6 +226,7 @@ const copy = {
     resourceRead: 'Skill resource loaded',
     runningCommand: 'Running inside the isolated sandbox...',
     commandCompleted: 'Sandbox command completed',
+    compacted: 'Context compacted; continuing the same task',
     unnamed: 'Unnamed',
     types: {
       tool_call: 'Tool',
@@ -203,35 +236,93 @@ const copy = {
       skill_load: 'Skill',
       skill_call: 'Skill',
       mcp_call: 'MCP',
-      model_call: 'Model',
       context_read: 'Context',
     } as Record<string, string>,
     statuses: {
+      planned: 'Planned',
+      pending: 'Pending',
       running: 'Running',
       succeeded: 'Done',
       completed: 'Done',
       loaded: 'Loaded',
       failed: 'Failed',
       cancelled: 'Cancelled',
-      pending: 'Pending',
+      blocked: 'Input needed',
       streaming: 'Streaming',
+      continuing: 'Continuing',
     } as Record<string, string>,
   },
 }
 
 const labels = computed(() => copy[props.language])
 
-const reasoning = computed(() => props.events
-  .filter((item) => item.type === 'reasoning')
-  .map((item) => item.content || '')
-  .join('')
-  .trim())
+const visible = computed(() => Boolean(
+  props.active
+  || props.plan.length
+  || progressEvents.value.length
+  || technicalGroups.value.length
+  || props.events.some((item) => item.type === 'context_compaction' || item.type === 'task_handoff'),
+))
+
+const progressEvents = computed<TraceEvent[]>(() => props.events
+  .filter((item) => item.type === 'agent_progress'))
+
+const hasSemantic = computed(() => progressEvents.value.length > 0 || props.plan.length > 0)
+
+const latestProgress = computed<TraceEvent | undefined>(() => [...progressEvents.value]
+  .reverse()
+  .find((item) => item.type === 'agent_progress'))
+
+const workItemRows = computed<WorkItem[]>(() => {
+  const rawItems = latestProgress.value?.work_items
+  if (Array.isArray(rawItems) && rawItems.length) {
+    return rawItems
+      .map((item: any, index: number) => ({
+        id: normalized(item.id) || `work-${index + 1}`,
+        title: normalized(item.title) || normalized(item.name) || labels.value.unnamed,
+        status: normalized(item.status) || statusFromProgress(latestProgress.value),
+        why: normalized(item.why || item.expected),
+        expected: normalized(item.expected),
+        result: normalized(item.result),
+        verification: normalized(item.verification),
+      }))
+      .filter((item: WorkItem) => item.title)
+  }
+  return props.plan.map((title, index) => ({
+    id: `plan-${index + 1}`,
+    title,
+    status: props.active && index === 0 ? 'running' : props.active ? 'pending' : 'completed',
+    why: '',
+    expected: '',
+    result: '',
+    verification: '',
+  }))
+})
+
+const continuityNotice = computed(() => {
+  const event = [...props.events]
+    .reverse()
+    .find((item) => item.type === 'context_compaction' || item.type === 'task_handoff')
+  if (!event) return null
+  return {
+    title: normalized(event.title) || labels.value.compacted,
+    summary: normalized(event.summary) || labels.value.compacted,
+  }
+})
+
+const artifacts = computed<string[]>(() => {
+  const values = latestProgress.value?.artifacts
+  return Array.isArray(values)
+    ? [...new Set(values.map((item: unknown) => normalized(item)).filter(Boolean))]
+    : []
+})
 
 const callEvents = computed<TraceEvent[]>(() => {
   const rows: TraceEvent[] = []
   const indexes = new Map<string, number>()
   for (const [rawIndex, event] of props.events.entries()) {
     if (!TRACE_TYPES.has(event.type)) continue
+    if (HIDDEN_TECHNICAL_FUNCTIONS.has(normalized(event.function_name || event.name))) continue
     const key = traceIdentity(event)
     if (key && indexes.has(key)) {
       const rowIndex = indexes.get(key)!
@@ -245,65 +336,53 @@ const callEvents = computed<TraceEvent[]>(() => {
   return rows
 })
 
-const activityRows = computed<ActivityRow[]>(() => {
-  const skillRows = new Map<TraceEvent, SkillActivityRow>()
-  const skillsById = new Map<string, SkillActivityRow>()
-  const skillsByName = new Map<string, SkillActivityRow[]>()
-
-  for (const [index, event] of callEvents.value.entries()) {
-    if (event.type !== 'skill_activation') continue
-    const row: SkillActivityRow = {
-      kind: 'skill',
-      key: `skill-${eventKey(event)}`,
-      index,
-      event,
-      children: [],
-    }
-    skillRows.set(event, row)
-    const skillId = normalized(event.skill_id || event.activation_id)
-    if (skillId) skillsById.set(skillId, row)
-    const skillName = normalized(event.skill_name || event.name)
-    if (skillName) skillsByName.set(skillName, [...(skillsByName.get(skillName) || []), row])
-  }
-
-  const rows: ActivityRow[] = []
-  for (const [index, event] of callEvents.value.entries()) {
-    if (event.type === 'skill_activation') {
-      const row = skillRows.get(event)
-      if (row) rows.push(row)
+const technicalGroups = computed<TechnicalGroup[]>(() => {
+  const groups = new Map<string, TechnicalGroup & { events: TraceEvent[] }>()
+  for (const event of callEvents.value) {
+    const key = technicalGroupKey(event)
+    const current = groups.get(key)
+    if (current) {
+      current.count += 1
+      current.events.push(event)
+      current.event = event
       continue
     }
-
-    const parent = SKILL_CHILD_TYPES.has(event.type)
-      ? linkedSkill(event, index, skillsById, skillsByName)
-      : undefined
-    if (parent) {
-      parent.children.push(event)
-      continue
-    }
-
-    rows.push({
-      kind: 'event',
-      key: `event-${eventKey(event)}`,
-      index,
+    groups.set(key, {
+      key,
+      label: technicalGroupLabel(event),
+      description: '',
+      count: 1,
+      status: normalized(event.status) || 'completed',
       event,
+      events: [event],
     })
   }
-  return rows.sort((left, right) => left.index - right.index)
+  return [...groups.values()].map((group) => {
+    const failed = [...group.events].reverse().find((event) => event.status === 'failed')
+    const running = [...group.events].reverse().find((event) => event.status === 'running')
+    const event = running || failed || group.event
+    return {
+      key: group.key,
+      label: group.label,
+      description: technicalGroupDescription(event, group.count),
+      count: group.count,
+      status: running ? 'running' : failed ? 'failed' : 'succeeded',
+      event,
+    }
+  })
 })
 
+const technicalCallCount = computed(() => technicalGroups.value
+  .reduce((total, group) => total + group.count, 0))
+
 const summaryText = computed(() => {
-  const running = [...callEvents.value].reverse().find((item) => item.status === 'running')
-  if (running) return eventLabel(running)
-  if (callEvents.value.length) {
-    const counts = callEvents.value.reduce((result: Record<string, number>, item: any) => {
-      const key = labels.value.types[item.type] || 'Agent'
-      result[key] = (result[key] || 0) + 1
-      return result
-    }, {})
-    return Object.entries(counts).map(([name, count]) => `${name} ${count}`).join(' · ')
-  }
-  return reasoning.value ? labels.value.reasoning : ''
+  const latest = latestProgress.value
+  const semantic = normalized(latest?.summary || latest?.title || latest?.next_step || latest?.result)
+  if (semantic) return semantic
+  const runningWork = workItemRows.value.find((item) => item.status === 'running')
+  if (runningWork) return runningWork.title
+  if (props.plan.length) return props.plan[0]
+  return props.active ? labels.value.planning : labels.value.noSemantic
 })
 
 function eventKey(event: any) {
@@ -325,10 +404,11 @@ function eventDescription(event: TraceEvent) {
     return event.status === 'running' ? labels.value.readingResource : labels.value.resourceRead
   }
   if (event.type === 'sandbox_command') {
-    const command = displayText(event.command)
+    const command = displayText(event.command || event.input?.command)
     if (command) return command
     return event.status === 'running' ? labels.value.runningCommand : labels.value.commandCompleted
   }
+  if (event.type === 'task_handoff') return labels.value.compacted
   return event.status === 'running' ? labels.value.calling : labels.value.completedCall
 }
 
@@ -336,25 +416,48 @@ function statusLabel(status: string) {
   return labels.value.statuses[status] || status || ''
 }
 
+function statusIcon(status: string) {
+  if (status === 'running') return Loading
+  if (status === 'blocked' || status === 'failed') return Warning
+  if (status === 'completed' || status === 'succeeded' || status === 'loaded') return CircleCheck
+  return Opportunity
+}
+
+function statusFromProgress(event: TraceEvent | undefined) {
+  const status = normalized(event?.status)
+  if (status) return status
+  if (event?.action === 'complete') return 'completed'
+  if (event?.action === 'block') return 'blocked'
+  if (event?.action === 'plan') return 'planned'
+  return 'running'
+}
+
 function traceIdentity(event: TraceEvent) {
   const id = event.call_id || event.id || event.event_id
   return id ? `${event.type}:${id}` : ''
 }
 
-function linkedSkill(
-  event: TraceEvent,
-  eventIndex: number,
-  skillsById: Map<string, SkillActivityRow>,
-  skillsByName: Map<string, SkillActivityRow[]>,
-) {
-  const parentSkillId = normalized(event.parent_skill_id)
-  if (parentSkillId) return skillsById.get(parentSkillId)
+function technicalGroupKey(event: TraceEvent) {
+  if (event.type === 'skill_activation') {
+    return `skill:${normalized(event.skill_name || event.name) || 'unknown'}`
+  }
+  if (event.type === 'skill_resource' || event.type === 'sandbox_command') {
+    return `${event.type}:${normalized(event.skill_name) || 'workspace'}`
+  }
+  return `${event.type}:${normalized(event.function_name || event.name) || 'unknown'}`
+}
 
-  const skillName = normalized(event.skill_name)
-  if (!skillName) return undefined
-  const candidates = skillsByName.get(skillName) || []
-  const previous = [...candidates].reverse().find((row) => row.index <= eventIndex)
-  return previous || (candidates.length === 1 ? candidates[0] : undefined)
+function technicalGroupLabel(event: TraceEvent) {
+  const type = labels.value.types[event.type] || 'Agent'
+  const name = event.type === 'sandbox_command'
+    ? normalized(event.skill_name) || labels.value.unnamed
+    : eventName(event)
+  return `${type} · ${name}`
+}
+
+function technicalGroupDescription(event: TraceEvent, count: number) {
+  const detail = eventDescription(event)
+  return count > 1 ? `${count} × · ${detail}` : detail
 }
 
 function normalized(value: unknown) {
@@ -387,7 +490,7 @@ function eventIcon(event: TraceEvent) {
   if (event.type === 'skill_resource' || event.type === 'context_read') return Document
   if (event.type === 'sandbox_command') return Monitor
   if (event.type === 'mcp_call') return Connection
-  if (event.type === 'model_call') return Cpu
+  if (event.type === 'task_handoff') return Refresh
   return Tools
 }
 </script>
@@ -404,7 +507,7 @@ function eventIcon(event: TraceEvent) {
   grid-template-columns: auto minmax(0, 1fr) 18px;
   gap: 8px;
   align-items: center;
-  min-height: 32px;
+  min-height: 34px;
   padding: 4px 6px;
   border-radius: 5px;
   color: var(--text-muted);
@@ -414,17 +517,19 @@ function eventIcon(event: TraceEvent) {
   transition: background 0.16s ease, color 0.16s ease;
 }
 
-.agent-activity summary::-webkit-details-marker {
+.agent-activity summary::-webkit-details-marker,
+.technical-trace summary::-webkit-details-marker {
   display: none;
 }
 
 .agent-activity summary:hover,
-.agent-activity[open] summary {
+.agent-activity[open] > summary {
   background: color-mix(in srgb, var(--surface-hover) 54%, transparent);
   color: var(--text-main);
 }
 
-.agent-activity summary:focus-visible {
+.agent-activity summary:focus-visible,
+.technical-trace summary:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
@@ -453,7 +558,7 @@ function eventIcon(event: TraceEvent) {
   transition: transform 0.18s ease;
 }
 
-.agent-activity[open] .chevron {
+.agent-activity[open] > summary .chevron {
   transform: rotate(90deg);
 }
 
@@ -465,7 +570,90 @@ function eventIcon(event: TraceEvent) {
   border-left: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
 }
 
-.agent-plan,
+.task-overview {
+  display: grid;
+  gap: 3px;
+  padding: 2px 0 7px;
+}
+
+.task-overview > span {
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.task-overview > strong {
+  color: var(--text-strong);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.task-overview > p,
+.continuity-notice p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.planning-state,
+.continuity-notice {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  min-height: 32px;
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.planning-state {
+  align-items: center;
+}
+
+.continuity-notice > .el-icon {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--accent);
+}
+
+.continuity-notice strong {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--text-main);
+  font-size: 11.5px;
+}
+
+.artifact-list {
+  min-width: 0;
+  padding-top: 2px;
+}
+
+.artifact-list header {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  color: var(--text-main);
+  font-size: 11.5px;
+}
+
+.artifact-list ul {
+  display: grid;
+  gap: 3px;
+  margin: 5px 0 0 20px;
+  padding: 0;
+  list-style: none;
+}
+
+.artifact-list code {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.work-items,
 .call-list {
   display: grid;
   gap: 0;
@@ -474,33 +662,116 @@ function eventIcon(event: TraceEvent) {
   list-style: none;
 }
 
-.agent-plan li {
+.work-items li {
   display: grid;
-  grid-template-columns: 18px minmax(0, 1fr);
+  grid-template-columns: 24px minmax(0, 1fr);
   gap: 8px;
-  align-items: start;
-  padding: 3px 0;
-  color: var(--text-muted);
-  font-size: 11.5px;
-  line-height: 1.55;
+  min-width: 0;
+  padding: 6px 0;
 }
 
-.agent-plan li > span {
+.work-items li + li {
+  border-top: 1px solid var(--border-soft);
+}
+
+.work-status {
   display: grid;
   place-items: center;
-  width: 18px;
-  height: 18px;
+  width: 24px;
+  height: 24px;
   border: 1px solid var(--border);
   border-radius: 50%;
   background: var(--surface-0);
   color: var(--text-muted);
-  font-size: 9px;
 }
 
-.agent-plan p,
+.work-items li.running .work-status {
+  border-color: color-mix(in srgb, var(--accent) 72%, var(--border));
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.work-items li.completed .work-status,
+.work-items li.succeeded .work-status {
+  border-color: color-mix(in srgb, var(--el-color-success) 72%, var(--border));
+  background: color-mix(in srgb, var(--el-color-success) 12%, transparent);
+  color: var(--el-color-success);
+}
+
+.work-items li.blocked .work-status,
+.work-items li.failed .work-status {
+  border-color: color-mix(in srgb, var(--warning) 72%, var(--border));
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+  color: var(--warning);
+}
+
+.work-copy {
+  min-width: 0;
+}
+
+.work-copy header,
+.progress-notes header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.work-copy strong,
+.progress-notes header span {
+  overflow: hidden;
+  color: var(--text-strong);
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.work-copy em,
+.progress-notes em {
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-style: normal;
+  white-space: nowrap;
+}
+
+.work-copy p,
+.progress-notes p,
 .reasoning-block p {
-  margin: 0;
+  margin: 3px 0 0;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
   white-space: pre-wrap;
+}
+
+.work-copy .result,
+.progress-notes .result {
+  color: var(--text-main);
+}
+
+.expected,
+.verification,
+.next-step {
+  color: color-mix(in srgb, var(--accent) 70%, var(--text-muted));
+}
+
+.progress-notes {
+  display: grid;
+  gap: 6px;
+}
+
+.progress-notes article {
+  padding: 7px 9px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--surface-1) 76%, transparent);
+}
+
+.progress-notes article.blocked,
+.progress-notes article.failed {
+  border-color: color-mix(in srgb, var(--warning) 42%, var(--border-soft));
 }
 
 .reasoning-block {
@@ -510,12 +781,55 @@ function eventIcon(event: TraceEvent) {
   line-height: 1.65;
 }
 
+.reasoning-block.compact {
+  padding: 4px 0 8px;
+}
+
 .reasoning-block header {
   display: flex;
   gap: 6px;
   align-items: center;
   margin-bottom: 4px;
   color: var(--text-strong);
+}
+
+.technical-trace {
+  min-width: 0;
+  border: 0;
+}
+
+.technical-trace summary {
+  display: inline-flex;
+  gap: 7px;
+  align-items: center;
+  min-height: 28px;
+  padding: 3px 7px;
+  border: 1px solid var(--border-soft);
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--surface-1) 62%, transparent);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 11px;
+  list-style: none;
+}
+
+.technical-trace summary em {
+  min-width: 16px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-size: 10px;
+  font-style: normal;
+  text-align: center;
+}
+
+.technical-trace[open] summary {
+  color: var(--text-main);
+}
+
+.technical-trace[open] .call-list {
+  margin-top: 6px;
 }
 
 .activity-item {
@@ -532,7 +846,7 @@ function eventIcon(event: TraceEvent) {
   grid-template-columns: 24px minmax(0, 1fr) auto;
   gap: 8px;
   align-items: center;
-  min-height: 40px;
+  min-height: 38px;
 }
 
 .skill-activity {
@@ -639,8 +953,9 @@ function eventIcon(event: TraceEvent) {
   white-space: nowrap;
 }
 
-.event-row em.failed {
-  color: var(--el-color-danger);
+.event-row em.failed,
+.event-row em.blocked {
+  color: var(--warning);
 }
 
 .event-row em.succeeded,
@@ -673,13 +988,20 @@ function eventIcon(event: TraceEvent) {
   }
 
   .reasoning-block,
-  .agent-plan li,
+  .work-copy strong,
+  .work-items li,
   .event-copy strong {
     font-size: 12px;
   }
 }
 
 @media (max-width: 520px) {
+  .event-row,
+  .work-copy header,
+  .progress-notes header {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .event-row {
     grid-template-columns: 24px minmax(0, 1fr);
   }

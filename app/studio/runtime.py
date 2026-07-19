@@ -29,8 +29,12 @@ def run_agent(
     )
 
 
-def clear_runtime_thread(business_id: str, session_id: str) -> None:
-    graph_runtime().clear_thread(business_id, session_id)
+def clear_runtime_thread(
+    business_id: str,
+    session_id: str,
+    run_ids: tuple[str, ...] = (),
+) -> None:
+    graph_runtime().clear_thread(business_id, session_id, run_ids)
 
 
 @lru_cache(maxsize=1)

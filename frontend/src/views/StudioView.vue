@@ -134,6 +134,7 @@
           :class="{ active: isActiveNode(row.node), folder: row.node.kind === 'folder' }"
           :style="{ paddingLeft: `${8 + row.depth * 14}px` }"
           @click="openWorkspaceNode(row.node)"
+          @contextmenu.prevent="openWorkspaceContextMenu(row.node, $event)"
         >
           <span class="chevron" :class="{ open: isExpanded(row.node) }">
             <el-icon v-if="row.node.kind === 'folder'"><ArrowRight /></el-icon>
@@ -142,6 +143,25 @@
           <span class="tree-label" :title="row.node.name">{{ row.node.name }}</span>
         </button>
       </section>
+      <div
+        v-if="workspaceContextMenu"
+        ref="workspaceContextMenuElement"
+        class="workspace-context-menu"
+        :style="{ left: `${workspaceContextMenu.x}px`, top: `${workspaceContextMenu.y}px` }"
+        role="menu"
+        :aria-label="workspaceContextMenu.node.name"
+        @pointerdown.stop
+      >
+        <button
+          class="context-menu-delete"
+          role="menuitem"
+          :disabled="isBusy"
+          @click="deleteWorkspacePath(workspaceContextMenu.node)"
+        >
+          <el-icon><Delete /></el-icon>
+          <span>{{ t('deleteFile') }}</span>
+        </button>
+      </div>
     </aside>
 
     <div
@@ -254,47 +274,42 @@
             <header class="section-head">
               <div>
                 <h1>{{ activeTab.title }}</h1>
-                <p>{{ activeTab.payload?.file?.summary }}</p>
+                <p>{{ activeTab.payload?.path || activeTab.payload?.file?.summary }}</p>
               </div>
               <div class="toolbar-actions">
-                <el-tag :type="activeTab.payload?.file?.parse_status === 'parsed' ? 'success' : 'warning'">
-                  {{ activeTab.payload?.file?.parse_status }}
+                <el-tag :type="activeTab.payload?.error ? 'danger' : activeTab.payload?.loading ? 'info' : 'success'">
+                  {{ activeTab.payload?.loading ? t('filePreviewLoading') : activeTab.payload?.kind || t('file') }}
                 </el-tag>
+                <el-tag v-if="activeTab.payload?.truncated" type="warning">{{ t('filePreviewTruncated') }}</el-tag>
+                <span v-if="activeTab.payload?.size != null" class="file-size">{{ formatFileSize(activeTab.payload.size) }}</span>
                 <el-button
+                  v-if="activeTab.payload?.download_url"
+                  :icon="Download"
+                  @click="downloadWorkspaceFile(activeTab.payload.download_url)"
+                >
+                  {{ t('download') }}
+                </el-button>
+                <el-button :icon="Refresh" :disabled="activeTab.payload?.loading" @click="reloadWorkspacePreview">
+                  {{ t('refresh') }}
+                </el-button>
+                <el-button
+                  v-if="activeTab.payload?.path"
                   :icon="Delete"
                   type="danger"
                   plain
-                  @click="deleteCurrentFile(activeTab.payload?.file)"
+                  :disabled="isBusy"
+                  @click="deleteWorkspacePath({ name: activeTab.title, path: activeTab.payload.path, kind: 'file' })"
                 >
                   {{ t('deleteFile') }}
                 </el-button>
               </div>
             </header>
-            <el-alert
-              v-for="warning in activeTab.payload?.warnings || []"
-              :key="warning"
-              :title="warning"
-              type="warning"
-              show-icon
-              :closable="false"
+            <WorkspaceFilePreview
+              :payload="activeTab.payload"
+              :language="uiLanguage"
+              :theme="themeMode"
+              @retry="reloadWorkspacePreview"
             />
-            <p v-if="activeTab.payload?.sample_rows?.length" class="preview-note">{{ t('filePreviewLimited') }}</p>
-            <el-table
-              v-if="activeTab.payload?.sample_rows?.length"
-              :data="activeTab.payload.sample_rows"
-              height="420"
-              border
-            >
-              <el-table-column
-                v-for="col in activeTab.payload.columns"
-                :key="col"
-                :prop="col"
-                :label="col"
-                min-width="150"
-                show-overflow-tooltip
-              />
-            </el-table>
-            <pre v-else class="text-preview">{{ activeTab.payload?.text || t('noPreview') }}</pre>
           </section>
 
           <section v-else-if="activeTab.kind === 'graph'" class="editor-panel graph-panel">
@@ -537,9 +552,16 @@
         <article
           v-for="message in activeMessages"
           :key="message.id"
-          v-memo="[message.id, message.content, runById[message.run_id]?.status]"
+          v-memo="[
+            message.id,
+            message.content,
+            message.kind,
+            message.activity_events?.length,
+            message.progress?.revision,
+            runById[message.run_id]?.status,
+          ]"
           class="chat-message"
-          :class="message.role"
+          :class="[message.role, message.kind]"
         >
           <header class="message-author">
             <div v-if="message.role === 'user'" class="user-identity">
@@ -564,13 +586,14 @@
             </button>
           </header>
           <div class="message-body">
+            <MarkdownContent :content="message.content" />
             <AgentActivity
               v-if="message.role === 'assistant' && runById[message.run_id]"
-              :plan="runById[message.run_id]?.plan || []"
-              :events="runById[message.run_id]?.events || []"
+              :plan="messageActivityPlan(message)"
+              :events="messageActivityEvents(message)"
+              compact
               :language="uiLanguage"
             />
-            <MarkdownContent :content="message.content" />
           </div>
         </article>
         <article v-if="(isStreaming && !streamCompleted) || streamingAssistant" class="chat-message assistant streaming">
@@ -628,19 +651,63 @@
           </el-button>
         </div>
         <div class="composer-shell">
+          <WorkspaceMentionMenu
+            v-if="mentionMenuOpen"
+            :files="mentionOptions"
+            :active-index="mentionActiveIndex"
+            list-id="workspace-mention-list"
+            :title="t('mentionFile')"
+            :result-label="`${matchingMentionFiles.length} ${t('mentionFileResults')}`"
+            :empty-label="t('mentionFileEmpty')"
+            :hint="t('mentionFileHint')"
+            @activate="mentionActiveIndex = $event"
+            @select="selectMentionFile"
+          />
+          <div v-if="mentionedFiles.length" class="composer-references" :aria-label="t('mentionFile')">
+            <span v-for="file in mentionedFiles" :key="file.path" class="composer-reference" :title="file.path">
+              <el-icon aria-hidden="true"><component :is="nodeIcon({ ...file, kind: 'file' })" /></el-icon>
+              <span>{{ file.name }}</span>
+              <button
+                type="button"
+                :title="`${t('mentionFileRemove')}: ${file.path}`"
+                :aria-label="`${t('mentionFileRemove')}: ${file.path}`"
+                @click="removeMentionFile(file.path)"
+              >
+                ×
+              </button>
+            </span>
+          </div>
           <textarea
             ref="composerInput"
             v-model="chatDraft"
             :aria-label="t('chatPlaceholder')"
             :placeholder="t('chatPlaceholder')"
+            :aria-expanded="mentionMenuOpen"
+            :aria-controls="mentionMenuOpen ? 'workspace-mention-list' : undefined"
+            :aria-activedescendant="mentionMenuOpen && mentionOptions.length ? `workspace-mention-option-${mentionActiveIndex}` : undefined"
+            aria-autocomplete="list"
             rows="1"
-            @input="resizeComposer"
+            @input="handleComposerInput"
+            @click="updateMentionFromComposer"
+            @focus="updateMentionFromComposer"
+            @blur="closeMentionMenu"
             @keydown="handleComposerKeydown"
           />
           <div class="composer-actions">
             <div class="composer-tools">
               <button class="composer-tool" :title="t('uploadData')" :aria-label="t('uploadData')" @click="triggerUpload">
                 <el-icon><Upload /></el-icon>
+              </button>
+              <button
+                class="composer-tool mention-tool"
+                type="button"
+                :title="t('mentionFile')"
+                :aria-label="t('mentionFile')"
+                :disabled="!current || isBusy || !workspaceMentionFiles.length"
+                @mousedown.prevent
+                @click="openMentionMenu"
+              >
+                @
               </button>
               <el-select
                 v-model="selectedModel"
@@ -659,7 +726,7 @@
             <button
               class="send-button"
               :class="{ stop: isStreaming }"
-              :disabled="!isStreaming && (isSubmittingAnswer || !current || !chatDraft.trim())"
+              :disabled="!isStreaming && (isSubmittingAnswer || !current || !canSendChat)"
               :aria-label="isStreaming ? t('stop') : t('send')"
               @click="isStreaming ? stopStreaming() : sendChat()"
             >
@@ -710,7 +777,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   ArrowRight,
@@ -723,17 +790,21 @@ import {
   DataLine,
   Delete,
   Document,
+  Download,
   Files,
   Folder,
   FolderOpened,
+  Headset,
   MagicStick,
   MoreFilled,
+  Picture,
   Plus,
   Promotion,
   Refresh,
   Setting,
   Share,
   Upload,
+  VideoCamera,
   VideoPause,
 } from '@element-plus/icons-vue'
 import mermaid from 'mermaid'
@@ -745,6 +816,7 @@ import McpSettingsWorkspace from '@/components/McpSettingsWorkspace.vue'
 import ModelSettingsPanel from '@/components/ModelSettingsPanel.vue'
 import SkillSettingsPanel from '@/components/SkillSettingsPanel.vue'
 import ToolSettingsPanel from '@/components/ToolSettingsPanel.vue'
+import WorkspaceMentionMenu, { type MentionFile } from '@/components/WorkspaceMentionMenu.vue'
 
 type Language = 'zh' | 'en'
 type ThemeMode = 'dark' | 'light' | 'contrast'
@@ -752,9 +824,13 @@ type TabKind = 'description' | 'overview' | 'context' | 'file' | 'graph' | 'thin
 type Tab = { id: string; title: string; kind: TabKind; payload?: any }
 type WorkspaceNode = { name: string; path: string; kind: 'file' | 'folder'; icon?: string; children?: WorkspaceNode[] }
 type TreeRow = { node: WorkspaceNode; depth: number }
+type WorkspaceContextMenu = { node: WorkspaceNode; x: number; y: number }
 type PaneKind = 'explorer' | 'assistant'
 type StreamTarget = { businessId: string; sessionId: string }
 type PendingResume = StreamTarget & { runId?: string; error: string }
+type MentionTrigger = { start: number; end: number; query: string }
+
+const MENTION_RESULT_LIMIT = 30
 
 const copy: Record<Language, Record<string, string>> = {
   zh: {
@@ -972,29 +1048,47 @@ const copy: Record<Language, Record<string, string>> = {
 }
 
 Object.assign(copy.zh, {
+  chatPlaceholder: '输入业务问题，使用 @ 引用场景文件...',
   deleteFile: '删除文件',
-  deleteFileConfirmBody: '删除后会从当前业务场景的 data 目录移除，并重新分析上下文。',
+  deleteFileConfirmBody: '文件将从当前业务场景永久删除。依赖它的分析结果需要重新运行后才能继续信任。',
   deleteFileConfirmTitle: '删除这个文件？',
   deleteScene: '删除场景',
   deleteSceneConfirmBody: '这会连同该业务场景下的 description.md、data、graphs、context、output 和 settings 一起删除。',
   deleteSceneConfirmTitle: '删除业务场景？',
   deleted: '已删除',
   filePreviewLimited: '表格预览仅显示前 20 行，避免大数据文件卡顿。',
+  filePreviewLoading: '加载中',
+  filePreviewTruncated: '有界预览',
+  mentionFile: '引用场景文件',
+  mentionFileEmpty: '没有找到匹配的文件',
+  mentionFileHint: '↑↓ 选择 · Enter 确认 · Esc 关闭',
+  mentionFileRemove: '移除文件引用',
+  mentionFileResults: '个匹配文件',
   needUserInput: '需要你确认',
+  referencedFilesPrompt: '引用的业务场景文件：',
   resumeFailed: 'AI 续跑未完成，可从暂停点继续。',
   retryContinue: '继续执行',
 })
 
 Object.assign(copy.en, {
+  chatPlaceholder: 'Ask a business question, or use @ to reference a scene file...',
   deleteFile: 'Delete File',
-  deleteFileConfirmBody: 'This removes the file from the current data folder and re-analyzes the context.',
+  deleteFileConfirmBody: 'This permanently removes the file from the business scene. Re-run any analysis that depends on it.',
   deleteFileConfirmTitle: 'Delete this file?',
   deleteScene: 'Delete Scene',
   deleteSceneConfirmBody: 'This deletes description.md, data, graphs, context, output, and settings in this scene.',
   deleteSceneConfirmTitle: 'Delete business scene?',
   deleted: 'Deleted',
   filePreviewLimited: 'Table previews show the first 20 rows only to keep large files responsive.',
+  filePreviewLoading: 'Loading',
+  filePreviewTruncated: 'Bounded preview',
+  mentionFile: 'Reference scene file',
+  mentionFileEmpty: 'No matching files',
+  mentionFileHint: '↑↓ Select · Enter Confirm · Esc Close',
+  mentionFileRemove: 'Remove file reference',
+  mentionFileResults: 'matching files',
   needUserInput: 'Input Needed',
+  referencedFilesPrompt: 'Referenced business scene files:',
   resumeFailed: 'AI continuation did not finish. Continue from the paused step.',
   retryContinue: 'Continue',
 })
@@ -1003,6 +1097,7 @@ const storedLanguage = localStorage.getItem('studio.language')
 const storedTheme = localStorage.getItem('studio.theme')
 const uiLanguage = ref<Language>(storedLanguage === 'en' ? 'en' : 'zh')
 const themeMode = ref<ThemeMode>(storedTheme === 'light' || storedTheme === 'contrast' ? storedTheme : 'dark')
+const WorkspaceFilePreview = defineAsyncComponent(() => import('@/components/WorkspaceFilePreview.vue'))
 
 const businesses = ref<any[]>([])
 const current = ref<any | null>(null)
@@ -1014,6 +1109,8 @@ const tabs = ref<Tab[]>([])
 const activeTabId = ref('')
 const renderedMermaid = ref('')
 const fileInput = ref<HTMLInputElement | null>(null)
+const workspaceContextMenuElement = ref<HTMLElement | null>(null)
+const workspaceContextMenu = ref<WorkspaceContextMenu | null>(null)
 const messagesContainer = ref<HTMLElement | null>(null)
 const composerInput = ref<HTMLTextAreaElement | null>(null)
 const chatBoxElement = ref<HTMLElement | null>(null)
@@ -1022,6 +1119,9 @@ const autoFollowMessages = ref(true)
 const descriptionContent = ref('')
 const descriptionDirty = ref(false)
 const chatDraft = ref('')
+const mentionedFiles = ref<MentionFile[]>([])
+const mentionTrigger = ref<MentionTrigger | null>(null)
+const mentionActiveIndex = ref(0)
 const selectedModel = ref('')
 const activeChatSessionId = ref('')
 const settingsTab = ref('general')
@@ -1085,6 +1185,24 @@ const treeRows = computed(() => {
   if (!workspaceTree.value?.children) return []
   return workspaceTree.value.children.flatMap((node) => flattenNode(node, 0))
 })
+const workspaceMentionFiles = computed<MentionFile[]>(() => {
+  if (!workspaceTree.value) return []
+  return collectWorkspaceFiles(workspaceTree.value).sort(compareMentionFiles)
+})
+const matchingMentionFiles = computed<MentionFile[]>(() => {
+  const query = normalizeMentionQuery(mentionTrigger.value?.query || '')
+  if (!query) return workspaceMentionFiles.value
+  return workspaceMentionFiles.value
+    .map((file) => ({ file, score: mentionMatchScore(file, query) }))
+    .filter((item) => item.score >= 0)
+    .sort((left, right) => left.score - right.score || compareMentionFiles(left.file, right.file))
+    .map((item) => item.file)
+})
+const mentionOptions = computed(() => matchingMentionFiles.value.slice(0, MENTION_RESULT_LIMIT))
+const mentionMenuOpen = computed(() => Boolean(
+  current.value && !isBusy.value && mentionTrigger.value,
+))
+const canSendChat = computed(() => Boolean(chatDraft.value.trim() || mentionedFiles.value.length))
 const contextBlocks = computed(() => [
   { key: 'requirements', title: 'Requirements', value: context.value.user_requirements },
   { key: 'files', title: 'Source Files', value: context.value.source_files },
@@ -1102,6 +1220,10 @@ initializeMermaid()
 onMounted(async () => {
   applyDocumentTheme()
   startChatBoxObserver()
+  window.addEventListener('pointerdown', handleWorkspaceContextPointerDown)
+  window.addEventListener('keydown', handleWorkspaceContextKeydown)
+  window.addEventListener('resize', closeWorkspaceContextMenu)
+  window.addEventListener('scroll', closeWorkspaceContextMenu, true)
   await Promise.all([loadSettings(), loadCapabilities(), loadBusinesses()])
   if (businesses.value.length) await selectBusiness(businesses.value[0].id)
 })
@@ -1110,6 +1232,10 @@ onBeforeUnmount(() => {
   stopPaneResize()
   chatBoxObserver?.disconnect()
   streamAbortController.value?.abort()
+  window.removeEventListener('pointerdown', handleWorkspaceContextPointerDown)
+  window.removeEventListener('keydown', handleWorkspaceContextKeydown)
+  window.removeEventListener('resize', closeWorkspaceContextMenu)
+  window.removeEventListener('scroll', closeWorkspaceContextMenu, true)
 })
 
 watch(activeTab, async (tab) => {
@@ -1142,6 +1268,18 @@ watch(openQuestions, (questions) => {
   } else if (!questions.some((question: any) => question.id === activeQuestionId.value)) {
     activeQuestionId.value = questions[0].id
   }
+})
+
+watch(() => current.value?.id, resetComposerFileReferences)
+watch(activeChatSessionId, resetComposerFileReferences)
+
+watch(workspaceMentionFiles, (files) => {
+  const availablePaths = new Set(files.map((file) => file.path))
+  mentionedFiles.value = mentionedFiles.value.filter((file) => availablePaths.has(file.path))
+})
+
+watch(mentionOptions, (files) => {
+  mentionActiveIndex.value = Math.min(mentionActiveIndex.value, Math.max(0, files.length - 1))
 })
 
 function t(key: string) {
@@ -1455,14 +1593,14 @@ function openContext() {
 }
 
 async function openFile(file: any) {
-  const payload = (await http.get(`/files/${file.id}/preview`)).data
-  openTab({ id: `data/${file.filename}`, title: file.filename, kind: 'file', payload })
+  await openWorkspaceFile({ name: file.filename, path: `data/${file.filename}` })
 }
 
-async function deleteCurrentFile(file: any) {
-  if (!file?.id) return
+async function deleteWorkspacePath(node: Pick<WorkspaceNode, 'name' | 'path' | 'kind'>) {
+  if (!current.value || !node.path || node.kind !== 'file' || isBusy.value) return
+  closeWorkspaceContextMenu()
   try {
-    await ElMessageBox.confirm(t('deleteFileConfirmBody'), `${t('deleteFileConfirmTitle')} ${file.filename}`, {
+    await ElMessageBox.confirm(t('deleteFileConfirmBody'), `${t('deleteFileConfirmTitle')} ${node.name}`, {
       confirmButtonText: t('deleteFile'),
       cancelButtonText: t('cancel'),
       type: 'warning',
@@ -1470,11 +1608,45 @@ async function deleteCurrentFile(file: any) {
   } catch {
     return
   }
-  const res = await http.delete(`/files/${file.id}`)
-  if (current.value && res.data.context) current.value.context = res.data.context
-  closeTab(`data/${file.filename}`)
+  const res = await http.delete(`/businesses/${current.value.id}/workspace/file`, {
+    params: { path: node.path },
+  })
+  if (res.data.business) current.value = res.data.business
+  closeTab(node.path)
+  if (node.path === 'description.md') {
+    descriptionContent.value = ''
+    descriptionDirty.value = false
+  }
   await refreshWorkspace()
   ElMessage.success(t('deleted'))
+}
+
+function openWorkspaceContextMenu(node: WorkspaceNode, event: MouseEvent) {
+  if (node.kind !== 'file' || isBusy.value) {
+    closeWorkspaceContextMenu()
+    return
+  }
+  const menuWidth = 176
+  const menuHeight = 44
+  const margin = 8
+  workspaceContextMenu.value = {
+    node,
+    x: clamp(event.clientX, margin, window.innerWidth - menuWidth - margin),
+    y: clamp(event.clientY, margin, window.innerHeight - menuHeight - margin),
+  }
+}
+
+function closeWorkspaceContextMenu() {
+  workspaceContextMenu.value = null
+}
+
+function handleWorkspaceContextPointerDown(event: PointerEvent) {
+  const target = event.target as Node | null
+  if (!target || !workspaceContextMenuElement.value?.contains(target)) closeWorkspaceContextMenu()
+}
+
+function handleWorkspaceContextKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') closeWorkspaceContextMenu()
 }
 
 async function openGraph(kind: string) {
@@ -1513,14 +1685,53 @@ function openWorkspaceNode(node: WorkspaceNode) {
   }
   if (node.path === 'description.md') return openDescription()
   if (node.path === 'context/business_context.json') return openContext()
-  if (node.path.startsWith('graphs/') && node.kind === 'file') return openGraph(node.name.replace('.mmd', ''))
-  if (node.path.startsWith('data/') && node.kind === 'file') {
-    const file = current.value?.files?.find((item: any) => item.filename === node.name)
-    if (file) return openFile(file)
-  }
-  if (node.path.startsWith('output')) return openOutputs()
-  if (node.path.startsWith('settings')) return openCapabilities()
+  if (node.kind === 'file') return openWorkspaceFile(node)
   if (!node.path) return openOverview()
+}
+
+async function openWorkspaceFile(node: Pick<WorkspaceNode, 'name' | 'path'>) {
+  if (!current.value || !node.path) return
+  const pending = { path: node.path, filename: node.name, loading: true }
+  openTab({ id: node.path, title: node.name, kind: 'file', payload: pending })
+  try {
+    const payload = (await http.get(`/businesses/${current.value.id}/workspace/preview`, {
+      params: { path: node.path },
+    })).data
+    openTab({ id: node.path, title: node.name, kind: 'file', payload })
+  } catch (error: any) {
+    openTab({
+      id: node.path,
+      title: node.name,
+      kind: 'file',
+      payload: {
+        ...pending,
+        loading: false,
+        error: error?.response?.data?.detail || error?.message || t('noPreview'),
+      },
+    })
+  }
+}
+
+async function reloadWorkspacePreview() {
+  if (activeTab.value?.kind !== 'file' || !activeTab.value.payload?.path) return
+  await openWorkspaceFile({ name: activeTab.value.title, path: activeTab.value.payload.path })
+}
+
+function downloadWorkspaceFile(url: string) {
+  window.open(url, '_blank', 'noopener,noreferrer')
+}
+
+function formatFileSize(value: number) {
+  if (!Number.isFinite(value) || value < 0) return ''
+  if (value < 1024) return `${value} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let size = value / 1024
+  let unit = 0
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024
+    unit += 1
+  }
+  return `${size >= 10 ? size.toFixed(0) : size.toFixed(1)} ${units[unit]}`
 }
 
 function openTab(tab: Tab) {
@@ -1537,14 +1748,132 @@ function closeTab(id: string) {
   if (activeTabId.value === id) activeTabId.value = tabs.value[Math.max(0, index - 1)]?.id || ''
 }
 
+function collectWorkspaceFiles(node: WorkspaceNode, result: MentionFile[] = []) {
+  if (node.kind === 'file') {
+    result.push({ name: node.name, path: node.path, icon: node.icon })
+    return result
+  }
+  for (const child of node.children || []) collectWorkspaceFiles(child, result)
+  return result
+}
+
+function compareMentionFiles(left: MentionFile, right: MentionFile) {
+  return left.path.localeCompare(right.path, uiLanguage.value === 'zh' ? 'zh-CN' : 'en', {
+    numeric: true,
+    sensitivity: 'base',
+  })
+}
+
+function normalizeMentionQuery(value: string) {
+  return value.trim().toLocaleLowerCase()
+}
+
+function mentionMatchScore(file: MentionFile, query: string) {
+  const name = file.name.toLocaleLowerCase()
+  const path = file.path.toLocaleLowerCase()
+  if (name === query) return 0
+  if (name.startsWith(query)) return 1
+  if (path.startsWith(query)) return 2
+  if (name.includes(query)) return 3
+  if (path.includes(query)) return 4
+  return -1
+}
+
+function findMentionTrigger(value: string, cursor: number): MentionTrigger | null {
+  const beforeCursor = value.slice(0, cursor)
+  const start = beforeCursor.lastIndexOf('@')
+  if (start < 0) return null
+  const previous = start > 0 ? beforeCursor[start - 1] : ''
+  if (previous && !/[\s(\[{"'“‘，。！？、；：]/.test(previous)) return null
+  const query = beforeCursor.slice(start + 1)
+  if (query.includes('\n') || query.length > 120) return null
+  return { start, end: cursor, query }
+}
+
+function updateMentionFromComposer(event?: Event) {
+  const textarea = (event?.target as HTMLTextAreaElement | null) || composerInput.value
+  if (!textarea || isBusy.value) {
+    mentionTrigger.value = null
+    return
+  }
+  const nextTrigger = findMentionTrigger(chatDraft.value, textarea.selectionStart ?? chatDraft.value.length)
+  const queryChanged = nextTrigger?.query !== mentionTrigger.value?.query
+  mentionTrigger.value = nextTrigger
+  if (queryChanged) mentionActiveIndex.value = 0
+}
+
+function handleComposerInput(event: Event) {
+  resizeComposer(event)
+  updateMentionFromComposer(event)
+}
+
+function closeMentionMenu() {
+  mentionTrigger.value = null
+}
+
+async function openMentionMenu() {
+  if (!current.value || isBusy.value || !workspaceMentionFiles.value.length) return
+  const textarea = composerInput.value
+  if (!textarea) return
+  const cursor = textarea.selectionStart ?? chatDraft.value.length
+  const existingTrigger = findMentionTrigger(chatDraft.value, cursor)
+  if (!existingTrigger) {
+    chatDraft.value = `${chatDraft.value.slice(0, cursor)}@${chatDraft.value.slice(cursor)}`
+  }
+  await nextTick()
+  const nextCursor = existingTrigger ? cursor : cursor + 1
+  textarea.focus()
+  textarea.setSelectionRange(nextCursor, nextCursor)
+  updateMentionFromComposer()
+  resizeComposer()
+}
+
+async function selectMentionFile(file: MentionFile) {
+  const trigger = mentionTrigger.value
+  if (!trigger) return
+  if (!mentionedFiles.value.some((item) => item.path === file.path)) {
+    mentionedFiles.value = [...mentionedFiles.value, file]
+  }
+  const before = chatDraft.value.slice(0, trigger.start)
+  const after = chatDraft.value.slice(trigger.end)
+  const separator = before && after && !/\s$/.test(before) && !/^\s/.test(after) ? ' ' : ''
+  chatDraft.value = `${before}${separator}${after}`
+  mentionTrigger.value = null
+  await nextTick()
+  const cursor = before.length + separator.length
+  composerInput.value?.focus()
+  composerInput.value?.setSelectionRange(cursor, cursor)
+  resizeComposer()
+}
+
+function removeMentionFile(path: string) {
+  mentionedFiles.value = mentionedFiles.value.filter((file) => file.path !== path)
+}
+
+function resetComposerFileReferences() {
+  mentionedFiles.value = []
+  mentionTrigger.value = null
+  mentionActiveIndex.value = 0
+}
+
+function composeChatMessage() {
+  const prompt = chatDraft.value.trim()
+  if (!mentionedFiles.value.length) return prompt
+  const references = mentionedFiles.value
+    .map((file) => `- @${file.path}`)
+    .join('\n')
+  return `${prompt}${prompt ? '\n\n' : ''}${t('referencedFilesPrompt')}\n${references}`
+}
+
 async function sendChat() {
-  if (!current.value || !activeChatSessionId.value || !chatDraft.value.trim() || isBusy.value) return
+  if (!current.value || !activeChatSessionId.value || !canSendChat.value || isBusy.value) return
   const target: StreamTarget = {
     businessId: current.value.id,
     sessionId: activeChatSessionId.value,
   }
-  const message = chatDraft.value.trim()
+  const message = composeChatMessage()
   chatDraft.value = ''
+  resetComposerFileReferences()
   await nextTick()
   resizeComposer()
   current.value.messages = [
@@ -1587,7 +1916,31 @@ function stopStreaming() {
 }
 
 function handleComposerKeydown(event: KeyboardEvent) {
-  if (event.isComposing || event.key !== 'Enter' || event.shiftKey || event.altKey) return
+  if (event.isComposing) return
+  if (mentionMenuOpen.value) {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault()
+      if (!mentionOptions.value.length) return
+      const direction = event.key === 'ArrowDown' ? 1 : -1
+      mentionActiveIndex.value = (
+        mentionActiveIndex.value + direction + mentionOptions.value.length
+      ) % mentionOptions.value.length
+      return
+    }
+    if ((event.key === 'Enter' || event.key === 'Tab') && !event.shiftKey && !event.altKey) {
+      event.preventDefault()
+      const selected = mentionOptions.value[mentionActiveIndex.value]
+      if (selected) void selectMentionFile(selected)
+      else closeMentionMenu()
+      return
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      closeMentionMenu()
+      return
+    }
+  }
+  if (event.key !== 'Enter' || event.shiftKey || event.altKey) return
   event.preventDefault()
   void sendChat()
 }
@@ -1753,12 +2106,29 @@ function handleRunEvent(event: any) {
     const index = (current.value.runs || []).findIndex((run: any) => run.id === event.run.id)
     if (index >= 0) current.value.runs[index] = event.run
     else current.value.runs.push(event.run)
+  } else if (event.type === 'progress_message' && event.message && current.value) {
+    const index = (current.value.messages || []).findIndex((message: any) => message.id === event.message.id)
+    if (index >= 0) current.value.messages[index] = event.message
+    else current.value.messages.push(event.message)
+    streamingAssistant.value = ''
+    executionPlan.value = []
+    executionTrace.value = []
+    void scrollMessages()
   } else if (event.type === 'plan') {
     executionPlan.value = event.items || []
-  } else if (event.type === 'reasoning') {
-    const last = executionTrace.value[executionTrace.value.length - 1]
-    if (last?.type === 'reasoning') last.content = `${last.content || ''}${event.content || ''}`
-    else executionTrace.value.push(event)
+  } else if (event.type === 'agent_progress') {
+    const items = Array.isArray(event.work_items) ? event.work_items : []
+    if (items.length) {
+      executionPlan.value = items
+        .map((item: any) => String(item?.title || item?.name || '').trim())
+        .filter(Boolean)
+    }
+    upsertTraceEvent(event)
+  } else if (event.type === 'task_handoff') {
+    streamingAssistant.value = ''
+    upsertTraceEvent(event)
+  } else if (event.type === 'context_compaction') {
+    upsertTraceEvent(event)
   } else if ([
     'tool_call',
     'skill_activation',
@@ -1767,8 +2137,8 @@ function handleRunEvent(event: any) {
     'skill_load',
     'skill_call',
     'mcp_call',
-    'model_call',
     'context_read',
+    'agent_progress',
   ].includes(event.type)) {
     upsertTraceEvent(event)
   } else if (event.type === 'question') {
@@ -1795,8 +2165,37 @@ function handleRunEvent(event: any) {
       else current.value.runs.push(event.run)
     }
   } else if (event.type === 'error') {
+    streamCompleted.value = true
+    streamingAssistant.value = ''
+    if (current.value && event.assistant_message) {
+      const index = (current.value.messages || []).findIndex((message: any) => message.id === event.assistant_message.id)
+      if (index >= 0) current.value.messages[index] = event.assistant_message
+      else current.value.messages.push(event.assistant_message)
+    }
+    if (current.value && event.run) {
+      const index = (current.value.runs || []).findIndex((run: any) => run.id === event.run.id)
+      if (index >= 0) current.value.runs[index] = event.run
+      else current.value.runs.push(event.run)
+    }
     throw new Error(event.message || 'AI stream failed')
   }
+}
+
+function messageActivityEvents(message: any) {
+  if (['progress', 'final', 'error'].includes(String(message?.kind || ''))) {
+    return Array.isArray(message?.activity_events) ? message.activity_events : []
+  }
+  return runById.value[message?.run_id]?.events || []
+}
+
+function messageActivityPlan(message: any) {
+  const workItems = message?.progress?.work_items
+  if (Array.isArray(workItems) && workItems.length) {
+    return workItems
+      .map((item: any) => String(item?.title || item?.name || '').trim())
+      .filter(Boolean)
+  }
+  return runById.value[message?.run_id]?.plan || []
 }
 
 function isCurrentStreamTarget(target: StreamTarget) {
@@ -1933,18 +2332,20 @@ function isExpanded(node: WorkspaceNode) {
 function nodeIcon(node: WorkspaceNode) {
   const icon = node.icon || (node.kind === 'folder' ? 'folder' : 'file')
   const map: Record<string, any> = {
+    audio: Headset,
     brain: Cpu,
     database: DataLine,
     file: Document,
     folder: node.kind === 'folder' && isExpanded(node) ? FolderOpened : Folder,
     graph: Share,
-    image: Document,
+    image: Picture,
     json: Document,
     markdown: Document,
     package: Box,
     scenario: MagicStick,
     settings: Setting,
     table: DataLine,
+    video: VideoCamera,
   }
   return map[icon] || Document
 }
@@ -2013,7 +2414,7 @@ function emptyContext() {
 
   display: grid;
   position: relative;
-  grid-template-columns: var(--activity-width) var(--explorer-width) minmax(460px, 1fr) var(--assistant-width);
+  grid-template-columns: var(--activity-width) var(--explorer-width) minmax(342px, 1fr) var(--assistant-width);
   grid-template-rows: 34px minmax(0, 1fr) 24px;
   height: 100dvh;
   min-width: 1180px;
@@ -2441,6 +2842,42 @@ function emptyContext() {
   white-space: nowrap;
 }
 
+.workspace-context-menu {
+  position: fixed;
+  z-index: 100;
+  width: 176px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface-3);
+  box-shadow: 0 10px 28px rgb(0 0 0 / 28%);
+}
+
+.workspace-context-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 36px;
+  padding: 0 10px;
+  border-radius: 3px;
+  color: var(--el-color-danger);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.workspace-context-menu button:hover,
+.workspace-context-menu button:focus-visible {
+  background: color-mix(in srgb, var(--el-color-danger) 14%, transparent);
+  outline: 1px solid color-mix(in srgb, var(--el-color-danger) 55%, transparent);
+}
+
+.workspace-context-menu button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 .pane-resizer {
   position: absolute;
   top: 34px;
@@ -2610,6 +3047,13 @@ function emptyContext() {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.file-size {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
 }
 
 .markdown-editor {
@@ -3305,6 +3749,7 @@ pre {
 }
 
 .composer-shell {
+  position: relative;
   display: grid;
   gap: 6px;
   padding: 8px 9px 7px;
@@ -3333,6 +3778,68 @@ pre {
   font-size: 13px;
   line-height: 1.55;
   overflow-y: auto;
+}
+
+.composer-references {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  max-height: 76px;
+  overflow-y: auto;
+  padding-bottom: 1px;
+}
+
+.composer-reference {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+  min-width: 0;
+  max-width: 100%;
+  height: 30px;
+  padding: 0 3px 0 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--chat-divider));
+  border-radius: 6px;
+  background: var(--accent-soft);
+  color: var(--text-strong);
+  font-size: 11px;
+}
+
+.composer-reference > .el-icon {
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+
+.composer-reference > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-reference button {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.composer-reference button:hover,
+.composer-reference button:focus-visible {
+  background: var(--surface-hover);
+  color: var(--text-strong);
+}
+
+.composer-reference button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 .composer-actions {
@@ -3406,6 +3913,16 @@ pre {
 .composer-tool:hover {
   color: var(--text-strong);
   background: var(--surface-hover);
+}
+
+.composer-tool:disabled {
+  cursor: default;
+  opacity: 0.42;
+}
+
+.mention-tool {
+  font-size: 16px;
+  font-weight: 700;
 }
 
 .send-button {

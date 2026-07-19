@@ -199,6 +199,8 @@ def _record_usage(
     arguments: dict[str, Any],
     result: CapabilityResult,
 ) -> None:
+    if capability.protocol in {"task_progress", "user_input"}:
+        return
     usage_name = (
         str(capability.config.get("_server_name") or capability.display_name)
         if capability.kind == "mcp"

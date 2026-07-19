@@ -150,16 +150,26 @@ class ChatMessage(BaseModel):
     content: str
     created_at: float
     run_id: str | None = None
+    task_id: str = ""
+    kind: Literal["standard", "progress", "final", "error"] = "standard"
+    progress_action: str = ""
+    work_item_id: str = ""
+    progress: dict[str, Any] = Field(default_factory=dict)
+    activity_events: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class AIRun(BaseModel):
     id: str
     business_id: str
     session_id: str | None = None
+    task_id: str = ""
+    segment_index: int = 1
+    continued_from_run_id: str | None = None
     resumed_from_run_id: str | None = None
     status: Literal["running", "waiting_for_user", "succeeded", "failed"] = "running"
     model: str = "local-context-builder"
     plan: list[str] = Field(default_factory=list)
+    task_progress: dict[str, Any] = Field(default_factory=dict)
     tool_invocations: list[dict[str, Any]] = Field(default_factory=list)
     events: list[dict[str, Any]] = Field(default_factory=list)
     started_at: float
@@ -193,6 +203,7 @@ class BusinessRecord(BaseModel):
     messages: list[ChatMessage] = Field(default_factory=list)
     runs: list[AIRun] = Field(default_factory=list)
     packages: list[PackageRecord] = Field(default_factory=list)
+    workspace_deleted_paths: list[str] = Field(default_factory=list)
 
 
 class BusinessSummary(BaseModel):

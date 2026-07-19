@@ -1247,9 +1247,10 @@ class ProgressiveAnalyzer:
                     )
                     self.process_seed_table(table, bootstrap=is_bootstrap)
                     self.check_deadline()
-                for item in seed_documents:
-                    self.process_seed_document(item, all_names)
-                    self.check_deadline()
+                if not getattr(self.args, "defer_documents", False):
+                    for item in seed_documents:
+                        self.process_seed_document(item, all_names)
+                        self.check_deadline()
             remaining = [table for table in self.tables.values() if table.key not in self.scanned_tables]
             if self.partial_table and self.partial_table.get("key") in self.tables:
                 table = self.tables[self.partial_table["key"]]
