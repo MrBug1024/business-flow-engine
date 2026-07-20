@@ -17,7 +17,7 @@ from app.studio.settings import studio_settings
 from app.studio.capabilities.tools import tool_registry
 
 
-StreamKind = Literal["content", "reasoning", "completed"]
+StreamKind = Literal["content", "reasoning", "tool_call_delta", "completed"]
 
 
 class ModelGatewayError(RuntimeError):
@@ -32,10 +32,19 @@ class ModelToolCall:
 
 
 @dataclass(slots=True)
+class ModelToolCallChunk:
+    index: int
+    id: str = ""
+    name: str = ""
+    arguments: str = ""
+
+
+@dataclass(slots=True)
 class ModelStreamEvent:
     kind: StreamKind
     content: str = ""
     tool_calls: list[ModelToolCall] = field(default_factory=list)
+    tool_call_chunks: list[ModelToolCallChunk] = field(default_factory=list)
 
 
 def stream_model_turn(
@@ -46,6 +55,7 @@ def stream_model_turn(
 ) -> Iterator[ModelStreamEvent]:
     """Stream one model turn, including reasoning and function calls."""
 
+    _enforce_request_budgets(messages, tools)
     model_config = studio_settings.active_model_config(requested_model)
     api_key = model_config.api_key.strip() or env_settings.openai_api_key.strip()
     if not api_key or api_key.casefold() in {"your-api-key-here", "sk-xxx", "changeme"}:
@@ -106,7 +116,15 @@ def stream_model_turn(
                     yielded = True
                     for part_kind, part in markup.feed(content):
                         yield ModelStreamEvent(kind=part_kind, content=part)
-                _merge_tool_call_deltas(pending_calls, delta.get("tool_calls") or [])
+                raw_tool_calls = delta.get("tool_calls") or []
+                tool_call_chunks = _tool_call_chunks(raw_tool_calls)
+                if tool_call_chunks:
+                    yielded = True
+                    yield ModelStreamEvent(
+                        kind="tool_call_delta",
+                        tool_call_chunks=tool_call_chunks,
+                    )
+                _merge_tool_call_deltas(pending_calls, raw_tool_calls)
 
             for part_kind, part in markup.flush():
                 yielded = True
@@ -126,6 +144,45 @@ def strip_thinking_markup(text: str) -> str:
     text = re.sub(r"(?is)<think>.*?</think>", "", text)
     text = re.sub(r"(?is)</?think>", "", text)
     return text.strip()
+
+
+def request_context_size(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+) -> dict[str, int]:
+    """Measure high-risk request sections without logging their contents."""
+
+    system_chars = sum(
+        len(_text_value(message.get("content")))
+        for message in messages
+        if str(message.get("role") or "").casefold() == "system"
+    )
+    tool_schema_chars = len(
+        json.dumps(tools or [], ensure_ascii=False, separators=(",", ":"), default=str)
+    )
+    return {
+        "system_chars": system_chars,
+        "tool_schema_chars": tool_schema_chars,
+    }
+
+
+def _enforce_request_budgets(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+) -> None:
+    sizes = request_context_size(messages, tools)
+    system_limit = max(1_000, int(env_settings.agent_system_prompt_character_limit))
+    tool_limit = max(5_000, int(env_settings.agent_tool_schema_character_limit))
+    if sizes["system_chars"] > system_limit:
+        raise ModelGatewayError(
+            "模型请求已阻止：System 提示词异常膨胀 "
+            f"({sizes['system_chars']}/{system_limit} 字符)。"
+        )
+    if sizes["tool_schema_chars"] > tool_limit:
+        raise ModelGatewayError(
+            "模型请求已阻止：默认挂载的工具定义异常膨胀 "
+            f"({sizes['tool_schema_chars']}/{tool_limit} 字符)，请改为按需发现能力。"
+        )
 
 
 def _extract_delta(chunk: dict[str, Any]) -> dict[str, Any]:
@@ -168,6 +225,29 @@ def _merge_tool_call_deltas(target: dict[int, dict[str, str]], deltas: list[Any]
                 current["name"] += str(function["name"])
             if function.get("arguments"):
                 current["arguments"] += str(function["arguments"])
+
+
+def _tool_call_chunks(deltas: list[Any]) -> list[ModelToolCallChunk]:
+    chunks: list[ModelToolCallChunk] = []
+    for fallback_index, raw in enumerate(deltas):
+        if not isinstance(raw, dict):
+            continue
+        try:
+            index = int(raw.get("index", fallback_index))
+        except (TypeError, ValueError):
+            index = fallback_index
+        function = raw.get("function") or {}
+        if not isinstance(function, dict):
+            function = {}
+        chunk = ModelToolCallChunk(
+            index=index,
+            id=str(raw.get("id") or ""),
+            name=str(function.get("name") or ""),
+            arguments=str(function.get("arguments") or ""),
+        )
+        if chunk.id or chunk.name or chunk.arguments:
+            chunks.append(chunk)
+    return chunks
 
 
 def _finalize_tool_calls(pending: dict[int, dict[str, str]]) -> list[ModelToolCall]:

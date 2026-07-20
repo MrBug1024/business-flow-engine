@@ -13,7 +13,7 @@ from typing import Any, Literal
 from langchain_core.tools import BaseTool
 
 from app.studio.capabilities.mcp import call_mcp_tool
-from app.studio.models import BusinessRecord
+from app.studio.models import BusinessRecord, SkillDefinition
 from app.studio.settings import studio_settings
 from app.studio.storage import new_id, store
 from app.studio.runtime.tool_context import StudioToolContext, bind_tool_context
@@ -22,6 +22,7 @@ from app.studio.capabilities.tools import tool_registry
 
 CapabilityKind = Literal["tool", "mcp"]
 MAX_TOOL_OUTPUT = 32_000
+MAX_DISCOVERY_DESCRIPTION = 500
 
 
 @dataclass(slots=True)
@@ -164,6 +165,112 @@ def result_for_model(result: CapabilityResult) -> str:
     return raw[:MAX_TOOL_OUTPUT] + "\n...[tool output truncated]"
 
 
+def optional_capability_catalog(
+    tool_capabilities: list[Capability],
+    mcp_capabilities: list[Capability],
+    skills: list[SkillDefinition],
+    *,
+    kind: str = "all",
+    query: str = "",
+    limit: int = 10,
+    offset: int = 0,
+    include_schema: bool = False,
+) -> dict[str, Any]:
+    """Return a bounded, on-demand Skill/MCP catalog for one model turn."""
+
+    normalized_kind = kind.casefold().strip()
+    if normalized_kind not in {"all", "skill", "tool", "mcp"}:
+        raise ValueError("kind must be one of: all, skill, tool, mcp")
+    safe_limit = max(1, min(int(limit), 20))
+    safe_offset = max(0, int(offset))
+    entries: list[dict[str, Any]] = []
+
+    if normalized_kind in {"all", "skill"}:
+        entries.extend(
+            {
+                "kind": "skill",
+                "name": skill.name,
+                "description": _bounded_description(skill.description),
+                "instruction_path": skill.location,
+            }
+            for skill in skills
+            if skill.enabled
+        )
+    if normalized_kind in {"all", "tool"}:
+        entries.extend(
+            {
+                "kind": "tool",
+                "name": capability.function_name,
+                "display_name": capability.display_name,
+                "source": capability.source,
+                "description": _bounded_description(capability.description),
+                "_capability": capability,
+            }
+            for capability in tool_capabilities
+        )
+    if normalized_kind in {"all", "mcp"}:
+        entries.extend(
+            {
+                "kind": "mcp",
+                "name": capability.function_name,
+                "display_name": capability.display_name,
+                "server": capability.source,
+                "description": _bounded_description(capability.description),
+                "_capability": capability,
+            }
+            for capability in mcp_capabilities
+        )
+
+    terms = [item for item in re.split(r"\s+", query.casefold().strip()) if item]
+    if terms:
+        ranked: list[tuple[int, dict[str, Any]]] = []
+        for entry in entries:
+            name_haystack = " ".join(
+                str(entry.get(key) or "")
+                for key in ("name", "display_name", "server")
+            ).casefold()
+            description_haystack = str(entry.get("description") or "").casefold()
+            score = sum(
+                30 if term in name_haystack else 10 if term in description_haystack else 0
+                for term in terms
+            )
+            if not score:
+                continue
+            exact = query.casefold().strip() in {
+                str(entry.get("name") or "").casefold(),
+                str(entry.get("display_name") or "").casefold(),
+            }
+            ranked.append((score + int(exact) * 1_000, entry))
+        entries = [entry for _score, entry in sorted(ranked, key=lambda item: -item[0])]
+    else:
+        entries.sort(key=lambda item: (str(item["kind"]), str(item["name"]).casefold()))
+
+    total = len(entries)
+    selected = entries[safe_offset : safe_offset + safe_limit]
+    schema_added = False
+    public_entries: list[dict[str, Any]] = []
+    for entry in selected:
+        capability = entry.pop("_capability", None)
+        public_entry = dict(entry)
+        if include_schema and not schema_added and isinstance(capability, Capability):
+            public_entry["input_schema"] = capability.input_schema
+            schema_added = True
+        public_entries.append(public_entry)
+    next_offset = safe_offset + len(public_entries)
+    return {
+        "items": public_entries,
+        "total": total,
+        "offset": safe_offset,
+        "next_offset": next_offset if next_offset < total else None,
+        "schema_included": schema_added,
+        "guidance": (
+            "Read a Skill's instruction_path before using it. For Tool or MCP, search "
+            "narrowly with include_schema=true, then pass its exact name and arguments "
+            "to call_tool or call_mcp respectively."
+        ),
+    }
+
+
 def _execute_tool(capability: Capability, arguments: dict[str, Any]) -> CapabilityResult:
     if capability.handler is None:
         raise RuntimeError(f"Dynamic tool {capability.display_name!r} is not mounted.")
@@ -199,7 +306,13 @@ def _record_usage(
     arguments: dict[str, Any],
     result: CapabilityResult,
 ) -> None:
-    if capability.protocol in {"task_progress", "user_input"}:
+    if capability.protocol in {
+        "task_progress",
+        "user_input",
+        "capability_discovery",
+        "mcp_gateway",
+        "tool_gateway",
+    }:
         return
     usage_name = (
         str(capability.config.get("_server_name") or capability.display_name)
@@ -240,6 +353,13 @@ def _normalize_output(value: Any) -> dict[str, Any]:
     if isinstance(value, str):
         return {"content": value}
     return {"data": value}
+
+
+def _bounded_description(value: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(value)).strip()
+    if len(normalized) <= MAX_DISCOVERY_DESCRIPTION:
+        return normalized
+    return normalized[: MAX_DISCOVERY_DESCRIPTION - 3].rstrip() + "..."
 
 
 def _function_slug(value: str) -> str:

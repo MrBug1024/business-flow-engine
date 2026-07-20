@@ -542,6 +542,11 @@ class StudioStore:
 
     def _write_workspace_artifacts(self, record: BusinessRecord) -> None:
         context_payload = record.context.model_dump(mode="json")
+        # Rollback snapshots remain in the internal business record. The Agent-facing
+        # workspace artifact exposes only current state and lean version metadata.
+        for version in context_payload.get("versions", []):
+            if isinstance(version, dict):
+                version.pop("snapshot", None)
         if not _workspace_path_is_deleted(record, "context/business_context.json"):
             (self.context_dir(record.id) / "business_context.json").write_text(
                 json.dumps(context_payload, ensure_ascii=False, indent=2),

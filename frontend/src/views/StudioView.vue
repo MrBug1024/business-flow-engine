@@ -834,6 +834,17 @@ type PaneKind = 'explorer' | 'assistant'
 type StreamTarget = { businessId: string; sessionId: string }
 type PendingResume = StreamTarget & { runId?: string; error: string }
 type MentionTrigger = { start: number; end: number; query: string }
+type LiveFileDraft = {
+  callId: string
+  path: string
+  operation: string
+  text: string
+  baseText: string
+  oldText: string
+  replacementText: string
+  revealPromise?: Promise<void>
+  cancelReveal?: () => void
+}
 
 const MENTION_RESULT_LIMIT = 30
 
@@ -1158,6 +1169,9 @@ const explorerWidth = ref(clamp(Number(localStorage.getItem('studio.explorerWidt
 const assistantWidth = ref(clamp(Number(localStorage.getItem('studio.assistantWidth')) || 500, 360, 720))
 let paneDrag: { kind: PaneKind; startX: number; startWidth: number } | null = null
 let chatBoxObserver: ResizeObserver | null = null
+let workspaceReloadTimer: number | undefined
+const liveFileDrafts = new Map<string, LiveFileDraft>()
+const pendingFileSettlements = new Set<Promise<void>>()
 
 const activeTab = computed(() => tabs.value.find((tab) => tab.id === activeTabId.value))
 const context = computed(() => current.value?.context || emptyContext())
@@ -1247,6 +1261,9 @@ onBeforeUnmount(() => {
   stopPaneResize()
   chatBoxObserver?.disconnect()
   streamAbortController.value?.abort()
+  if (workspaceReloadTimer != null) window.clearTimeout(workspaceReloadTimer)
+  liveFileDrafts.clear()
+  pendingFileSettlements.clear()
   window.removeEventListener('pointerdown', handleWorkspaceContextPointerDown)
   window.removeEventListener('keydown', handleWorkspaceContextKeydown)
   window.removeEventListener('resize', closeWorkspaceContextMenu)
@@ -1500,6 +1517,7 @@ async function deleteChatSession() {
 
 async function selectBusiness(id: string) {
   if (isBusy.value) return
+  liveFileDrafts.clear()
   current.value = (await http.get(`/businesses/${id}`)).data
   activeChatSessionId.value = preferredChatSessionId(current.value)
   tabs.value = []
@@ -1711,6 +1729,11 @@ function openWorkspaceNode(node: WorkspaceNode) {
 
 async function openWorkspaceFile(node: Pick<WorkspaceNode, 'name' | 'path'>) {
   if (!current.value || !node.path) return
+  const liveDraft = liveFileDrafts.get(node.path)
+  if (liveDraft) {
+    renderLiveFileDraft(liveDraft, 'streaming', true)
+    return
+  }
   const pending = { path: node.path, filename: node.name, loading: true }
   openTab({ id: node.path, title: node.name, kind: 'file', payload: pending })
   try {
@@ -1921,7 +1944,10 @@ async function sendChat() {
   } finally {
     streamAbortController.value = null
     isStreaming.value = false
-    if (isCurrentStreamTarget(target)) await refreshWorkspace()
+    if (isCurrentStreamTarget(target)) {
+      await refreshWorkspace()
+      await settleLiveFileOperations()
+    }
     if (activeStreamTarget.value?.businessId === target.businessId
       && activeStreamTarget.value?.sessionId === target.sessionId) {
       activeStreamTarget.value = null
@@ -2083,6 +2109,7 @@ async function resumeAgent(runId?: string, requestedTarget?: StreamTarget) {
     isStreaming.value = false
     if (isCurrentStreamTarget(target)) {
       await refreshWorkspace()
+      await settleLiveFileOperations()
       if (resumeConflict) {
         pendingResume.value = null
         if (openQuestions.value.length) openQuestionDock()
@@ -2151,7 +2178,7 @@ function handleRunEvent(event: any) {
     upsertTraceEvent(event)
   } else if (event.type === 'file_operation') {
     upsertTraceEvent(event)
-    void handleFileOperationEvent(event)
+    handleFileOperationEvent(event)
   } else if ([
     'tool_call',
     'skill_activation',
@@ -2237,26 +2264,28 @@ function upsertTraceEvent(event: any) {
   else executionTrace.value.push(event)
 }
 
-async function handleFileOperationEvent(event: any) {
+function handleFileOperationEvent(event: any) {
   if (!current.value || !event?.mutating) return
   const operation = String(event.operation || 'manage')
   const path = workspaceRelativePath(event.path)
   const destination = workspaceRelativePath(event.destination)
   if (!path) return
 
+  if (event.status === 'streaming' && ['create', 'edit'].includes(operation)) {
+    applyStreamedFileDelta(event, path, operation)
+    return
+  }
+
   if (event.status === 'running' && ['create', 'edit'].includes(operation)) {
-    const title = path.split('/').pop() || path
-    const existing = tabs.value.find((tab) => tab.id === path)?.payload || {}
-    openTab({
-      id: path,
-      title,
-      kind: 'file',
-      payload: { ...existing, path, filename: title, loading: true, live_operation: operation },
-    })
+    applyRunningFileOperation(event, path, operation)
     return
   }
 
   if (event.status === 'failed') {
+    const draft = liveFileDrafts.get(path)
+    if (draft && event.call_id && draft.callId && draft.callId !== String(event.call_id)) return
+    draft?.cancelReveal?.()
+    liveFileDrafts.delete(path)
     const tab = tabs.value.find((item) => item.id === path)
     if (tab?.kind === 'file') {
       tab.payload = {
@@ -2270,20 +2299,248 @@ async function handleFileOperationEvent(event: any) {
   }
   if (event.status !== 'succeeded') return
 
-  await reloadWorkspaceTree()
   if (operation === 'delete') {
+    liveFileDrafts.delete(path)
     closeTab(path)
+    trackFileSettlement(reloadWorkspaceTree())
     return
   }
   if (operation === 'move') {
+    liveFileDrafts.delete(path)
     closeTab(path)
-    if (destination) {
-      await openWorkspaceFile({ name: destination.split('/').pop() || destination, path: destination })
-    }
+    trackFileSettlement((async () => {
+      await reloadWorkspaceTree()
+      if (destination) await openWorkspaceFile({ name: destination.split('/').pop() || destination, path: destination })
+    })())
     return
   }
-  if (operation === 'create_directory') return
-  await openWorkspaceFile({ name: path.split('/').pop() || path, path })
+  if (operation === 'create_directory') {
+    trackFileSettlement(reloadWorkspaceTree())
+    return
+  }
+  const draft = liveFileDrafts.get(path)
+  if (event.auto_open === false && !draft) {
+    scheduleWorkspaceTreeReload()
+    return
+  }
+  trackFileSettlement(finalizeLiveFile(path, String(event.call_id || '')))
+}
+
+function applyStreamedFileDelta(event: any, path: string, operation: string) {
+  const callId = String(event.call_id || '')
+  let draft = liveFileDrafts.get(path)
+  if (!draft || (callId && draft.callId && draft.callId !== callId)) {
+    const existingText = String(tabs.value.find((tab) => tab.id === path)?.payload?.text || '')
+    draft = {
+      callId,
+      path,
+      operation,
+      text: operation === 'edit' ? existingText : '',
+      baseText: existingText,
+      oldText: '',
+      replacementText: '',
+    }
+    liveFileDrafts.set(path, draft)
+  }
+  if (callId) draft.callId = callId
+  if (operation === 'create') {
+    if (event.content_reset) draft.text = ''
+    draft.text += String(event.content_delta || '')
+  } else {
+    if (event.old_text) draft.oldText = String(event.old_text)
+    if (event.content_reset) draft.replacementText = ''
+    draft.replacementText += String(event.content_delta || '')
+    updateEditedDraftText(draft)
+    if (!draft.baseText) void hydrateLiveEditDraft(path, draft.callId)
+  }
+  renderLiveFileDraft(draft, 'streaming', true)
+}
+
+function applyRunningFileOperation(event: any, path: string, operation: string) {
+  const callId = String(event.call_id || '')
+  const existingText = String(tabs.value.find((tab) => tab.id === path)?.payload?.text || '')
+  let draft = liveFileDrafts.get(path)
+  if (!draft || (callId && draft.callId && draft.callId !== callId)) {
+    draft = {
+      callId,
+      path,
+      operation,
+      text: operation === 'edit' ? existingText : '',
+      baseText: existingText,
+      oldText: '',
+      replacementText: '',
+    }
+    liveFileDrafts.set(path, draft)
+  }
+  if (callId) draft.callId = callId
+  const input = event.input || {}
+  if (operation === 'create' && typeof input.content === 'string') {
+    if (!draft.text && input.content.length > 240) startLiveContentReveal(draft, input.content)
+    else draft.text = input.content
+  } else if (operation === 'edit') {
+    if (typeof input.old_string === 'string') draft.oldText = input.old_string
+    if (typeof input.new_string === 'string') draft.replacementText = input.new_string
+    updateEditedDraftText(draft)
+    if (!draft.baseText) void hydrateLiveEditDraft(path, draft.callId)
+  }
+  renderLiveFileDraft(draft, 'streaming', true)
+}
+
+function startLiveContentReveal(draft: LiveFileDraft, targetText: string) {
+  draft.cancelReveal?.()
+  const callId = draft.callId
+  const steps = Math.min(42, Math.max(18, Math.ceil(targetText.length / 180)))
+  const chunkSize = Math.max(1, Math.ceil(targetText.length / steps))
+  let cursor = 0
+  let resolveReveal: () => void = () => undefined
+  draft.text = ''
+  draft.revealPromise = new Promise<void>((resolve) => { resolveReveal = resolve })
+  const timer = window.setInterval(() => {
+    const current = liveFileDrafts.get(draft.path)
+    if (current !== draft || (callId && current.callId !== callId)) {
+      window.clearInterval(timer)
+      resolveReveal()
+      return
+    }
+    cursor = Math.min(targetText.length, cursor + chunkSize)
+    draft.text = targetText.slice(0, cursor)
+    renderLiveFileDraft(draft, 'streaming', false)
+    if (cursor >= targetText.length) {
+      window.clearInterval(timer)
+      draft.cancelReveal = undefined
+      resolveReveal()
+    }
+  }, 28)
+  draft.cancelReveal = () => {
+    window.clearInterval(timer)
+    draft.text = targetText
+    draft.cancelReveal = undefined
+    resolveReveal()
+  }
+}
+
+function updateEditedDraftText(draft: LiveFileDraft) {
+  if (draft.baseText && draft.oldText && draft.baseText.includes(draft.oldText)) {
+    draft.text = draft.baseText.replace(draft.oldText, draft.replacementText)
+  } else if (draft.replacementText) {
+    draft.text = draft.replacementText
+  }
+}
+
+async function hydrateLiveEditDraft(path: string, callId: string) {
+  if (!current.value) return
+  try {
+    const payload = await fetchWorkspacePreview(path)
+    const draft = liveFileDrafts.get(path)
+    if (!draft || (callId && draft.callId !== callId)) return
+    draft.baseText = String(payload.text || '')
+    updateEditedDraftText(draft)
+    renderLiveFileDraft(draft, 'streaming', false, payload)
+  } catch {
+    // The runtime completion event will retry once the file exists on disk.
+  }
+}
+
+function renderLiveFileDraft(
+  draft: LiveFileDraft,
+  phase: 'streaming' | 'saving',
+  activate: boolean,
+  sourcePayload: any = {},
+) {
+  const title = draft.path.split('/').pop() || draft.path
+  const existing = tabs.value.find((tab) => tab.id === draft.path)?.payload || {}
+  setFileTab({
+    id: draft.path,
+    title,
+    kind: 'file',
+    payload: {
+      ...existing,
+      ...sourcePayload,
+      path: draft.path,
+      filename: title,
+      kind: previewKindForPath(draft.path),
+      text: draft.text,
+      size: draft.text.length,
+      loading: false,
+      error: '',
+      live_operation: draft.operation,
+      live_phase: phase,
+    },
+  }, activate)
+}
+
+async function finalizeLiveFile(path: string, callId: string) {
+  try {
+    const activeDraft = liveFileDrafts.get(path)
+    if (activeDraft?.revealPromise) await activeDraft.revealPromise
+    if (activeDraft) renderLiveFileDraft(activeDraft, 'saving', false)
+    await reloadWorkspaceTree()
+    const payload = await fetchWorkspacePreview(path)
+    const draft = liveFileDrafts.get(path)
+    if (draft && callId && draft.callId && draft.callId !== callId) return
+    liveFileDrafts.delete(path)
+    const title = path.split('/').pop() || path
+    setFileTab({ id: path, title, kind: 'file', payload }, false)
+  } catch (error: any) {
+    const draft = liveFileDrafts.get(path)
+    if (draft && callId && draft.callId && draft.callId !== callId) return
+    liveFileDrafts.delete(path)
+    const tab = tabs.value.find((item) => item.id === path)
+    if (tab?.kind === 'file') {
+      tab.payload = {
+        ...tab.payload,
+        loading: false,
+        live_operation: '',
+        live_phase: '',
+        error: error?.response?.data?.detail || error?.message || t('noPreview'),
+      }
+    }
+  }
+}
+
+async function settleLiveFileOperations() {
+  if (pendingFileSettlements.size) {
+    await Promise.allSettled([...pendingFileSettlements])
+  }
+  const remaining = [...liveFileDrafts.values()]
+  if (!remaining.length) return
+  await Promise.allSettled(remaining.map((draft) => finalizeLiveFile(draft.path, draft.callId)))
+}
+
+function trackFileSettlement(task: Promise<unknown>) {
+  const tracked = Promise.resolve(task).then(() => undefined, () => undefined)
+  pendingFileSettlements.add(tracked)
+  void tracked.finally(() => pendingFileSettlements.delete(tracked))
+}
+
+function scheduleWorkspaceTreeReload() {
+  if (workspaceReloadTimer != null) window.clearTimeout(workspaceReloadTimer)
+  workspaceReloadTimer = window.setTimeout(() => {
+    workspaceReloadTimer = undefined
+    void reloadWorkspaceTree()
+  }, 120)
+}
+
+async function fetchWorkspacePreview(path: string) {
+  if (!current.value) throw new Error(t('noPreview'))
+  return (await http.get(`/businesses/${current.value.id}/workspace/preview`, {
+    params: { path },
+  })).data
+}
+
+function setFileTab(tab: Tab, activate: boolean) {
+  const index = tabs.value.findIndex((item) => item.id === tab.id)
+  if (index >= 0) tabs.value[index] = tab
+  else tabs.value.push(tab)
+  if (activate) activeTabId.value = tab.id
+}
+
+function previewKindForPath(path: string) {
+  const suffix = path.split('.').pop()?.toLowerCase()
+  if (suffix === 'json') return 'json'
+  if (suffix === 'md') return 'markdown'
+  if (suffix === 'mmd' || suffix === 'mermaid') return 'mermaid'
+  return 'text'
 }
 
 function workspaceRelativePath(value: unknown) {

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from functools import lru_cache
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from app.studio.runtime.graph import StudioGraphRuntime
 from app.studio.models import AIRun, BusinessRecord
+
+if TYPE_CHECKING:
+    from app.studio.runtime.graph import StudioGraphRuntime
 
 
 def run_agent(
@@ -38,5 +40,7 @@ def clear_runtime_thread(
 
 
 @lru_cache(maxsize=1)
-def graph_runtime() -> StudioGraphRuntime:
+def graph_runtime() -> "StudioGraphRuntime":
+    from app.studio.runtime.graph import StudioGraphRuntime
+
     return StudioGraphRuntime()

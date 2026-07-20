@@ -7,18 +7,17 @@ import re
 import sqlite3
 import threading
 from collections import defaultdict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter, time
-from typing import Any
+from typing import Any, Literal
 
 from jsonschema import Draft202012Validator
 from deepagents.backends.composite import CompositeBackend
 from deepagents.backends.filesystem import FilesystemBackend
 from deepagents.middleware.filesystem import FilesystemMiddleware, FilesystemPermission
-from deepagents.middleware.skills import SKILLS_SYSTEM_PROMPT
 from langchain.agents import create_agent
 from langchain.agents.middleware import (
     ModelCallLimitMiddleware,
@@ -30,6 +29,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from langchain_core.tools import StructuredTool, ToolException
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command, interrupt
+from pydantic import BaseModel, Field
 
 from app.core.config import settings
 from app.studio.runtime.agent import _safe_arguments, _system_prompt
@@ -38,30 +38,19 @@ from app.studio.runtime.capabilities import (
     CapabilityResult,
     discover_capabilities,
     execute_capability,
+    optional_capability_catalog,
     result_for_model,
 )
 from app.studio.runtime.ledger import ToolExecutionLedger
 from app.studio.runtime.model_adapter import ModelTurn, StudioChatModel
 from app.studio.models import AIRun, BusinessRecord
-from app.studio.capabilities.registry import SYSTEM_SKILLS_ROOT
+from app.studio.capabilities.registry import SYSTEM_SKILLS_ROOT, list_skills
 from app.studio.runtime.sandbox import sandbox_manager
 from app.studio.capabilities.skill_middleware import ReloadingSkillsMiddleware
 from app.studio.storage import new_id, store
 
 
 SKILL_SOURCE = "/skills/"
-SKILLS_PROMPT = SKILLS_SYSTEM_PROMPT + """
-
-**Studio capability boundary:**
-- Each Skill is one complete, read-only package below `/skills/<name>/`.
-- Workspace files are writable below `/workspace/`.
-- A Skill is an activated instruction and resource package, not a Tool. Read its
-  SKILL.md, resolve relative files from the package root, and follow the workflow.
-- Use the sandbox `execute` capability for commands and dependency installation.
-  `python` resolves to Studio's system-level managed venv outside business workspaces.
-  Use absolute Skill paths or `cd /skills/<name>` so executions can be attributed to
-  the active Skill.
-"""
 CONTEXT_SUMMARY_PROMPT = """You compress execution context for an ongoing AI Business
 Studio task. Preserve only information needed to continue accurately. Do not invent
 business steps. Return these concise sections: USER OBJECTIVE, AGREEMENTS AND
@@ -81,6 +70,49 @@ _FILE_TOOL_OPERATIONS = {
     "glob": "search",
     "grep": "search",
 }
+_WORKSPACE_SNAPSHOT_LIMIT = 10_000
+
+
+class _CapabilityDiscoveryInput(BaseModel):
+    kind: Literal["all", "skill", "tool", "mcp"] = Field(
+        default="all",
+        description="Capability family to search.",
+    )
+    query: str = Field(
+        default="",
+        max_length=300,
+        description="Short task or capability search phrase.",
+    )
+    limit: int = Field(default=10, ge=1, le=20)
+    offset: int = Field(default=0, ge=0)
+    include_schema: bool = Field(
+        default=False,
+        description="Include the input schema for only the best matching MCP result.",
+    )
+
+
+class _MCPGatewayInput(BaseModel):
+    name: str = Field(
+        min_length=1,
+        max_length=128,
+        description="Exact MCP capability name returned by discover_studio_capabilities.",
+    )
+    arguments: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Arguments matching the discovered MCP input_schema.",
+    )
+
+
+class _ToolGatewayInput(BaseModel):
+    name: str = Field(
+        min_length=1,
+        max_length=128,
+        description="Exact Tool name returned by discover_studio_capabilities.",
+    )
+    arguments: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Arguments matching the discovered Tool input_schema.",
+    )
 
 
 class _StudioSummarizationMiddleware(SummarizationMiddleware):
@@ -110,6 +142,16 @@ class _Invocation:
     result: CapabilityResult | None = None
     replayed: bool = False
     error: str = ""
+
+
+@dataclass(slots=True)
+class _StreamedFileDraft:
+    index: int
+    call_id: str = ""
+    name: str = ""
+    arguments: str = ""
+    emitted_content: str = ""
+    announced: bool = False
 
 
 class _SkillTrace:
@@ -175,7 +217,39 @@ class StudioGraphRuntime:
         include_history: bool = True,
         resume_payload: dict[str, Any] | None = None,
     ) -> Iterator[dict[str, Any]]:
-        capabilities = discover_capabilities(record)
+        discovered_capabilities = discover_capabilities(record)
+        direct_protocols = {"task_progress", "user_input", "workspace_file"}
+        direct_capabilities = [
+            item
+            for item in discovered_capabilities
+            if item.kind == "tool" and item.protocol in direct_protocols
+        ]
+        optional_tool_capabilities = [
+            item
+            for item in discovered_capabilities
+            if item.kind == "tool" and item.protocol not in direct_protocols
+        ]
+        mcp_capabilities = [
+            item for item in discovered_capabilities if item.kind == "mcp"
+        ]
+        reserved_names = {"discover_studio_capabilities", "call_tool", "call_mcp"}
+        conflicts = sorted(
+            item.function_name
+            for item in direct_capabilities
+            if item.function_name in reserved_names
+        )
+        if conflicts:
+            raise RuntimeError(
+                "Project Tool names conflict with Studio capability gateways: "
+                + ", ".join(conflicts)
+            )
+        gateway_capabilities = self._gateway_capabilities(
+            optional_tool_capabilities,
+            mcp_capabilities,
+            record,
+            run,
+        )
+        capabilities = [*direct_capabilities, *gateway_capabilities]
         capability_map = {item.function_name: item for item in capabilities}
         tools = [self._tool_for(item, record, run) for item in capabilities]
         skill_trace = _SkillTrace(run.id)
@@ -202,10 +276,11 @@ class StudioGraphRuntime:
         skills_middleware = ReloadingSkillsMiddleware(
             backend=backend,
             sources=[(SKILL_SOURCE, "Studio")],
-            system_prompt=SKILLS_PROMPT,
+            system_prompt=None,
         )
         filesystem_middleware = FilesystemMiddleware(
             backend=backend,
+            system_prompt="",
             max_execute_timeout=settings.sandbox_command_timeout,
             _permissions=[
                 FilesystemPermission(
@@ -218,7 +293,7 @@ class StudioGraphRuntime:
         agent = create_agent(
             model,
             tools,
-            system_prompt=_system_prompt(record, capabilities),
+            system_prompt=_system_prompt(record),
             middleware=[
                 skills_middleware,
                 filesystem_middleware,
@@ -273,6 +348,7 @@ class StudioGraphRuntime:
                 )
             }
 
+        streamed_file_drafts: dict[int, _StreamedFileDraft] = {}
         for chunk in agent.stream(
             graph_input,
             config,
@@ -300,6 +376,8 @@ class StudioGraphRuntime:
                 content = _message_text(message.content)
                 if content:
                     yield {"type": "token", "content": content}
+                if isinstance(message, AIMessageChunk):
+                    yield from _streamed_file_events(message, streamed_file_drafts)
                 continue
 
             if chunk_type != "updates":
@@ -350,6 +428,151 @@ class StudioGraphRuntime:
     @staticmethod
     def thread_id(business_id: str, session_id: str) -> str:
         return f"{business_id}:{session_id}"
+
+    @staticmethod
+    def _gateway_capabilities(
+        tool_capabilities: list[Capability],
+        mcp_capabilities: list[Capability],
+        record: BusinessRecord,
+        run: AIRun,
+    ) -> list[Capability]:
+        """Expose compact discovery/invocation gateways instead of every MCP schema."""
+
+        tool_by_name = {item.function_name: item for item in tool_capabilities}
+        mcp_by_name = {item.function_name: item for item in mcp_capabilities}
+
+        def discover_optional_capabilities(
+            kind: str = "all",
+            query: str = "",
+            limit: int = 10,
+            offset: int = 0,
+            include_schema: bool = False,
+        ) -> dict[str, Any]:
+            return optional_capability_catalog(
+                tool_capabilities,
+                mcp_capabilities,
+                list_skills(),
+                kind=kind,
+                query=query,
+                limit=limit,
+                offset=offset,
+                include_schema=include_schema,
+            )
+
+        discovery_tool = StructuredTool.from_function(
+            func=discover_optional_capabilities,
+            name="discover_studio_capabilities",
+            description=(
+                "Search optional Tools, Skills, and MCP capabilities only when the current "
+                "task needs them. Results are bounded; set include_schema for a narrow "
+                "Tool or MCP search before calling it."
+            ),
+            args_schema=_CapabilityDiscoveryInput,
+            infer_schema=False,
+        )
+
+        def invoke_tool(name: str, arguments: dict[str, Any]) -> CapabilityResult:
+            capability = tool_by_name.get(name)
+            if capability is None:
+                raise ToolException(
+                    "Unknown optional Tool. Search discover_studio_capabilities first."
+                )
+            validation_errors = sorted(
+                Draft202012Validator(capability.input_schema).iter_errors(arguments),
+                key=lambda item: list(item.path),
+            )
+            if validation_errors:
+                message = "; ".join(item.message for item in validation_errors[:4])
+                raise ToolException(
+                    f"Invalid arguments for {name}: {message}. Discover it with "
+                    "include_schema=true and retry with the documented schema."
+                )
+            return execute_capability(
+                capability,
+                record,
+                arguments,
+                run_id=run.id,
+                session_id=run.session_id or "",
+            )
+
+        tool_gateway = StructuredTool.from_function(
+            func=invoke_tool,
+            name="call_tool",
+            description=(
+                "Call one exact optional Tool previously returned by "
+                "discover_studio_capabilities. Do not guess names or arguments."
+            ),
+            args_schema=_ToolGatewayInput,
+            infer_schema=False,
+        )
+
+        def invoke_mcp(name: str, arguments: dict[str, Any]) -> CapabilityResult:
+            capability = mcp_by_name.get(name)
+            if capability is None:
+                raise ToolException(
+                    "Unknown MCP capability. Search discover_studio_capabilities first."
+                )
+            validation_errors = sorted(
+                Draft202012Validator(capability.input_schema).iter_errors(arguments),
+                key=lambda item: list(item.path),
+            )
+            if validation_errors:
+                message = "; ".join(item.message for item in validation_errors[:4])
+                raise ToolException(
+                    f"Invalid arguments for {name}: {message}. Discover it with "
+                    "include_schema=true and retry with the documented schema."
+                )
+            return execute_capability(
+                capability,
+                record,
+                arguments,
+                run_id=run.id,
+                session_id=run.session_id or "",
+            )
+
+        mcp_tool = StructuredTool.from_function(
+            func=invoke_mcp,
+            name="call_mcp",
+            description=(
+                "Call one exact MCP capability previously returned by "
+                "discover_studio_capabilities. Do not guess names or arguments."
+            ),
+            args_schema=_MCPGatewayInput,
+            infer_schema=False,
+        )
+
+        return [
+            Capability(
+                function_name=discovery_tool.name,
+                display_name="Capability discovery",
+                kind="tool",
+                description=discovery_tool.description,
+                input_schema=discovery_tool.get_input_schema().model_json_schema(),
+                handler=discovery_tool,
+                protocol="capability_discovery",
+                source="studio-runtime",
+            ),
+            Capability(
+                function_name=tool_gateway.name,
+                display_name="Tool gateway",
+                kind="tool",
+                description=tool_gateway.description,
+                input_schema=tool_gateway.get_input_schema().model_json_schema(),
+                handler=tool_gateway,
+                protocol="tool_gateway",
+                source="studio-runtime",
+            ),
+            Capability(
+                function_name=mcp_tool.name,
+                display_name="MCP gateway",
+                kind="tool",
+                description=mcp_tool.description,
+                input_schema=mcp_tool.get_input_schema().model_json_schema(),
+                handler=mcp_tool,
+                protocol="mcp_gateway",
+                source="studio-runtime",
+            ),
+        ]
 
     def _tool_for(
         self,
@@ -616,6 +839,8 @@ class StudioGraphRuntime:
             kind = "runtime_tool"
             display_name = name
         started = perf_counter()
+        workspace_root = store.workspace_dir(record.id)
+        workspace_before = _workspace_file_state(workspace_root) if name == "execute" else None
         base_event = {
             "type": event_type,
             "kind": kind,
@@ -655,6 +880,12 @@ class StudioGraphRuntime:
                     "duration_ms": round((perf_counter() - started) * 1000),
                 }
             )
+            _emit_workspace_changes(
+                request.runtime.stream_writer,
+                call_id,
+                workspace_root,
+                workspace_before,
+            )
             raise
 
         failed = _runtime_tool_failed(name, response)
@@ -682,6 +913,12 @@ class StudioGraphRuntime:
         else:
             event["output"] = summary
         request.runtime.stream_writer(event)
+        _emit_workspace_changes(
+            request.runtime.stream_writer,
+            call_id,
+            workspace_root,
+            workspace_before,
+        )
         return response
 
 
@@ -823,6 +1060,176 @@ def _file_event_details(tool_name: str, arguments: dict[str, Any]) -> dict[str, 
         "destination": str(arguments.get("destination") or ""),
         "mutating": operation in {"create", "edit", "delete", "move", "create_directory"},
     }
+
+
+def _streamed_file_events(
+    message: AIMessageChunk,
+    drafts: dict[int, _StreamedFileDraft],
+) -> Iterator[dict[str, Any]]:
+    for fallback_index, raw in enumerate(message.tool_call_chunks or []):
+        if not isinstance(raw, dict):
+            continue
+        try:
+            index = int(raw.get("index", fallback_index))
+        except (TypeError, ValueError):
+            index = fallback_index
+        draft = drafts.setdefault(index, _StreamedFileDraft(index=index))
+        if raw.get("id"):
+            draft.call_id = _merge_stream_identifier(draft.call_id, str(raw["id"]))
+        if raw.get("name"):
+            draft.name = _merge_stream_identifier(draft.name, str(raw["name"]))
+        if raw.get("args"):
+            draft.arguments += str(raw["args"])
+        if draft.name not in {"write_file", "edit_file"}:
+            continue
+
+        path, path_complete = _partial_json_string_field(draft.arguments, "file_path")
+        if not path_complete or not path.startswith("/workspace/"):
+            continue
+        operation = _FILE_TOOL_OPERATIONS[draft.name]
+        field = "content" if draft.name == "write_file" else "new_string"
+        content, _content_complete = _partial_json_string_field(draft.arguments, field)
+        reset = not content.startswith(draft.emitted_content)
+        delta = content if reset else content[len(draft.emitted_content) :]
+        old_text = ""
+        if draft.name == "edit_file":
+            old_text, _ = _partial_json_string_field(draft.arguments, "old_string")
+        if not draft.announced or delta or reset:
+            yield {
+                "type": "file_operation",
+                "kind": "workspace_file",
+                "call_id": draft.call_id or f"streamed_file_{index}",
+                "name": draft.name,
+                "function_name": draft.name,
+                "status": "streaming",
+                "operation": operation,
+                "path": path,
+                "destination": "",
+                "mutating": True,
+                "content_delta": delta,
+                "content_reset": reset,
+                "content_length": len(content),
+                **({"old_text": old_text} if old_text else {}),
+            }
+            draft.announced = True
+        draft.emitted_content = content
+
+
+def _merge_stream_identifier(current: str, fragment: str) -> str:
+    if not fragment or fragment == current or current.endswith(fragment):
+        return current
+    if fragment.startswith(current):
+        return fragment
+    return current + fragment
+
+
+def _partial_json_string_field(raw: str, field: str) -> tuple[str, bool]:
+    match = re.search(rf'"{re.escape(field)}"\s*:\s*"', raw)
+    if match is None:
+        return "", False
+    index = match.end()
+    output: list[str] = []
+    while index < len(raw):
+        char = raw[index]
+        if char == '"':
+            return "".join(output), True
+        if char != "\\":
+            output.append(char)
+            index += 1
+            continue
+        if index + 1 >= len(raw):
+            break
+        escape = raw[index + 1]
+        replacements = {
+            '"': '"',
+            "\\": "\\",
+            "/": "/",
+            "b": "\b",
+            "f": "\f",
+            "n": "\n",
+            "r": "\r",
+            "t": "\t",
+        }
+        if escape in replacements:
+            output.append(replacements[escape])
+            index += 2
+            continue
+        if escape != "u" or index + 6 > len(raw):
+            break
+        code = raw[index + 2 : index + 6]
+        if not re.fullmatch(r"[0-9a-fA-F]{4}", code):
+            break
+        value = int(code, 16)
+        if 0xD800 <= value <= 0xDBFF:
+            if index + 12 > len(raw) or raw[index + 6 : index + 8] != "\\u":
+                break
+            low_code = raw[index + 8 : index + 12]
+            if not re.fullmatch(r"[0-9a-fA-F]{4}", low_code):
+                break
+            low = int(low_code, 16)
+            if not 0xDC00 <= low <= 0xDFFF:
+                break
+            output.append(chr(0x10000 + ((value - 0xD800) << 10) + low - 0xDC00))
+            index += 12
+            continue
+        output.append(chr(value))
+        index += 6
+    return "".join(output), False
+
+
+def _workspace_file_state(root: Path) -> dict[str, tuple[int, int]]:
+    state: dict[str, tuple[int, int]] = {}
+    if not root.exists():
+        return state
+    for path in root.rglob("*"):
+        if len(state) >= _WORKSPACE_SNAPSHOT_LIMIT:
+            break
+        if not path.is_file() or "__pycache__" in path.parts:
+            continue
+        try:
+            metadata = path.stat()
+            relative = path.relative_to(root).as_posix()
+        except (OSError, ValueError):
+            continue
+        state[relative] = (metadata.st_mtime_ns, metadata.st_size)
+    return state
+
+
+def _emit_workspace_changes(
+    writer: Callable[[dict[str, Any]], None],
+    parent_call_id: str,
+    workspace_root: Path,
+    before: dict[str, tuple[int, int]] | None,
+) -> None:
+    if before is None:
+        return
+    after = _workspace_file_state(workspace_root)
+    changes: list[tuple[str, str]] = []
+    for path in sorted(after.keys() - before.keys()):
+        changes.append(("create", path))
+    for path in sorted(before.keys() & after.keys()):
+        if before[path] != after[path]:
+            changes.append(("edit", path))
+    for path in sorted(before.keys() - after.keys()):
+        changes.append(("delete", path))
+    for index, (operation, path) in enumerate(changes[:50], start=1):
+        writer(
+            {
+                "type": "file_operation",
+                "kind": "workspace_file",
+                "call_id": f"{parent_call_id}:workspace:{index}",
+                "parent_call_id": parent_call_id,
+                "name": "Sandbox",
+                "function_name": "execute",
+                "status": "succeeded",
+                "operation": operation,
+                "path": f"/workspace/{path}",
+                "destination": "",
+                "mutating": True,
+                "source": "sandbox",
+                "auto_open": False,
+            }
+        )
 
 
 def _runtime_tool_failed(tool_name: str, response: ToolMessage) -> bool:

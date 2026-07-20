@@ -90,6 +90,7 @@ class StudioChatModel(BaseChatModel):
             tools = None
 
         final_calls = []
+        streamed_tool_calls = False
         for event in self._model_turn(
             self._record,
             openai_messages,
@@ -105,18 +106,36 @@ class StudioChatModel(BaseChatModel):
                 )
             elif event.kind == "content" and event.content:
                 yield ChatGenerationChunk(message=AIMessageChunk(content=event.content))
+            elif event.kind == "tool_call_delta" and event.tool_call_chunks:
+                streamed_tool_calls = True
+                yield ChatGenerationChunk(
+                    message=AIMessageChunk(
+                        content="",
+                        tool_call_chunks=[
+                            {
+                                "name": chunk.name,
+                                "args": chunk.arguments,
+                                "id": chunk.id,
+                                "index": chunk.index,
+                            }
+                            for chunk in event.tool_call_chunks
+                        ],
+                    )
+                )
             elif event.kind == "completed":
                 final_calls = event.tool_calls
 
-        tool_chunks = [
-            {
-                "name": call.name,
-                "args": json.dumps(call.arguments, ensure_ascii=False),
-                "id": call.id,
-                "index": index,
-            }
-            for index, call in enumerate(final_calls)
-        ]
+        tool_chunks = []
+        if not streamed_tool_calls:
+            tool_chunks = [
+                {
+                    "name": call.name,
+                    "args": json.dumps(call.arguments, ensure_ascii=False),
+                    "id": call.id,
+                    "index": index,
+                }
+                for index, call in enumerate(final_calls)
+            ]
         yield ChatGenerationChunk(
             message=AIMessageChunk(
                 content="",

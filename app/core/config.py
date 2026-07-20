@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     agent_context_keep_tokens: int = 24_000
     agent_history_message_limit: int = 12
     agent_history_character_limit: int = 32_000
+    # Fail closed if future middleware accidentally re-injects catalogs or snapshots.
+    agent_system_prompt_character_limit: int = 12_000
+    agent_tool_schema_character_limit: int = 40_000
     data_dir: str = "data"
 
     host: str = "127.0.0.1"

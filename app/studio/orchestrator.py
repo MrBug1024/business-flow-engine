@@ -632,7 +632,8 @@ def _event(run: AIRun, event_type: str, payload: dict[str, Any]) -> dict[str, An
         "created_at": time(),
         **payload,
     }
-    if event_type not in {"token", "reasoning", "model_call", "progress_message"}:
+    transient_file_delta = event_type == "file_operation" and payload.get("status") == "streaming"
+    if event_type not in {"token", "reasoning", "model_call", "progress_message"} and not transient_file_delta:
         persisted = dict(event)
         if event_type in {"run_start", "done", "error"}:
             persisted.pop("run", None)

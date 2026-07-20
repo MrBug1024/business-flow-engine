@@ -1,6 +1,24 @@
 <template>
-  <div class="workspace-preview" :aria-busy="payload?.loading ? 'true' : 'false'">
-    <div v-if="payload?.loading" class="preview-loading" aria-live="polite">
+  <div class="workspace-preview" :aria-busy="payload?.loading || payload?.live_operation ? 'true' : 'false'">
+    <section v-if="payload?.live_operation" class="live-code-preview">
+      <header class="live-code-head" aria-live="polite">
+        <span class="live-code-state">
+          <el-icon class="spin"><Loading /></el-icon>
+          {{ payload.live_phase === 'saving' ? text.saving : text.streaming }}
+        </span>
+        <span>{{ liveLines.length }} {{ text.lines }} / {{ liveCharacterCount }} {{ text.characters }}</span>
+      </header>
+      <div class="live-code-body" :aria-label="text.liveEditor">
+        <span
+          v-for="(line, index) in liveLines"
+          :key="index"
+          class="live-code-line"
+          :class="{ current: index === liveLines.length - 1 }"
+        >{{ line || ' ' }}</span>
+      </div>
+    </section>
+
+    <div v-else-if="payload?.loading" class="preview-loading" aria-live="polite">
       <el-skeleton :rows="8" animated />
     </div>
 
@@ -140,7 +158,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
-import { Document, Download, FullScreen, Refresh, RefreshLeft, WarningFilled, ZoomIn, ZoomOut } from '@element-plus/icons-vue'
+import { Document, Download, FullScreen, Loading, Refresh, RefreshLeft, WarningFilled, ZoomIn, ZoomOut } from '@element-plus/icons-vue'
 import mermaid from 'mermaid'
 import MarkdownContent from '@/components/MarkdownContent.vue'
 
@@ -163,6 +181,8 @@ type PreviewPayload = {
   }>
   warnings?: string[]
   truncated?: boolean
+  live_operation?: string
+  live_phase?: 'streaming' | 'saving'
 }
 
 const props = defineProps<{
@@ -188,6 +208,7 @@ const copy = {
     table: '数据表', sheet: '工作表', rows: '行预览', columns: '列', mediaFailed: '媒体无法加载，请下载后查看。',
     mediaUnsupported: '当前浏览器不支持此媒体格式。', noRenderer: '此格式暂不支持内嵌预览',
     downloadHint: '可以下载原文件并使用本地应用打开。', download: '下载文件',
+    streaming: '正在接收 AI 写入内容', saving: '正在保存文件', lines: '行', characters: '字符', liveEditor: 'AI 实时文件编辑器',
   },
   en: {
     diagram: 'Diagram', graphControls: 'Diagram zoom controls', zoomIn: 'Zoom in', zoomOut: 'Zoom out', fitWindow: 'Fit window', actualSize: 'Actual size',
@@ -195,10 +216,13 @@ const copy = {
     table: 'Table', sheet: 'Sheet', rows: 'rows previewed', columns: 'columns', mediaFailed: 'The media could not be loaded. Download it to inspect locally.',
     mediaUnsupported: 'This browser does not support the media format.', noRenderer: 'No embedded preview is available for this format',
     downloadHint: 'Download the original file and open it with a local application.', download: 'Download file',
+    streaming: 'Receiving AI file changes', saving: 'Saving file', lines: 'lines', characters: 'characters', liveEditor: 'Live AI file editor',
   },
 }
 
 const text = computed(() => copy[props.language])
+const liveLines = computed(() => String(props.payload?.text || '').split('\n'))
+const liveCharacterCount = computed(() => String(props.payload?.text || '').length)
 const isTable = computed(() => ['table', 'database', 'archive'].includes(props.payload?.kind || ''))
 const sheetOptions = computed(() => props.payload?.sheets?.length
   ? props.payload.sheets
@@ -292,6 +316,85 @@ function openDownload() {
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--surface-2);
+}
+
+.live-code-preview {
+  min-height: 420px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-2);
+}
+
+.live-code-head {
+  display: flex;
+  min-height: 40px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.live-code-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--warning);
+}
+
+.live-code-body {
+  min-height: 380px;
+  max-height: calc(100vh - 245px);
+  overflow: auto;
+  padding: 8px 0 28px;
+  counter-reset: live-line;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.65;
+  tab-size: 2;
+}
+
+.live-code-line {
+  display: block;
+  position: relative;
+  min-height: 21px;
+  padding: 0 18px 0 58px;
+  white-space: pre;
+  counter-increment: live-line;
+}
+
+.live-code-line::before {
+  content: counter(live-line);
+  position: absolute;
+  left: 0;
+  width: 44px;
+  padding-right: 12px;
+  color: var(--text-muted);
+  opacity: 0.58;
+  text-align: right;
+  user-select: none;
+}
+
+.live-code-line.current {
+  background: var(--surface-hover);
+}
+
+.live-code-line.current::after {
+  content: '';
+  display: inline-block;
+  width: 2px;
+  height: 15px;
+  margin-left: 2px;
+  vertical-align: -2px;
+  background: var(--accent);
+  animation: live-caret 900ms steps(1, end) infinite;
+}
+
+@keyframes live-caret {
+  50% { opacity: 0; }
 }
 
 .preview-state {
@@ -446,6 +549,10 @@ function openDownload() {
 @media (prefers-reduced-motion: reduce) {
   .mermaid-render {
     transition: none;
+  }
+
+  .live-code-line.current::after {
+    animation: none;
   }
 }
 
