@@ -150,7 +150,6 @@
         <el-icon><Document /></el-icon>
         <strong>{{ payload.kind === 'error' ? text.previewFailed : text.noRenderer }}</strong>
         <p>{{ payload.warnings?.[0] || text.downloadHint }}</p>
-        <el-button :icon="Download" @click="openDownload">{{ text.download }}</el-button>
       </div>
     </template>
   </div>
@@ -158,7 +157,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
-import { Document, Download, FullScreen, Loading, Refresh, RefreshLeft, WarningFilled, ZoomIn, ZoomOut } from '@element-plus/icons-vue'
+import { Document, FullScreen, Loading, Refresh, RefreshLeft, WarningFilled, ZoomIn, ZoomOut } from '@element-plus/icons-vue'
 import mermaid from 'mermaid'
 import MarkdownContent from '@/components/MarkdownContent.vue'
 
@@ -292,9 +291,6 @@ function resetGraphSize() {
   graphZoom.value = 1
 }
 
-function openDownload() {
-  if (props.payload?.download_url) window.open(props.payload.download_url, '_blank', 'noopener,noreferrer')
-}
 </script>
 
 <style scoped>

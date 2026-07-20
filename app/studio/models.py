@@ -40,6 +40,17 @@ class DescriptionMarkdownRequest(BaseModel):
     content: str = Field(max_length=80000)
 
 
+class WorkspaceCreateRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=1000)
+    kind: Literal["file", "folder"]
+    content: str = Field(default="", max_length=2_000_000)
+
+
+class WorkspaceMoveRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=1000)
+    destination: str = Field(min_length=1, max_length=1000)
+
+
 class AIModelConfig(BaseModel):
     id: str
     name: str

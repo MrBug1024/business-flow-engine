@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import tempfile
+import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 from time import time
 from typing import Any
 from urllib.parse import quote
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from app.studio.file_preview import preview_workspace_file
 from app.studio.graphs import entity_graph, evidence_graph, flow_graph, lineage_graph
@@ -28,6 +31,8 @@ from app.studio.models import (
     DescriptionMarkdownRequest,
     ResumeChatRequest,
     UpdateBusinessRequest,
+    WorkspaceCreateRequest,
+    WorkspaceMoveRequest,
     WorkspaceNode,
 )
 from app.studio.orchestrator import ResumeBlockedError, orchestrator
@@ -100,6 +105,168 @@ def raw_workspace_path(business_id: str, path: str, download: bool = False) -> F
         filename=source.name,
         media_type=_guess_mime(source.name),
         content_disposition_type="attachment" if download else "inline",
+    )
+
+
+@router.post("/businesses/{business_id}/workspace/entry", status_code=201)
+def create_workspace_entry(
+    business_id: str,
+    req: WorkspaceCreateRequest,
+) -> dict[str, Any]:
+    record = _record_or_404(business_id)
+    try:
+        entry = store.create_workspace_entry(
+            record,
+            req.path,
+            req.kind,
+            content=req.content,
+        )
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail="目标名称已存在。") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="目标目录不存在。") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="无效的工作区路径。") from exc
+    return {"ok": True, "entry": entry, "business": record.model_dump(mode="json")}
+
+
+@router.patch("/businesses/{business_id}/workspace/entry")
+def move_workspace_entry(
+    business_id: str,
+    req: WorkspaceMoveRequest,
+) -> dict[str, Any]:
+    record = _record_or_404(business_id)
+    try:
+        entry = store.move_workspace_entry(record, req.path, req.destination)
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail="目标名称已存在。") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="工作区文件或目标目录不存在。") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc) or "无效的工作区路径。") from exc
+    return {"ok": True, "entry": entry, "business": record.model_dump(mode="json")}
+
+
+@router.delete("/businesses/{business_id}/workspace/entry")
+def delete_workspace_entry(
+    business_id: str,
+    path: str,
+    recursive: bool = False,
+) -> dict[str, Any]:
+    record = _record_or_404(business_id)
+    try:
+        deleted = store.delete_workspace_entry(record, path, recursive=recursive)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc) or "无效的工作区路径。") from exc
+    if deleted is None:
+        raise HTTPException(status_code=404, detail="工作区文件或目录不存在。")
+    return {"ok": True, "deleted": deleted, "business": record.model_dump(mode="json")}
+
+
+@router.post("/businesses/{business_id}/workspace/import")
+async def import_workspace_files(
+    business_id: str,
+    files: list[UploadFile] = File(...),
+    target_path: str = Form(default="data"),
+) -> dict[str, Any]:
+    record = _record_or_404(business_id)
+    target, target_relative = _resolve_workspace_entry(
+        business_id,
+        target_path,
+        allow_root=True,
+    )
+    if not target.is_dir():
+        raise HTTPException(status_code=400, detail="导入目标必须是工作区目录。")
+    imported: list[dict[str, Any]] = []
+    registered: list[BusinessFile] = []
+    for upload in files:
+        filename = _safe_filename(upload.filename or "upload.bin")
+        destination = _next_available_path(target, filename)
+        size = 0
+        try:
+            with destination.open("wb") as handle:
+                while chunk := await upload.read(UPLOAD_CHUNK_SIZE):
+                    size += len(chunk)
+                    if size > MAX_UPLOAD_SIZE:
+                        handle.close()
+                        destination.unlink(missing_ok=True)
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"{filename} 超过 500MB 上传限制。",
+                        )
+                    handle.write(chunk)
+        finally:
+            await upload.close()
+        relative_path = destination.relative_to(store.workspace_dir(business_id)).as_posix()
+        record.workspace_deleted_paths = [
+            item for item in record.workspace_deleted_paths if item != relative_path
+        ]
+        metadata = BusinessFile(
+            id=new_id("file"),
+            business_id=business_id,
+            filename=destination.name,
+            suffix=destination.suffix.lower(),
+            size=size,
+            mime_type=upload.content_type or _guess_mime(filename),
+            storage_path=str(destination),
+            uploaded_at=time(),
+        )
+        record.files.append(metadata)
+        registered.append(metadata)
+        imported.append({"path": relative_path, "name": destination.name, "size": size})
+
+    if registered:
+        record.status = "files_uploaded"
+    store.create_version(
+        record,
+        f"Imported {len(imported)} file(s) into {target_relative or '/'}",
+        "import_workspace_files",
+        actor="user",
+        evidence_ids=[item.id for item in registered],
+    )
+    store.save(record)
+    return {
+        "ok": True,
+        "imported": imported,
+        "business": record.model_dump(mode="json"),
+    }
+
+
+@router.get("/businesses/{business_id}/workspace/export")
+def export_workspace_entry(business_id: str, path: str = "") -> FileResponse:
+    record = _record_or_404(business_id)
+    source, relative = _resolve_workspace_entry(business_id, path, allow_root=True)
+    if source.is_file():
+        return FileResponse(
+            source,
+            filename=source.name,
+            media_type=_guess_mime(source.name),
+            content_disposition_type="attachment",
+        )
+
+    archive_handle = tempfile.NamedTemporaryFile(
+        prefix="studio-export-",
+        suffix=".zip",
+        delete=False,
+    )
+    archive_path = Path(archive_handle.name)
+    archive_handle.close()
+    try:
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for candidate in sorted(source.rglob("*"), key=lambda item: item.as_posix()):
+                if candidate.is_symlink() or not candidate.is_file():
+                    continue
+                archive.write(candidate, candidate.relative_to(source).as_posix())
+    except Exception:
+        archive_path.unlink(missing_ok=True)
+        raise
+    filename = f"{_safe_filename(source.name if relative else record.name)}.zip"
+    return FileResponse(
+        archive_path,
+        filename=filename,
+        media_type="application/zip",
+        content_disposition_type="attachment",
+        background=BackgroundTask(archive_path.unlink, missing_ok=True),
     )
 
 
@@ -551,19 +718,47 @@ def _safe_filename(filename: str) -> str:
     return cleaned[:180]
 
 
-def _resolve_workspace_file(business_id: str, requested_path: str) -> tuple[Path, str]:
+def _resolve_workspace_entry(
+    business_id: str,
+    requested_path: str,
+    *,
+    allow_root: bool = False,
+) -> tuple[Path, str]:
     workspace = store.workspace_dir(business_id).resolve()
     normalized = requested_path.replace("\\", "/").strip("/")
     relative = Path(normalized)
-    if not normalized or "\x00" in normalized or relative.is_absolute() or ".." in relative.parts:
+    if (
+        (not normalized and not allow_root)
+        or "\x00" in normalized
+        or relative.is_absolute()
+        or ".." in relative.parts
+    ):
         raise HTTPException(status_code=400, detail="无效的工作区文件路径。")
     try:
-        source = (workspace / relative).resolve()
+        source = workspace if not normalized else (workspace / relative).resolve()
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="无效的工作区文件路径。") from exc
-    if workspace not in source.parents or not source.is_file():
+    if (source != workspace and workspace not in source.parents) or not source.exists():
+        raise HTTPException(status_code=404, detail="工作区文件或目录不存在。")
+    return source, "" if source == workspace else source.relative_to(workspace).as_posix()
+
+
+def _resolve_workspace_file(business_id: str, requested_path: str) -> tuple[Path, str]:
+    source, relative = _resolve_workspace_entry(business_id, requested_path)
+    if not source.is_file():
         raise HTTPException(status_code=404, detail="工作区文件不存在。")
-    return source, source.relative_to(workspace).as_posix()
+    return source, relative
+
+
+def _next_available_path(directory: Path, filename: str) -> Path:
+    candidate = directory / filename
+    if not candidate.exists():
+        return candidate
+    for index in range(2, 10_000):
+        alternative = directory / f"{candidate.stem}-{index}{candidate.suffix}"
+        if not alternative.exists():
+            return alternative
+    raise HTTPException(status_code=409, detail=f"无法为 {filename} 分配唯一文件名。")
 
 
 def _preview_sheets(sheets: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -388,6 +388,143 @@ class StudioStore:
             pass
         return package
 
+    def create_workspace_entry(
+        self,
+        record: BusinessRecord,
+        requested_path: str,
+        kind: str,
+        *,
+        content: str = "",
+        actor: str = "user",
+    ) -> dict[str, Any]:
+        with self._lock:
+            workspace, target, relative_path = _workspace_target(
+                self.workspace_dir(record.id), requested_path
+            )
+            if target == workspace:
+                raise ValueError("The workspace root cannot be created.")
+            if target.exists():
+                raise FileExistsError(relative_path)
+            if not target.parent.is_dir():
+                raise FileNotFoundError(target.parent.relative_to(workspace).as_posix())
+            if kind == "folder":
+                target.mkdir()
+            elif kind == "file":
+                target.write_text(content, encoding="utf-8")
+            else:
+                raise ValueError("Workspace entry kind must be file or folder.")
+            _clear_workspace_tombstone(record, relative_path)
+            self.create_version(
+                record,
+                f"Created workspace {kind} {relative_path}",
+                f"create_workspace_{kind}",
+                actor=actor,
+            )
+            self.save(record)
+            return {
+                "path": relative_path,
+                "name": target.name,
+                "kind": kind,
+            }
+
+    def move_workspace_entry(
+        self,
+        record: BusinessRecord,
+        requested_path: str,
+        destination: str,
+        *,
+        actor: str = "user",
+    ) -> dict[str, Any]:
+        with self._lock:
+            workspace, source, relative_path = _workspace_target(
+                self.workspace_dir(record.id), requested_path
+            )
+            _workspace, target, destination_path = _workspace_target(
+                workspace, destination
+            )
+            if source == workspace or target == workspace:
+                raise ValueError("The workspace root cannot be moved.")
+            if not source.exists():
+                raise FileNotFoundError(relative_path)
+            if target.exists():
+                raise FileExistsError(destination_path)
+            if not target.parent.is_dir():
+                raise FileNotFoundError(target.parent.relative_to(workspace).as_posix())
+            if source.is_dir() and source in target.parents:
+                raise ValueError("A directory cannot be moved inside itself.")
+            source_was_directory = source.is_dir()
+            shutil.move(str(source), str(target))
+            _update_registered_workspace_paths(record, source, target)
+            record.workspace_deleted_paths = sorted(
+                {*record.workspace_deleted_paths, relative_path}
+            )
+            _clear_workspace_tombstone(record, destination_path)
+            if relative_path == DESCRIPTION_FILENAME:
+                record.description = ""
+            self.create_version(
+                record,
+                f"Moved workspace entry {relative_path} to {destination_path}",
+                "move_workspace_entry",
+                actor=actor,
+            )
+            self.save(record)
+            return {
+                "path": relative_path,
+                "destination": destination_path,
+                "name": target.name,
+                "kind": "folder" if source_was_directory else "file",
+            }
+
+    def delete_workspace_entry(
+        self,
+        record: BusinessRecord,
+        requested_path: str,
+        *,
+        recursive: bool = False,
+        actor: str = "user",
+    ) -> dict[str, Any] | None:
+        workspace, target, relative_path = _workspace_target(
+            self.workspace_dir(record.id), requested_path
+        )
+        if target == workspace:
+            raise ValueError("The workspace root cannot be deleted.")
+        if not target.exists():
+            return None
+        if target.is_file():
+            return self.delete_workspace_file(record, relative_path, actor=actor)
+        with self._lock:
+            if any(target.iterdir()) and not recursive:
+                raise ValueError("Directory is not empty.")
+            affected_files = _registered_items_under(record.files, target)
+            affected_packages = _registered_items_under(record.packages, target)
+            if recursive:
+                shutil.rmtree(target)
+            else:
+                target.rmdir()
+            record.files = [item for item in record.files if item not in affected_files]
+            record.packages = [item for item in record.packages if item not in affected_packages]
+            removed_ids = {item.id for item in affected_files}
+            record.context.source_files = [
+                item for item in record.context.source_files if item.get("id") not in removed_ids
+            ]
+            record.workspace_deleted_paths = sorted(
+                {*record.workspace_deleted_paths, relative_path}
+            )
+            self.create_version(
+                record,
+                f"Deleted workspace directory {relative_path}",
+                "delete_workspace_directory",
+                actor=actor,
+                evidence_ids=sorted(removed_ids),
+            )
+            self.save(record)
+            return {
+                "path": relative_path,
+                "filename": target.name,
+                "kind": "folder",
+                "registered_file_ids": sorted(removed_ids),
+            }
+
     def delete_workspace_file(
         self,
         record: BusinessRecord,
@@ -688,6 +825,52 @@ def _workspace_path_is_deleted(record: BusinessRecord, relative_path: str) -> bo
         for item in record.workspace_deleted_paths
         if item.replace("\\", "/").strip("/")
     )
+
+
+def _workspace_target(workspace_root: Path, requested_path: str) -> tuple[Path, Path, str]:
+    workspace = workspace_root.resolve()
+    normalized = str(requested_path or "").replace("\\", "/").strip("/")
+    relative = Path(normalized)
+    if "\x00" in normalized or relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("Invalid workspace path.")
+    target = workspace if not normalized else (workspace / relative).resolve()
+    if target != workspace and workspace not in target.parents:
+        raise ValueError("Invalid workspace path.")
+    relative_path = "" if target == workspace else target.relative_to(workspace).as_posix()
+    return workspace, target, relative_path
+
+
+def _registered_items_under(items: list[Any], root: Path) -> list[Any]:
+    registered: list[Any] = []
+    resolved_root = root.resolve()
+    for item in items:
+        try:
+            path = Path(item.storage_path).resolve()
+        except (OSError, ValueError):
+            continue
+        if path == resolved_root or resolved_root in path.parents:
+            registered.append(item)
+    return registered
+
+
+def _update_registered_workspace_paths(
+    record: BusinessRecord,
+    source: Path,
+    destination: Path,
+) -> None:
+    resolved_source = source.resolve()
+    for item in [*record.files, *record.packages]:
+        try:
+            current = Path(item.storage_path).resolve()
+            relative = current.relative_to(resolved_source)
+        except (OSError, ValueError):
+            continue
+        updated = (destination / relative).resolve()
+        item.storage_path = str(updated)
+        if current == resolved_source and hasattr(item, "filename"):
+            item.filename = updated.name
+        if current == resolved_source and hasattr(item, "suffix"):
+            item.suffix = updated.suffix.lower()
 
 
 def _tree_node(path: Path, base: Path, root_name: str | None = None) -> WorkspaceNode:
