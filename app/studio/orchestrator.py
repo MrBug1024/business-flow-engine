@@ -97,7 +97,7 @@ class BusinessOrchestrator:
                 if (
                     event.get("type") == "error"
                     and run.segment_index < segment_limit
-                    and _is_recoverable_segment_error(str(event.get("message") or ""))
+                    and _is_recoverable_segment_error(str(event.get("message") or ""), run)
                 ):
                     continuation_error = str(event.get("message") or "")
                     continue
@@ -142,7 +142,7 @@ class BusinessOrchestrator:
                     "call_id": f"handoff_{run.id}_{next_run.id}",
                     "name": f"阶段 {run.segment_index + 1}",
                     "status": "succeeded",
-                    "summary": "上下文已自动压缩，正在用新的模型上下文继续同一任务。",
+                    "summary": "阶段状态已保存，正在用新的模型上下文从检查点继续同一任务。",
                     "reason": continuation_error[:1000],
                     "task_id": task_id,
                     "from_run_id": run.id,
@@ -307,6 +307,7 @@ class BusinessOrchestrator:
                 )
                 if not update_text or progress_key == last_progress_key:
                     continue
+                _reconcile_activity_events(run)
                 activity_events = deepcopy(run.events[activity_cursor:])
                 progress_message = store.append_message(
                     record,
@@ -358,7 +359,7 @@ class BusinessOrchestrator:
                 task_id=run.task_id,
                 kind="final",
                 progress=deepcopy(run.task_progress),
-                activity_events=deepcopy(run.events[activity_cursor:]),
+                activity_events=_activity_events(run, activity_cursor),
             )
             if waiting_for_user:
                 run.finished_at = None
@@ -539,6 +540,22 @@ def _append_failure_message(record: BusinessRecord, run: AIRun, error: str):
         or progress.get("title")
         or ""
     ).strip()
+    if not checkpoint:
+        current_id = str(progress.get("current_work_item_id") or "")
+        current_item = next(
+            (
+                item
+                for item in progress.get("work_items") or []
+                if isinstance(item, dict) and str(item.get("id") or "") == current_id
+            ),
+            None,
+        )
+        if current_item is not None:
+            checkpoint = str(
+                current_item.get("result")
+                or current_item.get("title")
+                or ""
+            ).strip()
     next_step = str(progress.get("next_step") or "").strip()
     content = "当前任务在这一阶段中断，未达到最终验收标准。"
     if checkpoint:
@@ -554,6 +571,7 @@ def _append_failure_message(record: BusinessRecord, run: AIRun, error: str):
         None,
     )
     cutoff = last_message.created_at if last_message is not None else 0
+    _reconcile_activity_events(run)
     activity_events = [
         deepcopy(event)
         for event in run.events
@@ -573,6 +591,36 @@ def _append_failure_message(record: BusinessRecord, run: AIRun, error: str):
     )
     store.save(record)
     return message
+
+
+def _reconcile_activity_events(run: AIRun) -> None:
+    """Close persisted running events from the authoritative invocation ledger."""
+
+    invocations = {
+        str(item.get("call_id") or ""): item
+        for item in run.tool_invocations
+        if str(item.get("call_id") or "")
+    }
+    for event in run.events:
+        if str(event.get("status") or "") != "running":
+            continue
+        invocation = invocations.get(str(event.get("call_id") or ""))
+        if invocation is None:
+            continue
+        status = str(invocation.get("status") or "")
+        if status not in {"succeeded", "failed"}:
+            continue
+        event["status"] = status
+        if status == "succeeded":
+            event["output"] = str(invocation.get("summary") or "")[:4000]
+            event.pop("error", None)
+        else:
+            event["error"] = str(invocation.get("error") or "")[:4000]
+
+
+def _activity_events(run: AIRun, start: int = 0) -> list[dict[str, Any]]:
+    _reconcile_activity_events(run)
+    return deepcopy(run.events[max(0, start):])
 
 
 def _event(run: AIRun, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -730,9 +778,9 @@ def _resume_prompt(answers: list[dict[str, Any]]) -> str:
 请先复核这些确认对 Business Context 和原任务的影响，按需调用真实 Tool、Skill 或 MCP 更新结果，然后完成原任务。不要要求用户重复回答，也不要把这段内部续跑提示描述成新的用户消息。"""
 
 
-def _is_recoverable_segment_error(message: str) -> bool:
+def _is_recoverable_segment_error(message: str, run: AIRun) -> bool:
     lowered = message.casefold()
-    return any(
+    context_boundary = any(
         marker in lowered
         for marker in (
             "maximum context length",
@@ -742,6 +790,26 @@ def _is_recoverable_segment_error(message: str) -> bool:
             "input is too long",
         )
     )
+    if context_boundary:
+        return True
+    call_boundary = "model call limit" in lowered or "model call limits exceeded" in lowered
+    return call_boundary and _has_durable_task_checkpoint(run)
+
+
+def _has_durable_task_checkpoint(run: AIRun) -> bool:
+    progress = run.task_progress or {}
+    work_items = progress.get("work_items")
+    has_work_item = isinstance(work_items, list) and any(
+        isinstance(item, dict) and str(item.get("title") or "").strip()
+        for item in work_items
+    )
+    has_checkpoint_text = any(
+        str(progress.get(key) or "").strip()
+        for key in ("objective", "summary", "result", "next_step")
+    )
+    has_artifact = bool(progress.get("artifacts"))
+    has_progress_event = any(event.get("type") == "agent_progress" for event in run.events)
+    return has_progress_event and (has_work_item or has_checkpoint_text or has_artifact)
 
 
 def _progress_requests_continuation(run: AIRun) -> bool:

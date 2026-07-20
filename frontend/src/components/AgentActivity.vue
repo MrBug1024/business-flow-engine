@@ -54,6 +54,23 @@
         </div>
       </section>
 
+      <section v-if="fileActivities.length" class="file-activity-list" :aria-label="labels.fileActivities">
+        <header>
+          <el-icon><Document /></el-icon>
+          <strong>{{ labels.fileActivities }}</strong>
+        </header>
+        <ul>
+          <li v-for="item in fileActivities" :key="item.key">
+            <el-icon :class="{ spin: item.status === 'running' }">
+              <component :is="statusIcon(item.status)" />
+            </el-icon>
+            <span>{{ operationLabel(item.operation) }}</span>
+            <code :title="item.path">{{ item.path }}</code>
+            <em :class="item.status">{{ statusLabel(item.status) }}</em>
+          </li>
+        </ul>
+      </section>
+
       <section v-if="artifacts.length" class="artifact-list" :aria-label="labels.artifacts">
         <header>
           <el-icon><Document /></el-icon>
@@ -130,6 +147,12 @@ type TechnicalGroup = {
   status: string
   event: TraceEvent
 }
+type FileActivity = {
+  key: string
+  path: string
+  operation: string
+  status: string
+}
 
 const TRACE_TYPES = new Set([
   'tool_call',
@@ -140,6 +163,7 @@ const TRACE_TYPES = new Set([
   'skill_call',
   'mcp_call',
   'context_read',
+  'file_operation',
 ])
 const HIDDEN_TECHNICAL_FUNCTIONS = new Set(['report_task_progress', 'request_user_input'])
 
@@ -167,6 +191,7 @@ const copy = {
     artifacts: '成果文件',
     planning: '正在理解目标并制定执行计划',
     technicalDetails: '运行明细',
+    fileActivities: '文件活动',
     mergedCalls: (count: number) => `已归并 ${count} 条`,
     verification: '验收',
     nextStep: '下一步',
@@ -190,6 +215,7 @@ const copy = {
       skill_call: 'Skill',
       mcp_call: 'MCP',
       context_read: 'Context',
+      file_operation: '文件',
     } as Record<string, string>,
     statuses: {
       planned: '已计划',
@@ -204,6 +230,10 @@ const copy = {
       streaming: '生成中',
       continuing: '继续中',
     } as Record<string, string>,
+    operations: {
+      list: '查看目录', read: '读取', search: '搜索', create: '创建', edit: '编辑',
+      create_directory: '新建目录', move: '移动', delete: '删除', manage: '管理',
+    } as Record<string, string>,
   },
   en: {
     working: 'Working',
@@ -214,6 +244,7 @@ const copy = {
     artifacts: 'Deliverables',
     planning: 'Understanding the objective and preparing a plan',
     technicalDetails: 'Run details',
+    fileActivities: 'File activity',
     mergedCalls: (count: number) => `${count} entries merged`,
     verification: 'Verification',
     nextStep: 'Next',
@@ -237,6 +268,7 @@ const copy = {
       skill_call: 'Skill',
       mcp_call: 'MCP',
       context_read: 'Context',
+      file_operation: 'File',
     } as Record<string, string>,
     statuses: {
       planned: 'Planned',
@@ -250,6 +282,10 @@ const copy = {
       blocked: 'Input needed',
       streaming: 'Streaming',
       continuing: 'Continuing',
+    } as Record<string, string>,
+    operations: {
+      list: 'List', read: 'Read', search: 'Search', create: 'Create', edit: 'Edit',
+      create_directory: 'New folder', move: 'Move', delete: 'Delete', manage: 'Manage',
     } as Record<string, string>,
   },
 }
@@ -338,7 +374,7 @@ const callEvents = computed<TraceEvent[]>(() => {
 
 const technicalGroups = computed<TechnicalGroup[]>(() => {
   const groups = new Map<string, TechnicalGroup & { events: TraceEvent[] }>()
-  for (const event of callEvents.value) {
+  for (const event of callEvents.value.filter((item) => item.type !== 'file_operation')) {
     const key = technicalGroupKey(event)
     const current = groups.get(key)
     if (current) {
@@ -370,6 +406,25 @@ const technicalGroups = computed<TechnicalGroup[]>(() => {
       event,
     }
   })
+})
+
+const fileActivities = computed<FileActivity[]>(() => {
+  const rows: FileActivity[] = []
+  const seen = new Set<string>()
+  for (const event of [...callEvents.value].reverse()) {
+    if (event.type !== 'file_operation') continue
+    const path = displayWorkspacePath(event.path || event.input?.file_path || event.input?.path)
+    if (!path || seen.has(path)) continue
+    seen.add(path)
+    rows.push({
+      key: `${normalized(event.call_id || event.id) || rows.length}:${path}`,
+      path,
+      operation: normalized(event.operation) || 'manage',
+      status: normalized(event.status) || 'completed',
+    })
+    if (rows.length >= 5) break
+  }
+  return rows
 })
 
 const technicalCallCount = computed(() => technicalGroups.value
@@ -414,6 +469,10 @@ function eventDescription(event: TraceEvent) {
 
 function statusLabel(status: string) {
   return labels.value.statuses[status] || status || ''
+}
+
+function operationLabel(operation: string) {
+  return labels.value.operations[operation] || operation
 }
 
 function statusIcon(status: string) {
@@ -484,10 +543,16 @@ function displayText(value: unknown) {
   }
 }
 
+function displayWorkspacePath(value: unknown) {
+  const path = normalized(value).replace(/\\/g, '/')
+  return path.replace(/^\/workspace\/?/, '')
+}
+
 function eventIcon(event: TraceEvent) {
   if (event.status === 'running') return Loading
   if (['skill_activation', 'skill_load', 'skill_call'].includes(event.type)) return MagicStick
   if (event.type === 'skill_resource' || event.type === 'context_read') return Document
+  if (event.type === 'file_operation') return Document
   if (event.type === 'sandbox_command') return Monitor
   if (event.type === 'mcp_call') return Connection
   if (event.type === 'task_handoff') return Refresh
@@ -622,6 +687,60 @@ function eventIcon(event: TraceEvent) {
   margin-bottom: 2px;
   color: var(--text-main);
   font-size: 11.5px;
+}
+
+.file-activity-list {
+  min-width: 0;
+}
+
+.file-activity-list header,
+.file-activity-list li {
+  display: grid;
+  align-items: center;
+}
+
+.file-activity-list header {
+  grid-template-columns: 16px 1fr;
+  gap: 6px;
+  color: var(--text-main);
+  font-size: 11.5px;
+}
+
+.file-activity-list ul {
+  display: grid;
+  gap: 3px;
+  margin: 5px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.file-activity-list li {
+  grid-template-columns: 16px auto minmax(0, 1fr) auto;
+  gap: 6px;
+  min-height: 26px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.file-activity-list code {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-main);
+  font-family: var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-activity-list em {
+  font-style: normal;
+}
+
+.file-activity-list em.failed {
+  color: var(--el-color-danger);
+}
+
+.file-activity-list em.running {
+  color: var(--accent);
 }
 
 .artifact-list {

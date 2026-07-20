@@ -12,7 +12,7 @@ from pathlib import Path
 from time import time
 from typing import Any
 
-from app.studio.capability_runtime import CapabilityResult
+from app.studio.runtime.capabilities import CapabilityResult
 
 
 _PROCESS_OWNER = uuid.uuid4().hex

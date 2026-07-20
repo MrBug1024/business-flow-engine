@@ -744,7 +744,7 @@ def _configured_sandbox_manager() -> SandboxManager:
 
 
 def _skill_sandbox_environment(command: str) -> dict[str, str]:
-    from app.studio.skill_secrets import skill_secret_store  # noqa: PLC0415
+    from app.studio.capabilities.skill_secrets import skill_secret_store  # noqa: PLC0415
 
     return skill_secret_store.sandbox_environment(command)
 

@@ -32,20 +32,20 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command, interrupt
 
 from app.core.config import settings
-from app.studio.agent_runtime import _safe_arguments, _system_prompt
-from app.studio.capability_runtime import (
+from app.studio.runtime.agent import _safe_arguments, _system_prompt
+from app.studio.runtime.capabilities import (
     Capability,
     CapabilityResult,
     discover_capabilities,
     execute_capability,
     result_for_model,
 )
-from app.studio.execution_ledger import ToolExecutionLedger
-from app.studio.model_adapter import ModelTurn, StudioChatModel
+from app.studio.runtime.ledger import ToolExecutionLedger
+from app.studio.runtime.model_adapter import ModelTurn, StudioChatModel
 from app.studio.models import AIRun, BusinessRecord
-from app.studio.registry import SYSTEM_SKILLS_ROOT
-from app.studio.sandbox_runtime import sandbox_manager
-from app.studio.skill_middleware import ReloadingSkillsMiddleware
+from app.studio.capabilities.registry import SYSTEM_SKILLS_ROOT
+from app.studio.runtime.sandbox import sandbox_manager
+from app.studio.capabilities.skill_middleware import ReloadingSkillsMiddleware
 from app.studio.storage import new_id, store
 
 
@@ -73,6 +73,14 @@ and user decisions. Omit repetitive tool transcripts and superseded attempts.
 {messages}
 </messages>"""
 _BUSINESS_LOCKS: defaultdict[str, threading.RLock] = defaultdict(threading.RLock)
+_FILE_TOOL_OPERATIONS = {
+    "ls": "list",
+    "read_file": "read",
+    "write_file": "create",
+    "edit_file": "edit",
+    "glob": "search",
+    "grep": "search",
+}
 
 
 class _StudioSummarizationMiddleware(SummarizationMiddleware):
@@ -427,7 +435,12 @@ class StudioGraphRuntime:
                     skill_trace=skill_trace,
                 )
 
-            event_type = f"{capability.kind}_call"
+            event_type = (
+                "file_operation"
+                if capability.protocol == "workspace_file"
+                else f"{capability.kind}_call"
+            )
+            event_details = _file_event_details(capability.function_name, arguments)
             started = perf_counter()
 
             if capability.protocol == "user_input":
@@ -504,6 +517,7 @@ class StudioGraphRuntime:
                     "function_name": capability.function_name,
                     "status": "running",
                     "input": _safe_arguments(arguments),
+                    **event_details,
                 }
             )
             invocation = _Invocation(call_id=call_id, capability=capability)
@@ -527,6 +541,7 @@ class StudioGraphRuntime:
                         "function_name": capability.function_name,
                         "status": "succeeded",
                         "output": result.summary,
+                        **event_details,
                         "replayed": invocation.replayed,
                         "duration_ms": round((perf_counter() - started) * 1000),
                     }
@@ -546,6 +561,7 @@ class StudioGraphRuntime:
                         "function_name": capability.function_name,
                         "status": "failed",
                         "error": error,
+                        **event_details,
                         "duration_ms": round((perf_counter() - started) * 1000),
                     }
                 )
@@ -589,6 +605,11 @@ class StudioGraphRuntime:
             event_type = "sandbox_command"
             kind = "sandbox"
             display_name = "Sandbox"
+        elif name in _FILE_TOOL_OPERATIONS:
+            parent_skill_id = None
+            event_type = "file_operation"
+            kind = "workspace_file"
+            display_name = name
         else:
             parent_skill_id = None
             event_type = "tool_call"
@@ -603,6 +624,7 @@ class StudioGraphRuntime:
             "function_name": name,
             "status": "running",
             "input": _safe_arguments(arguments),
+            **_file_event_details(name, arguments),
             **({"resource": skill[1]} if skill is not None else {}),
             **({"skill_name": skill_name} if skill_name else {}),
             **({"parent_skill_id": parent_skill_id} if parent_skill_id else {}),
@@ -670,9 +692,9 @@ def _live_model_turn(
     tools: list[dict[str, Any]] | None,
 ) -> Iterator[Any]:
     # Resolve at call time so tests and provider plugins can replace the gateway.
-    from app.studio import agent_runtime
+    from app.studio.runtime import agent
 
-    return agent_runtime.stream_model_turn(record, messages, requested_model, tools)
+    return agent.stream_model_turn(record, messages, requested_model, tools)
 
 
 def _input_messages(
@@ -781,6 +803,26 @@ def _runtime_tool_summary(
         return "Sandbox command failed" if failed else "Sandbox command completed"
     action = "failed" if failed else "completed"
     return f"{tool_name} {action}"
+
+
+def _file_event_details(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    operation = _FILE_TOOL_OPERATIONS.get(tool_name)
+    if tool_name == "manage_workspace_entry":
+        operation = str(arguments.get("action") or "manage")
+    if not operation:
+        return {}
+    path = str(
+        arguments.get("file_path")
+        or arguments.get("path")
+        or arguments.get("source")
+        or "/workspace"
+    )
+    return {
+        "operation": operation,
+        "path": path,
+        "destination": str(arguments.get("destination") or ""),
+        "mutating": operation in {"create", "edit", "delete", "move", "create_directory"},
+    }
 
 
 def _runtime_tool_failed(tool_name: str, response: ToolMessage) -> bool:

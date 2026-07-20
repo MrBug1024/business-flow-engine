@@ -277,6 +277,10 @@
                 <p>{{ activeTab.payload?.path || activeTab.payload?.file?.summary }}</p>
               </div>
               <div class="toolbar-actions">
+                <el-tag v-if="activeTab.payload?.live_operation" class="live-file-tag" type="warning" effect="plain">
+                  <el-icon class="spin"><Loading /></el-icon>
+                  {{ fileOperationLabel(activeTab.payload.live_operation) }}
+                </el-tag>
                 <el-tag :type="activeTab.payload?.error ? 'danger' : activeTab.payload?.loading ? 'info' : 'success'">
                   {{ activeTab.payload?.loading ? t('filePreviewLoading') : activeTab.payload?.kind || t('file') }}
                 </el-tag>
@@ -795,6 +799,7 @@ import {
   Folder,
   FolderOpened,
   Headset,
+  Loading,
   MagicStick,
   MoreFilled,
   Picture,
@@ -1068,6 +1073,11 @@ Object.assign(copy.zh, {
   referencedFilesPrompt: '引用的业务场景文件：',
   resumeFailed: 'AI 续跑未完成，可从暂停点继续。',
   retryContinue: '继续执行',
+  fileOperationCreate: '正在创建',
+  fileOperationEdit: '正在编辑',
+  fileOperationMove: '正在移动',
+  fileOperationDelete: '正在删除',
+  fileOperationManage: '正在更新',
 })
 
 Object.assign(copy.en, {
@@ -1091,6 +1101,11 @@ Object.assign(copy.en, {
   referencedFilesPrompt: 'Referenced business scene files:',
   resumeFailed: 'AI continuation did not finish. Continue from the paused step.',
   retryContinue: 'Continue',
+  fileOperationCreate: 'Creating',
+  fileOperationEdit: 'Editing',
+  fileOperationMove: 'Moving',
+  fileOperationDelete: 'Deleting',
+  fileOperationManage: 'Updating',
 })
 
 const storedLanguage = localStorage.getItem('studio.language')
@@ -1508,6 +1523,11 @@ async function refreshCurrent() {
 async function refreshWorkspace() {
   if (!current.value) return
   await refreshCurrent()
+  await reloadWorkspaceTree()
+}
+
+async function reloadWorkspaceTree() {
+  if (!current.value) return
   workspaceTree.value = (await http.get(`/businesses/${current.value.id}/workspace/tree`)).data
 }
 
@@ -2129,6 +2149,9 @@ function handleRunEvent(event: any) {
     upsertTraceEvent(event)
   } else if (event.type === 'context_compaction') {
     upsertTraceEvent(event)
+  } else if (event.type === 'file_operation') {
+    upsertTraceEvent(event)
+    void handleFileOperationEvent(event)
   } else if ([
     'tool_call',
     'skill_activation',
@@ -2212,6 +2235,71 @@ function upsertTraceEvent(event: any) {
   const index = executionTrace.value.findIndex((item: any) => item.call_id && item.call_id === event.call_id)
   if (index >= 0) executionTrace.value[index] = event
   else executionTrace.value.push(event)
+}
+
+async function handleFileOperationEvent(event: any) {
+  if (!current.value || !event?.mutating) return
+  const operation = String(event.operation || 'manage')
+  const path = workspaceRelativePath(event.path)
+  const destination = workspaceRelativePath(event.destination)
+  if (!path) return
+
+  if (event.status === 'running' && ['create', 'edit'].includes(operation)) {
+    const title = path.split('/').pop() || path
+    const existing = tabs.value.find((tab) => tab.id === path)?.payload || {}
+    openTab({
+      id: path,
+      title,
+      kind: 'file',
+      payload: { ...existing, path, filename: title, loading: true, live_operation: operation },
+    })
+    return
+  }
+
+  if (event.status === 'failed') {
+    const tab = tabs.value.find((item) => item.id === path)
+    if (tab?.kind === 'file') {
+      tab.payload = {
+        ...tab.payload,
+        loading: false,
+        live_operation: '',
+        error: event.error || t('noPreview'),
+      }
+    }
+    return
+  }
+  if (event.status !== 'succeeded') return
+
+  await reloadWorkspaceTree()
+  if (operation === 'delete') {
+    closeTab(path)
+    return
+  }
+  if (operation === 'move') {
+    closeTab(path)
+    if (destination) {
+      await openWorkspaceFile({ name: destination.split('/').pop() || destination, path: destination })
+    }
+    return
+  }
+  if (operation === 'create_directory') return
+  await openWorkspaceFile({ name: path.split('/').pop() || path, path })
+}
+
+function workspaceRelativePath(value: unknown) {
+  const normalized = String(value || '').trim().replace(/\\/g, '/')
+  if (!normalized || normalized === '/workspace' || normalized.startsWith('/skills') || normalized.startsWith('/tmp')) return ''
+  return normalized.replace(/^\/workspace\/?/, '').replace(/^\/+/, '')
+}
+
+function fileOperationLabel(operation: string) {
+  const labels: Record<string, string> = {
+    create: t('fileOperationCreate'),
+    edit: t('fileOperationEdit'),
+    move: t('fileOperationMove'),
+    delete: t('fileOperationDelete'),
+  }
+  return labels[operation] || t('fileOperationManage')
 }
 
 function handleMessagesScroll() {
@@ -3026,6 +3114,14 @@ function emptyContext() {
   justify-content: space-between;
   gap: 14px;
   margin-bottom: 14px;
+}
+
+.live-file-tag {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+  min-width: 96px;
+  justify-content: center;
 }
 
 .editor-toolbar strong,

@@ -12,12 +12,12 @@ from typing import Any, Literal
 
 from langchain_core.tools import BaseTool
 
-from app.studio.mcp_runtime import call_mcp_tool
+from app.studio.capabilities.mcp import call_mcp_tool
 from app.studio.models import BusinessRecord
 from app.studio.settings import studio_settings
 from app.studio.storage import new_id, store
-from app.studio.tool_context import StudioToolContext, bind_tool_context
-from app.studio.tool_registry import tool_registry
+from app.studio.runtime.tool_context import StudioToolContext, bind_tool_context
+from app.studio.capabilities.tools import tool_registry
 
 
 CapabilityKind = Literal["tool", "mcp"]

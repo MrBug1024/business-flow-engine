@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from app.core.config import settings
-from app.studio.registry import SYSTEM_SKILLS_ROOT
+from app.studio.capabilities.registry import SYSTEM_SKILLS_ROOT
 
 
 _STORE_VERSION = 1

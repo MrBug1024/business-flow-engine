@@ -19,7 +19,7 @@ must be unique across this directory; duplicate names are reported and not mount
 Python modules execute during discovery. Only install code you trust.
 
 Tools that need the active workspace can call
-`app.studio.tool_context.get_tool_context()`. The returned context exposes the
+`app.studio.runtime.tool_context.get_tool_context()`. The returned context exposes the
 workspace root, the active record, a safe relative-path resolver, persistence,
 and event emission. Optional tool metadata is also discovered by the runtime:
 

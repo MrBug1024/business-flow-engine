@@ -21,7 +21,7 @@ from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import PrivateAttr
 
-from app.studio.llm import ModelStreamEvent, stream_model_turn
+from app.studio.runtime.llm import ModelStreamEvent, stream_model_turn
 from app.studio.models import BusinessRecord
 
 

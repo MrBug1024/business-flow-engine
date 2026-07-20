@@ -16,7 +16,7 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 
-from app.studio import registry
+from app.studio.capabilities import registry
 from app.studio.models import SkillDefinition
 
 

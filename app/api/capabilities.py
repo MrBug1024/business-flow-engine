@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile
 
-from app.studio.mcp_runtime import (
+from app.studio.capabilities.mcp import (
     merge_masked_mcp_configs,
     normalize_mcp_payload,
     probe_mcp_configs,
@@ -16,9 +16,9 @@ from app.studio.models import (
     UpdateMCPServerRequest,
     UpdateStudioSettings,
 )
-from app.studio.registry import list_skills
+from app.studio.capabilities.registry import list_skills
 from app.studio.settings import studio_settings
-from app.studio.skill_installer import (
+from app.studio.capabilities.skill_installer import (
     MAX_SKILL_FILES,
     MAX_SKILL_FILE_BYTES,
     MAX_SKILL_TOTAL_BYTES,
@@ -27,7 +27,7 @@ from app.studio.skill_installer import (
     install_skill_files,
     install_skill_from_url,
 )
-from app.studio.tool_registry import tool_registry
+from app.studio.capabilities.tools import tool_registry
 
 router = APIRouter(tags=["capabilities"])
 

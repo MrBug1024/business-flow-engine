@@ -31,9 +31,9 @@ from app.studio.models import (
     WorkspaceNode,
 )
 from app.studio.orchestrator import ResumeBlockedError, orchestrator
-from app.studio.registry import SYSTEM_SKILLS_ROOT
+from app.studio.capabilities.registry import SYSTEM_SKILLS_ROOT
 from app.studio.runtime import clear_runtime_thread
-from app.studio.sandbox_runtime import SandboxError, sandbox_manager
+from app.studio.runtime.sandbox import SandboxError, sandbox_manager
 from app.studio.storage import new_id, store
 
 router = APIRouter(tags=["business-studio"])
@@ -120,7 +120,6 @@ def delete_workspace_path(business_id: str, path: str) -> dict[str, Any]:
 
 
 @router.get("/businesses/{business_id}/description")
-@router.get("/businesses/{business_id}/scenario-description", deprecated=True)
 def get_description(business_id: str) -> dict[str, Any]:
     record = _record_or_404(business_id)
     return {
@@ -131,7 +130,6 @@ def get_description(business_id: str) -> dict[str, Any]:
 
 
 @router.patch("/businesses/{business_id}/description", response_model=BusinessRecord)
-@router.patch("/businesses/{business_id}/scenario-description", response_model=BusinessRecord, deprecated=True)
 def update_description(business_id: str, req: DescriptionMarkdownRequest) -> BusinessRecord:
     record = _record_or_404(business_id)
     store.write_description_markdown(record, req.content)

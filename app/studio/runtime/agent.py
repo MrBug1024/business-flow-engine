@@ -6,10 +6,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-from app.studio.capability_runtime import Capability
-from app.studio.llm import stream_model_turn
+from app.studio.runtime.capabilities import Capability
+from app.studio.runtime.llm import stream_model_turn
 from app.studio.models import BusinessRecord
-from app.studio.registry import list_skills
 from app.studio.storage import store
 
 
@@ -75,6 +74,10 @@ Runtime contract:
   DeepAgents. The writable project is `/workspace`; `python` and `python -m pip`
   always resolve to Studio's system-level managed venv outside the business workspace,
   never to the ambient system Python environment.
+- Sandbox commands run in the host's native shell. Never assume Unix utilities are
+  available. Prefer a Skill's documented CLI and structured output; run one complete
+  command at a time, and do not use pipelines, redirection, heredocs, or ad-hoc helper
+  scripts merely to inspect or reshape a Skill artifact.
 - After activating a Skill, resolve all relative resource paths from that Skill's
   `/skills/<name>/` directory. Use absolute Skill paths or explicitly `cd` into that
   directory before running its documented commands.
@@ -113,12 +116,6 @@ Mounted capabilities:
 """
 
 
-def _skill_instructions() -> str:
-    """Return a compact catalog; full instructions are loaded on demand."""
-
-    return "\n".join(f"- {skill.name}: {skill.description}" for skill in list_skills())
-
-
 def _safe_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     return {str(key): _redact_value(str(key), value) for key, value in arguments.items()}
 
@@ -134,4 +131,4 @@ def _redact_value(key: str, value: Any) -> Any:
     return value
 
 
-__all__ = ["_safe_arguments", "_skill_instructions", "_system_prompt", "stream_model_turn"]
+__all__ = ["_safe_arguments", "_system_prompt", "stream_model_turn"]

@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     openai_base_url: str = "https://api.minimaxi.com/v1"
     llm_model: str = "MiniMax-M2"
     llm_temperature: float = 0.0
-    llm_parallel_tool_calls: bool = False
+    llm_parallel_tool_calls: bool = True
     # Safety ceilings, not workflow targets. Context summarization normally keeps a
     # task inside one run; a fresh run is reserved for a real context boundary.
     agent_model_call_limit: int = 64

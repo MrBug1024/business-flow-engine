@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from langchain_core.tools import tool
 
-from app.studio.tool_context import get_tool_context
+from app.studio.runtime.tool_context import get_tool_context
 
 
 ProgressAction = Literal["plan", "start", "update", "complete", "block", "compact"]

@@ -7,14 +7,14 @@ import re
 import threading
 
 from app.core.config import settings as env_settings
-from app.studio.mcp_runtime import (
+from app.studio.capabilities.mcp import (
     merge_masked_mcp_configs,
     normalize_stored_mcp_configs,
     public_mcp_configs,
 )
 from app.studio.models import AIModelConfig, StudioSettings, UpdateStudioSettings
-from app.studio.registry import list_skills
-from app.studio.tool_registry import tool_registry
+from app.studio.capabilities.registry import list_skills
+from app.studio.capabilities.tools import tool_registry
 
 
 MODEL_SECRET_MASK = "********"

@@ -36,7 +36,7 @@ MAX_SNIPPET = 320
 MAX_CARD_STATEMENT = 480
 MAX_EVIDENCE_PAGE = 20
 MAX_BRIEF_CARDS = 40
-MAX_BRIEF_STATEMENTS = 10
+MAX_BRIEF_STATEMENTS = 8
 MAX_SCENARIO_NODES = 10
 MAX_SCENARIO_EDGES = 14
 MAX_SCENARIO_BRANCHES = 3
@@ -60,14 +60,14 @@ EDGE_ENDPOINT_TYPES: dict[str, tuple[set[str], set[str]]] = {
     "governed_by": ({"activity", "decision", "system"}, {"rule"}),
     "performed_by": ({"activity", "decision"}, {"actor"}),
     "feeds": (
-        {"trigger", "input", "object", "state", "system"},
+        {"trigger", "input", "object", "activity", "state", "system"},
         {"activity", "decision", "system", "object", "output"},
     ),
     "joins_with": ({"input", "object", "state"}, {"input", "object", "state"}),
     "governs": ({"rule"}, {"activity", "decision", "system", "object", "output"}),
     "derives": (
         {"input", "object", "activity", "decision", "system", "state"},
-        {"object", "state", "output"},
+        {"decision", "object", "state", "output"},
     ),
 }
 RELATION_MARKERS = (
@@ -748,7 +748,7 @@ def compact_evidence_card(card: dict[str, Any]) -> dict[str, Any]:
     facts = card.get("facts") if isinstance(card.get("facts"), dict) else {}
     compact_facts: dict[str, Any]
     if kind == "scenario_goal":
-        compact_facts = {"description": compact_text(facts.get("description", ""), 720)}
+        compact_facts = {"description": compact_text(facts.get("description", ""), 600)}
     elif kind == "table_schema":
         columns = facts.get("columns_by_role") if isinstance(facts.get("columns_by_role"), dict) else {}
         compact_facts = {
@@ -757,7 +757,7 @@ def compact_evidence_card(card: dict[str, Any]) -> dict[str, Any]:
             "column_count": facts.get("column_count"),
             "inferred_material_role": facts.get("inferred_material_role", ""),
             "columns_by_role": {
-                str(role): list(values)[:4]
+                str(role): [compact_text(value, 48) for value in values[:3]]
                 for role, values in columns.items()
                 if isinstance(values, list) and values
             },
@@ -775,43 +775,49 @@ def compact_evidence_card(card: dict[str, Any]) -> dict[str, Any]:
                     "confidence": item.get("confidence", 0),
                     "evidence_count": item.get("evidence_count", 0),
                 }
-                for item in correspondences[:6]
+                for item in correspondences[:4]
                 if isinstance(item, dict)
             ],
             "omitted_correspondence_count": int(facts.get("omitted_correspondence_count", 0))
-            + max(0, len(correspondences) - 6),
+            + max(0, len(correspondences) - 4),
             "confidence": facts.get("confidence", 0),
             "evidence_count": facts.get("evidence_count", 0),
         }
+    elif kind == "file_structure":
+        compact_facts = {
+            "extension": facts.get("extension", ""),
+            "table_count": facts.get("table_count", 0),
+            "inventory_status": facts.get("inventory_status", "ok"),
+        }
+    elif kind == "table_process_signal":
+        compact_facts = {
+            "table": compact_text(facts.get("table", ""), 80),
+            "co_located_roles": list(facts.get("co_located_roles", []))[:8],
+            "inferred_material_role": facts.get("inferred_material_role", ""),
+        }
+    elif kind in {"goal_relation_statement", "document_relation_statement", "table_relation_statement", "material_topic_alignment"}:
+        compact_facts = {
+            "relation_markers": list(facts.get("relation_markers", []))[:6],
+            "mentioned_files": list(facts.get("mentioned_files", []))[:4],
+        }
     else:
-        compact_facts = facts
+        compact_facts = {}
     return {
         "id": card.get("id", ""),
         "kind": kind,
         "strength": card.get("strength", ""),
-        "statement": compact_text(card.get("statement", ""), MAX_CARD_STATEMENT),
+        "statement": compact_text(card.get("statement", ""), 280),
         "sources": list(card.get("sources", []))[:2],
         "facts": compact_facts,
-        "snippet": compact_text(card.get("snippet", ""), MAX_SNIPPET),
+        "snippet": compact_text(card.get("snippet", ""), 240),
     }
 
 
 def synthesis_brief(payload: dict[str, Any]) -> dict[str, Any]:
     cards = [card for card in payload.get("cards", []) if isinstance(card, dict)]
-    core_kinds = {
-        "scenario_goal", "goal_relation_statement", "file_structure", "table_schema",
-        "table_process_signal", "field_relationship",
-    }
     statement_kinds = {
-        "document_relation_statement", "table_relation_statement", "material_topic_alignment",
-    }
-    kind_order = {
-        "scenario_goal": 0,
-        "goal_relation_statement": 1,
-        "file_structure": 2,
-        "table_schema": 3,
-        "table_process_signal": 4,
-        "field_relationship": 5,
+        "goal_relation_statement", "document_relation_statement", "table_relation_statement",
+        "material_topic_alignment",
     }
     context_text = " ".join(
         str(card.get("snippet") or card.get("facts", {}).get("description") or "")
@@ -820,14 +826,23 @@ def synthesis_brief(payload: dict[str, Any]) -> dict[str, Any]:
     )
     context_text += " " + " ".join(str(item) for item in payload.get("coverage", {}).get("files", []))
     context_tokens = relation_tokens(context_text)
-    core = sorted(
-        (card for card in cards if card.get("kind") in core_kinds),
-        key=lambda card: (
-            kind_order.get(str(card.get("kind")), 99),
-            str(card.get("sources", [{}])[0].get("file", "")),
-            str(card.get("id", "")),
-        ),
-    )
+    def source_key(card: dict[str, Any]) -> tuple[str, str]:
+        sources = card.get("sources") if isinstance(card.get("sources"), list) else []
+        first = sources[0] if sources and isinstance(sources[0], dict) else {}
+        return (str(first.get("file", "")), str(card.get("id", "")))
+
+    def first_per_file(kind: str, limit: int) -> list[dict[str, Any]]:
+        selected: list[dict[str, Any]] = []
+        seen_files: set[str] = set()
+        for card in sorted((item for item in cards if item.get("kind") == kind), key=source_key):
+            file_name = source_key(card)[0]
+            if file_name in seen_files:
+                continue
+            selected.append(card)
+            seen_files.add(file_name)
+            if len(selected) >= limit:
+                break
+        return selected
 
     def statement_rank(card: dict[str, Any]) -> tuple[int, str]:
         text = f"{card.get('snippet', '')} {card.get('statement', '')}"
@@ -840,7 +855,24 @@ def synthesis_brief(payload: dict[str, Any]) -> dict[str, Any]:
         (card for card in cards if card.get("kind") in statement_kinds),
         key=statement_rank,
     )[:MAX_BRIEF_STATEMENTS]
-    selected = (core[:MAX_BRIEF_CARDS - len(statements)] + statements)[:MAX_BRIEF_CARDS]
+    candidates = (
+        sorted((card for card in cards if card.get("kind") == "scenario_goal"), key=source_key)[:1]
+        + first_per_file("file_structure", MAX_BRIEF_CARDS)
+        + first_per_file("table_schema", 16)
+        + sorted((card for card in cards if card.get("kind") == "field_relationship"), key=source_key)[:6]
+        + first_per_file("table_process_signal", 6)
+        + statements
+    )
+    selected: list[dict[str, Any]] = []
+    selected_ids: set[str] = set()
+    for card in candidates:
+        card_id = str(card.get("id", ""))
+        if not card_id or card_id in selected_ids:
+            continue
+        selected.append(card)
+        selected_ids.add(card_id)
+        if len(selected) >= MAX_BRIEF_CARDS:
+            break
     files = list(payload.get("coverage", {}).get("files", []))
     return {
         "schema_version": SCHEMA_VERSION,
@@ -856,8 +888,8 @@ def synthesis_brief(payload: dict[str, Any]) -> dict[str, Any]:
         },
         "cards": [compact_evidence_card(card) for card in selected],
         "next_action": (
-            "Read references/scenario-synthesis.md, write scenario-claims.json from these evidence IDs, "
-            "then run finalize. Query additional evidence only by file or ID when a required edge remains unsupported."
+            "Write one bounded scenario-claims.candidate.json from these evidence IDs, run preflight, "
+            "apply any returned repair hints to that same candidate, then finalize only after preflight is valid."
         ),
     }
 
@@ -1414,12 +1446,105 @@ def mutate_claims(args: argparse.Namespace) -> dict[str, Any]:
     return {"status": "success", "claims": str(claims_path), **detail}
 
 
+def compatible_edge_types(source_type: str, target_type: str) -> list[str]:
+    return sorted(
+        edge_type
+        for edge_type, (allowed_sources, allowed_targets) in EDGE_ENDPOINT_TYPES.items()
+        if source_type in allowed_sources and target_type in allowed_targets
+    )
+
+
+def validation_payload(
+    claims: dict[str, Any],
+    card_payload: dict[str, Any],
+    claims_path: Path,
+) -> dict[str, Any]:
+    errors = validate_claims(claims, card_payload)
+    if not errors:
+        return {
+            "status": "valid",
+            "error_count": 0,
+            "claims": str(claims_path),
+            "node_count": len(claims.get("nodes", [])),
+            "edge_count": len(claims.get("edges", [])),
+            "branch_count": len(claims.get("branches", [])),
+            "next_action": "Run finalize with this exact claims path.",
+        }
+
+    node_by_id = {
+        str(node.get("id", "")): node
+        for node in claims.get("nodes", [])
+        if isinstance(node, dict)
+    }
+    repair_hints: list[dict[str, Any]] = []
+    for edge in claims.get("edges", []):
+        if not isinstance(edge, dict):
+            continue
+        source = str(edge.get("source", ""))
+        target = str(edge.get("target", ""))
+        edge_type = str(edge.get("type", ""))
+        if source not in node_by_id or target not in node_by_id or edge_type not in EDGE_ENDPOINT_TYPES:
+            continue
+        source_type = str(node_by_id[source].get("type", ""))
+        target_type = str(node_by_id[target].get("type", ""))
+        allowed_sources, allowed_targets = EDGE_ENDPOINT_TYPES[edge_type]
+        if source_type in allowed_sources and target_type in allowed_targets:
+            continue
+        compatible = compatible_edge_types(source_type, target_type)
+        repair_hints.append({
+            "claim": "edge",
+            "id": str(edge.get("id", "")),
+            "problem": "invalid_direction",
+            "current_type": edge_type,
+            "source_type": source_type,
+            "target_type": target_type,
+            "compatible_types": compatible,
+            "repair": (
+                "Choose a compatible type only when it preserves the evidence-backed meaning; "
+                "otherwise reverse, remove, or restructure this edge."
+            ),
+        })
+    return {
+        "status": "validation_failed",
+        "error_count": len(errors),
+        "errors": errors,
+        "claims": str(claims_path),
+        "repair_target": str(claims_path),
+        "candidate_preserved": True,
+        "repair_hints": repair_hints,
+        "next_action": (
+            "Fix all errors on repair_target in one pass. Prefer the documented claims-* commands for "
+            "small edits, then rerun preflight. Do not inspect validator source or create helper scripts."
+        ),
+    }
+
+
+def preflight(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
+    output_root = Path(args.output).resolve()
+    cards_path = Path(args.cards).resolve() if args.cards else output_root / "evidence-cards.json"
+    claims_path = Path(args.claims).resolve()
+    card_payload = json.loads(cards_path.read_text(encoding="utf-8"))
+    claims = _load_claims(claims_path)
+    payload = validation_payload(claims, card_payload, claims_path)
+    validation_path = output_root / "validation-errors.json"
+    if payload["status"] == "validation_failed":
+        atomic_json(validation_path, payload)
+        return 2, payload
+    validation_path.unlink(missing_ok=True)
+    return 0, payload
+
+
 def finalize(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     output_root = Path(args.output).resolve()
     cards_path = Path(args.cards).resolve() if args.cards else output_root / "evidence-cards.json"
     claims_path = Path(args.claims).resolve()
     card_payload = json.loads(cards_path.read_text(encoding="utf-8"))
-    claims = json.loads(claims_path.read_text(encoding="utf-8"))
+    claims = _load_claims(claims_path)
+    validation = validation_payload(claims, card_payload, claims_path)
+    if validation["status"] == "validation_failed":
+        payload = validation
+        atomic_json(output_root / "validation-errors.json", payload)
+        return 2, payload
     canonical_claims_path = output_root / "scenario-claims.json"
     if claims_path != canonical_claims_path:
         atomic_json(canonical_claims_path, claims)
@@ -1428,11 +1553,6 @@ def finalize(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             and claims_path.name.startswith("scenario-claims.candidate")
         ):
             claims_path.unlink(missing_ok=True)
-    errors = validate_claims(claims, card_payload)
-    if errors:
-        payload = {"status": "validation_failed", "error_count": len(errors), "errors": errors}
-        atomic_json(output_root / "validation-errors.json", payload)
-        return 2, payload
     cards_by_id = {card["id"]: card for card in card_payload["cards"]}
     result = {
         "schema_version": SCHEMA_VERSION,
@@ -1560,6 +1680,10 @@ def build_parser() -> argparse.ArgumentParser:
     claims_remove.add_argument("--claims", required=True)
     claims_remove.add_argument("--kind", choices=["node", "edge", "branch"], required=True)
     claims_remove.add_argument("--id", required=True)
+    check = commands.add_parser("preflight")
+    check.add_argument("--claims", required=True)
+    check.add_argument("--cards", default="")
+    check.add_argument("--output", default="/workspace/outputs/data-relations")
     finish = commands.add_parser("finalize")
     finish.add_argument("--claims", required=True)
     finish.add_argument("--cards", default="")
@@ -1605,6 +1729,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command.startswith("claims-"):
             print_agent_json(mutate_claims(args))
             return 0
+        if args.command == "preflight":
+            code, payload = preflight(args)
+            print_agent_json(payload, stream=sys.stderr if code else sys.stdout)
+            return code
         if args.command == "finalize":
             code, payload = finalize(args)
             stream = sys.stderr if code else sys.stdout

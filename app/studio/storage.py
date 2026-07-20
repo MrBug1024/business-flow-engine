@@ -13,7 +13,7 @@ from typing import Any
 
 from app.core.config import settings
 from app.studio.graphs import entity_graph, evidence_graph, flow_graph, lineage_graph
-from app.studio.llm import strip_thinking_markup
+from app.studio.runtime.llm import strip_thinking_markup
 from app.studio.models import (
     AIRun,
     BusinessContext,
@@ -25,7 +25,7 @@ from app.studio.models import (
     PackageRecord,
     WorkspaceNode,
 )
-from app.studio.registry import installed_skill_names
+from app.studio.capabilities.registry import installed_skill_names
 
 
 DESCRIPTION_FILENAME = "description.md"
@@ -234,12 +234,6 @@ class StudioStore:
         self.create_version(record, "Updated description.md", "edit_description_markdown", actor="user")
         return self.save(record)
 
-    def read_scenario_markdown(self, record: BusinessRecord) -> str:
-        return self.read_description_markdown(record)
-
-    def write_scenario_markdown(self, record: BusinessRecord, content: str) -> BusinessRecord:
-        return self.write_description_markdown(record, content)
-
     def create_version(
         self,
         record: BusinessRecord,
@@ -394,7 +388,13 @@ class StudioStore:
             pass
         return package
 
-    def delete_workspace_file(self, record: BusinessRecord, requested_path: str) -> dict[str, Any] | None:
+    def delete_workspace_file(
+        self,
+        record: BusinessRecord,
+        requested_path: str,
+        *,
+        actor: str = "user",
+    ) -> dict[str, Any] | None:
         with self._lock:
             workspace = self.workspace_dir(record.id).resolve()
             normalized = requested_path.replace("\\", "/").strip("/")
@@ -452,7 +452,7 @@ class StudioStore:
                 record,
                 f"Deleted workspace file {relative_path}",
                 "delete_workspace_file",
-                actor="user",
+                actor=actor,
                 evidence_ids=evidence_ids,
             )
             self.save(record)
@@ -535,14 +535,14 @@ class StudioStore:
         self.settings_dir(record.id)
         changed = _migrate_legacy_description_file(workspace)
         description = self.description_markdown_path(record.id)
-        if not description.exists() and DESCRIPTION_FILENAME not in record.workspace_deleted_paths:
+        if not description.exists() and not _workspace_path_is_deleted(record, DESCRIPTION_FILENAME):
             description.write_text(_description_markdown(record), encoding="utf-8")
             changed = True
         return changed
 
     def _write_workspace_artifacts(self, record: BusinessRecord) -> None:
         context_payload = record.context.model_dump(mode="json")
-        if "context/business_context.json" not in record.workspace_deleted_paths:
+        if not _workspace_path_is_deleted(record, "context/business_context.json"):
             (self.context_dir(record.id) / "business_context.json").write_text(
                 json.dumps(context_payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -555,7 +555,7 @@ class StudioStore:
         }
         for filename, builder in graph_builders.items():
             relative = f"graphs/{filename}"
-            if relative not in record.workspace_deleted_paths:
+            if not _workspace_path_is_deleted(record, relative):
                 (self.graphs_dir(record.id) / filename).write_text(
                     builder(record.context)["mermaid"],
                     encoding="utf-8",
@@ -565,7 +565,7 @@ class StudioStore:
             "mcp": record.context.mcp_references,
             "tools": record.context.tool_usages,
         }
-        if "settings/capabilities.json" not in record.workspace_deleted_paths:
+        if not _workspace_path_is_deleted(record, "settings/capabilities.json"):
             (self.settings_dir(record.id) / "capabilities.json").write_text(
                 json.dumps(capability_state, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -673,6 +673,16 @@ def _clear_workspace_tombstone(record: BusinessRecord, relative_path: str) -> No
     record.workspace_deleted_paths = [
         item for item in record.workspace_deleted_paths if item != normalized
     ]
+
+
+def _workspace_path_is_deleted(record: BusinessRecord, relative_path: str) -> bool:
+    normalized = relative_path.replace("\\", "/").strip("/")
+    return any(
+        normalized == item.replace("\\", "/").strip("/")
+        or normalized.startswith(item.replace("\\", "/").strip("/") + "/")
+        for item in record.workspace_deleted_paths
+        if item.replace("\\", "/").strip("/")
+    )
 
 
 def _tree_node(path: Path, base: Path, root_name: str | None = None) -> WorkspaceNode:

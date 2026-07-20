@@ -12,9 +12,9 @@ from typing import Any, Literal
 
 from app.core.config import settings as env_settings
 from app.studio.models import BusinessRecord
-from app.studio.registry import list_skills
+from app.studio.capabilities.registry import list_skills
 from app.studio.settings import studio_settings
-from app.studio.tool_registry import tool_registry
+from app.studio.capabilities.tools import tool_registry
 
 
 StreamKind = Literal["content", "reasoning", "completed"]

@@ -40,9 +40,6 @@ class DescriptionMarkdownRequest(BaseModel):
     content: str = Field(max_length=80000)
 
 
-ScenarioMarkdownRequest = DescriptionMarkdownRequest
-
-
 class AIModelConfig(BaseModel):
     id: str
     name: str

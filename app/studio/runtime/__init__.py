@@ -6,7 +6,7 @@ from collections.abc import Iterator
 from functools import lru_cache
 from typing import Any
 
-from app.studio.graph_runtime import StudioGraphRuntime
+from app.studio.runtime.graph import StudioGraphRuntime
 from app.studio.models import AIRun, BusinessRecord
 
 

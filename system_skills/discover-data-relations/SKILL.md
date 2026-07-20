@@ -23,6 +23,7 @@ description: >
 - 不为了图看起来完整而补关系。证据不足就删边或明确待确认。
 - main_chain 是兼容字段，语义上表示“主数据路径”，不是业务流程步骤。
 - 只有顶层 scenario-relationship.json 状态为 complete、无 validation-errors.json，且 relations.mmd、relation-report.md 均存在时才算完成。
+- 命令运行环境使用宿主原生 Shell，不假设 Bash。每次只执行文档中的一条完整命令；不得使用 `|`、`&&`、重定向、`head`、`cat`、`wc`、heredoc 或内联 Python，也不得创建临时脚本来读取、裁剪或改写 JSON。
 
 ## 用户可见进展
 
@@ -55,7 +56,7 @@ python /skills/discover-data-relations/scripts/analyze_relations.py analyze \
   --summary-limit 20
 ~~~
 
-状态为 partial 时，用完全相同的命令恢复。状态为 ready_for_synthesis 后，向用户说明识别到的材料类型、文件覆盖和下一步；不要重新扫描。
+状态为 partial 时，用完全相同的命令恢复。状态为 ready_for_synthesis 后，返回值已经包含严格限长的 synthesis_brief；直接使用它综合，向用户说明识别到的材料类型、文件覆盖和下一步，不要重新扫描，也不要另写脚本压缩材料。
 
 若需要恢复紧凑简报，只执行一次：
 
@@ -87,7 +88,35 @@ python /skills/discover-data-relations/scripts/analyze_relations.py evidence \
 
 候选必须是合法 JSON，使用 scenario-claims.template.json 的结构，内容保持在 20 KB 内。允许使用一次 write_file 写入这个候选文件；不要用几十个原子命令逐节点、逐边拼装，也不要覆盖正式的 scenario-claims.json。
 
-### 3. 整体验收
+### 3. 预检与定点修复
+
+先预检候选，预检不会覆盖正式结果，也不会删除失败候选：
+
+~~~bash
+python /skills/discover-data-relations/scripts/analyze_relations.py preflight \
+  --claims /workspace/outputs/data-relations/scenario-claims.candidate.json \
+  --output /workspace/outputs/data-relations
+~~~
+
+状态为 valid 才进入 finalize。若为 validation_failed：
+
+1. 直接使用返回的 repair_target、errors 和 repair_hints，不要搜索或阅读校验器源码；
+2. 多个结构问题在内存中一次修正并用一次 write_file 重写同一候选；
+3. 单条节点或边属性错误优先用对应的 claims-node / claims-edge 命令定点修改；
+4. 只再执行一次 preflight 验证整体验修结果。
+
+例如，只修正一条边的语义类型：
+
+~~~bash
+python /skills/discover-data-relations/scripts/analyze_relations.py claims-edge \
+  --claims /workspace/outputs/data-relations/scenario-claims.candidate.json \
+  --id e_example \
+  --edge-type feeds
+~~~
+
+兼容类型只表示结构合法，最终选择仍必须符合该边引用的业务证据。不得一条错误跑一轮模型，不得创建辅助脚本，不得在没有新增证据或结构调整时重复相同尝试。相同根因连续失败时，报告真实阻塞和缺失证据。
+
+### 4. 整体验收
 
 ~~~bash
 python /skills/discover-data-relations/scripts/analyze_relations.py finalize \
@@ -96,16 +125,9 @@ python /skills/discover-data-relations/scripts/analyze_relations.py finalize \
   --summary-limit 20
 ~~~
 
-若返回 validation_failed：
+finalize 只负责将已经通过预检的候选提升为正式结果并生成交付文件。如果仍返回 validation_failed，候选会原样保留；按返回的 repair_target 恢复，不得重新初始化或覆盖检查点。
 
-1. 一次读取 validation-errors.json；
-2. 在内存中同时修正全部问题；
-3. 一次重写完整候选；
-4. 再次执行 finalize。
-
-不得一条错误跑一次命令，也不得在没有新增证据或结构调整时重复相同尝试。相同根因连续失败时，报告真实阻塞和缺失证据。
-
-### 4. 交付
+### 5. 交付
 
 验收后读取有界摘要：
 
@@ -128,7 +150,7 @@ python /skills/discover-data-relations/scripts/analyze_relations.py summary \
 
 1. prepare-status.json
 2. synthesis-brief.json
-3. scenario-claims.candidate.json 或 scenario-claims.json
+3. scenario-claims.candidate.json 或 scenario-claims.json（对找到的文件执行 preflight）
 4. validation-errors.json
 5. scenario-relationship.json
 
