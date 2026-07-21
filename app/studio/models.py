@@ -198,6 +198,7 @@ class PackageRecord(BaseModel):
 
 class BusinessRecord(BaseModel):
     id: str
+    owner_id: str = ""
     name: str
     goal: str = ""
     description: str = ""

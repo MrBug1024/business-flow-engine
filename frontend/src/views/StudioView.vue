@@ -14,6 +14,7 @@
         <span v-if="activeTab" class="title-file">{{ activeTab.title }}</span>
       </div>
       <div class="title-actions">
+        <AccountMenu :language="uiLanguage" />
         <el-button
           :icon="Plus"
           text
@@ -701,6 +702,7 @@ import SkillSettingsPanel from '@/components/SkillSettingsPanel.vue'
 import ToolSettingsPanel from '@/components/ToolSettingsPanel.vue'
 import WorkspaceMentionMenu, { type MentionFile } from '@/components/WorkspaceMentionMenu.vue'
 import BusinessResourceExplorer from '@/components/studio/BusinessResourceExplorer.vue'
+import AccountMenu from '@/components/studio/AccountMenu.vue'
 import { useBusinessResourceTrees } from '@/composables/useBusinessResourceTrees'
 import { useBusinessResourceActions } from '@/composables/useBusinessResourceActions'
 import { useResizableStudioPanes } from '@/composables/useResizableStudioPanes'

@@ -115,7 +115,14 @@ class StudioStore:
     def _meta_file(self, business_id: str) -> Path:
         return self.business_dir(business_id) / "business.json"
 
-    def create(self, name: str, goal: str = "", description: str = "") -> BusinessRecord:
+    def create(
+        self,
+        name: str,
+        goal: str = "",
+        description: str = "",
+        *,
+        owner_id: str = "",
+    ) -> BusinessRecord:
         with self._lock:
             business_id = new_id("biz")
             ts = now()
@@ -138,6 +145,7 @@ class StudioStore:
             )
             record = BusinessRecord(
                 id=business_id,
+                owner_id=owner_id,
                 name=name.strip(),
                 goal=cleaned_goal,
                 description=cleaned_description,
@@ -159,7 +167,7 @@ class StudioStore:
             self.save(record)
             return record
 
-    def list(self) -> list[BusinessSummary]:
+    def list(self, owner_id: str | None = None) -> list[BusinessSummary]:
         with self._lock:
             items: list[BusinessSummary] = []
             for meta in self.business_root.glob("*/business.json"):
@@ -167,16 +175,20 @@ class StudioStore:
                     record = self._read(meta)
                 except Exception:  # noqa: BLE001
                     continue
+                if owner_id is not None and record.owner_id != owner_id:
+                    continue
                 items.append(self.to_summary(record))
             items.sort(key=lambda item: item.updated_at, reverse=True)
             return items
 
-    def get(self, business_id: str) -> BusinessRecord | None:
+    def get(self, business_id: str, owner_id: str | None = None) -> BusinessRecord | None:
         with self._lock:
             meta = self._meta_file(business_id)
             if not meta.exists():
                 return None
             record = self._read(meta)
+            if owner_id is not None and record.owner_id != owner_id:
+                return None
             changed = _sanitize_legacy_runtime_state(record)
             changed = _ensure_chat_sessions(record) or changed
             changed = self._ensure_workspace(record) or changed
@@ -188,8 +200,8 @@ class StudioStore:
                 target.write_text(record.model_dump_json(indent=2), encoding="utf-8")
             return record
 
-    def require(self, business_id: str) -> BusinessRecord:
-        record = self.get(business_id)
+    def require(self, business_id: str, owner_id: str | None = None) -> BusinessRecord:
+        record = self.get(business_id, owner_id)
         if record is None:
             raise KeyError(business_id)
         return record
@@ -207,6 +219,23 @@ class StudioStore:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(record.model_dump_json(indent=2), encoding="utf-8")
             return record
+
+    def claim_unowned(self, owner_id: str) -> list[str]:
+        """Assign legacy workspaces to the first registered Studio account."""
+
+        claimed: list[str] = []
+        with self._lock:
+            for meta in self.business_root.glob("*/business.json"):
+                try:
+                    record = self._read(meta)
+                except Exception:  # noqa: BLE001
+                    continue
+                if record.owner_id:
+                    continue
+                record.owner_id = owner_id
+                meta.write_text(record.model_dump_json(indent=2), encoding="utf-8")
+                claimed.append(record.id)
+        return claimed
 
     def delete(self, business_id: str) -> bool:
         with self._lock:
@@ -617,10 +646,14 @@ class StudioStore:
             pass
         return match
 
-    def find_file(self, file_id: str) -> tuple[BusinessRecord, Any] | None:
+    def find_file(
+        self,
+        file_id: str,
+        owner_id: str | None = None,
+    ) -> tuple[BusinessRecord, Any] | None:
         with self._lock:
-            for summary in self.list():
-                record = self.get(summary.id)
+            for summary in self.list(owner_id):
+                record = self.get(summary.id, owner_id)
                 if record is None:
                     continue
                 match = next((item for item in record.files if item.id == file_id), None)
@@ -628,10 +661,14 @@ class StudioStore:
                     return record, match
         return None
 
-    def find_package(self, package_id: str) -> tuple[BusinessRecord, PackageRecord] | None:
+    def find_package(
+        self,
+        package_id: str,
+        owner_id: str | None = None,
+    ) -> tuple[BusinessRecord, PackageRecord] | None:
         with self._lock:
-            for summary in self.list():
-                record = self.get(summary.id)
+            for summary in self.list(owner_id):
+                record = self.get(summary.id, owner_id)
                 if record is None:
                     continue
                 match = next((item for item in record.packages if item.id == package_id), None)

@@ -40,6 +40,27 @@ class Settings(BaseSettings):
     agent_system_prompt_character_limit: int = 12_000
     agent_tool_schema_character_limit: int = 40_000
     data_dir: str = "data"
+    system_dir: str = "system"
+
+    # Account sessions and email verification.
+    jwt_secret: str = "change-me-in-production-please"
+    jwt_expire_hours: int = 168
+    auth_cookie_name: str = "studio_session"
+    auth_cookie_secure: bool = False
+    verification_code_ttl_minutes: int = 10
+    verification_code_resend_seconds: int = 60
+    verification_code_max_per_hour: int = 5
+    verification_code_max_attempts: int = 5
+
+    mail_username: str = ""
+    mail_password: str = ""
+    mail_from: str = ""
+    mail_port: int = 587
+    mail_server: str = "smtp.163.com"
+    mail_starttls: bool = False
+    mail_ssl_tls: bool = True
+    mail_use_credentials: bool = True
+    mail_timeout_seconds: int = 20
 
     host: str = "127.0.0.1"
     port: int = 8000
@@ -78,6 +99,14 @@ class Settings(BaseSettings):
     @property
     def llm_enabled(self) -> bool:
         return self.openai_api_key.strip() not in _PLACEHOLDER_KEYS
+
+    @property
+    def system_path(self) -> Path:
+        path = Path(self.system_dir)
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     @property
     def env_model_name(self) -> str:

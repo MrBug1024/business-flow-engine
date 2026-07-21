@@ -102,7 +102,7 @@
 }
 
 .studio-shell.settings-focus .title-bar {
-  grid-template-columns: calc(var(--activity-width) + var(--explorer-width)) minmax(0, 1fr) 120px;
+  grid-template-columns: calc(var(--activity-width) + var(--explorer-width)) minmax(0, 1fr) 330px;
 }
 
 .title-bar {
@@ -173,6 +173,7 @@
 }
 
 .title-actions {
+  gap: 2px;
   justify-content: flex-end;
   padding-right: 8px;
 }

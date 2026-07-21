@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
 from app.studio.file_preview import preview_workspace_file
+from app.auth.dependencies import current_account
 from app.studio.graphs import entity_graph, evidence_graph, flow_graph, lineage_graph
 from app.studio.models import (
     BusinessContext,
@@ -54,12 +55,17 @@ def create_business(req: CreateBusinessRequest) -> BusinessRecord:
     name = req.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="业务场景名称不能为空。")
-    return store.create(name=name, goal=req.goal, description=req.description)
+    return store.create(
+        name=name,
+        goal=req.goal,
+        description=req.description,
+        owner_id=current_account().id,
+    )
 
 
 @router.get("/businesses", response_model=list[BusinessSummary])
 def list_businesses() -> list[BusinessSummary]:
-    return store.list()
+    return store.list(current_account().id)
 
 
 @router.get("/businesses/{business_id}", response_model=BusinessRecord)
@@ -428,7 +434,7 @@ def list_business_files(business_id: str) -> list[BusinessFile]:
 
 @router.get("/files/{file_id}/preview")
 def preview_file(file_id: str) -> dict[str, Any]:
-    found = store.find_file(file_id)
+    found = store.find_file(file_id, current_account().id)
     if found is None:
         raise HTTPException(status_code=404, detail="文件不存在。")
     _record, file = found
@@ -445,7 +451,7 @@ def preview_file(file_id: str) -> dict[str, Any]:
 
 @router.get("/files/{file_id}/raw")
 def raw_file(file_id: str) -> FileResponse:
-    found = store.find_file(file_id)
+    found = store.find_file(file_id, current_account().id)
     if found is None:
         raise HTTPException(status_code=404, detail="文件不存在。")
     _record, file = found
@@ -454,7 +460,7 @@ def raw_file(file_id: str) -> FileResponse:
 
 @router.delete("/files/{file_id}")
 def delete_file(file_id: str) -> dict[str, Any]:
-    found = store.find_file(file_id)
+    found = store.find_file(file_id, current_account().id)
     if found is None:
         raise HTTPException(status_code=404, detail="文件不存在。")
     record, file = found
@@ -666,7 +672,7 @@ def get_evidence_graph(business_id: str) -> dict[str, Any]:
 
 @router.get("/packages/{package_id}/download")
 def download_package(package_id: str) -> FileResponse:
-    found = store.find_package(package_id)
+    found = store.find_package(package_id, current_account().id)
     if found is None:
         raise HTTPException(status_code=404, detail="能力包不存在。")
     _record, package = found
@@ -699,7 +705,7 @@ def _release_project_sandbox_best_effort(business_id: str) -> dict[str, Any]:
 
 def _record_or_404(business_id: str) -> BusinessRecord:
     try:
-        return store.require(business_id)
+        return store.require(business_id, current_account().id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="业务场景不存在。") from exc
 

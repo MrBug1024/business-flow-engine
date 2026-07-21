@@ -27,8 +27,15 @@ function safeErrorDetail(value: unknown): string {
 http.interceptors.response.use(
   (res) => res,
   (err) => {
+    const url = String(err?.config?.url || '')
+    const authRequest = url.startsWith('/auth/')
     const detail = err?.response?.data?.detail || err?.response?.data?.message || err?.message
-    if (err?.response?.status !== 404) ElMessage.error(safeErrorDetail(detail))
+    if (err?.response?.status === 401 && !authRequest) {
+      window.dispatchEvent(new CustomEvent('studio:unauthorized'))
+      if (!window.location.hash.startsWith('#/login')) window.location.hash = '#/login?reason=session'
+    } else if (!authRequest && err?.response?.status !== 404) {
+      ElMessage.error(safeErrorDetail(detail))
+    }
     return Promise.reject(err)
   },
 )
