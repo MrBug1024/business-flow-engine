@@ -56,7 +56,10 @@ def stream_model_turn(
     """Stream one model turn, including reasoning and function calls."""
 
     _enforce_request_budgets(messages, tools)
-    model_config = studio_settings.active_model_config(requested_model)
+    model_config = studio_settings.active_model_config(
+        requested_model,
+        owner_id=record.owner_id,
+    )
     api_key = model_config.api_key.strip() or env_settings.openai_api_key.strip()
     if not api_key or api_key.casefold() in {"your-api-key-here", "sk-xxx", "changeme"}:
         yield ModelStreamEvent(kind="content", content=_model_unavailable_message(record, "没有配置可用的 API Key"))
@@ -321,7 +324,9 @@ class ThinkingMarkupParser:
 
 
 def _model_unavailable_message(record: BusinessRecord, reason: str) -> str:
-    skill_names = ", ".join(skill.name for skill in list_skills()) or "暂无"
+    skill_names = ", ".join(
+        skill.name for skill in list_skills(record.owner_id)
+    ) or "暂无"
     tool_names = ", ".join(tool.name for tool in tool_registry.list() if tool.mounted) or "暂无"
     return (
         "我现在没有拿到真实模型的可用回复，所以不会假装已经完成业务分析。\n\n"

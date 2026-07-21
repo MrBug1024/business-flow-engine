@@ -1,12 +1,21 @@
-"""Studio settings persisted beside workspace data."""
+"""Account-scoped Studio settings stored with system state."""
 
 from __future__ import annotations
 
 import json
 import re
+import shutil
 import threading
+from pathlib import Path
 
 from app.core.config import settings as env_settings
+from app.core.storage_layout import (
+    LEGACY_SETTINGS_PATH,
+    account_system_root,
+    claim_legacy_account_state,
+    ensure_storage_layout,
+    safe_scope,
+)
 from app.studio.capabilities.mcp import (
     merge_masked_mcp_configs,
     normalize_stored_mcp_configs,
@@ -21,31 +30,42 @@ MODEL_SECRET_MASK = "********"
 
 
 class StudioSettingsStore:
-    def __init__(self) -> None:
-        self.root = env_settings.data_path / "business_studio"
-        self.path = self.root / "studio_settings.json"
+    def __init__(self, root: Path | None = None) -> None:
+        ensure_storage_layout()
+        self.root = root or env_settings.studio_users_path
+        self._uses_default_root = root is None
         self._lock = threading.RLock()
 
-    def load(self) -> StudioSettings:
+    def path_for(self, owner_id: str) -> Path:
+        owner = safe_scope(owner_id, label="account id")
+        root = account_system_root(owner) if self._uses_default_root else self.root / owner
+        return root / "studio_settings.json"
+
+    def load(self, owner_id: str | None = None) -> StudioSettings:
         with self._lock:
-            if self.path.exists():
-                data = json.loads(self.path.read_text(encoding="utf-8"))
+            if owner_id is None:
+                return _normalize_settings(_default_settings(None), None)
+            path = self.path_for(owner_id)
+            self._claim_legacy_settings(owner_id, path)
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
                 loaded = StudioSettings.model_validate(data)
             else:
-                loaded = _default_settings()
-            normalized = _normalize_settings(loaded)
-            if normalized != loaded or not self.path.exists():
-                self.save(normalized)
+                loaded = _default_settings(owner_id)
+            normalized = _normalize_settings(loaded, owner_id)
+            if normalized != loaded or not path.exists():
+                self.save(normalized, owner_id)
             return normalized
 
-    def save(self, value: StudioSettings) -> StudioSettings:
+    def save(self, value: StudioSettings, owner_id: str) -> StudioSettings:
         with self._lock:
-            self.root.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(value.model_dump_json(indent=2), encoding="utf-8")
+            path = self.path_for(owner_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(value.model_dump_json(indent=2), encoding="utf-8")
             return value
 
-    def update(self, patch: UpdateStudioSettings) -> StudioSettings:
-        current = self.load()
+    def update(self, patch: UpdateStudioSettings, owner_id: str) -> StudioSettings:
+        current = self.load(owner_id)
         data = current.model_dump(mode="json")
         incoming = patch.model_dump(exclude_unset=True, mode="json")
         if isinstance(incoming.get("configured_models"), list):
@@ -59,11 +79,15 @@ class StudioSettingsStore:
                 current.mcp_configs,
             )
         data.update(incoming)
-        updated = _normalize_settings(StudioSettings.model_validate(data))
-        return self.save(updated)
+        updated = _normalize_settings(StudioSettings.model_validate(data), owner_id)
+        return self.save(updated, owner_id)
 
-    def public(self, value: StudioSettings | None = None) -> StudioSettings:
-        current = value or self.load()
+    def public(
+        self,
+        value: StudioSettings | None = None,
+        owner_id: str | None = None,
+    ) -> StudioSettings:
+        current = value or self.load(owner_id)
         data = current.model_dump(mode="json")
         for model in data["configured_models"]:
             if model.get("api_key"):
@@ -71,9 +95,9 @@ class StudioSettingsStore:
         data["mcp_configs"] = public_mcp_configs(current.mcp_configs)
         return StudioSettings.model_validate(data)
 
-    def upsert_mcp_configs(self, entries: list[dict]) -> StudioSettings:
+    def upsert_mcp_configs(self, entries: list[dict], owner_id: str) -> StudioSettings:
         with self._lock:
-            current = self.load()
+            current = self.load(owner_id)
             by_name = {str(item.get("name")): item for item in current.mcp_configs}
             order = [str(item.get("name")) for item in current.mcp_configs]
             for entry in entries:
@@ -83,11 +107,19 @@ class StudioSettingsStore:
                 by_name[name] = entry
             data = current.model_dump(mode="json")
             data["mcp_configs"] = [by_name[name] for name in order]
-            return self.save(_normalize_settings(StudioSettings.model_validate(data)))
+            return self.save(
+                _normalize_settings(StudioSettings.model_validate(data), owner_id),
+                owner_id,
+            )
 
-    def set_mcp_enabled(self, name: str, enabled: bool) -> StudioSettings | None:
+    def set_mcp_enabled(
+        self,
+        name: str,
+        enabled: bool,
+        owner_id: str,
+    ) -> StudioSettings | None:
         with self._lock:
-            current = self.load()
+            current = self.load(owner_id)
             found = False
             entries: list[dict] = []
             for entry in current.mcp_configs:
@@ -100,21 +132,27 @@ class StudioSettingsStore:
                 return None
             data = current.model_dump(mode="json")
             data["mcp_configs"] = entries
-            return self.save(_normalize_settings(StudioSettings.model_validate(data)))
+            return self.save(
+                _normalize_settings(StudioSettings.model_validate(data), owner_id),
+                owner_id,
+            )
 
-    def delete_mcp_config(self, name: str) -> StudioSettings | None:
+    def delete_mcp_config(self, name: str, owner_id: str) -> StudioSettings | None:
         with self._lock:
-            current = self.load()
+            current = self.load(owner_id)
             entries = [item for item in current.mcp_configs if str(item.get("name")) != name]
             if len(entries) == len(current.mcp_configs):
                 return None
             data = current.model_dump(mode="json")
             data["mcp_configs"] = entries
-            return self.save(_normalize_settings(StudioSettings.model_validate(data)))
+            return self.save(
+                _normalize_settings(StudioSettings.model_validate(data), owner_id),
+                owner_id,
+            )
 
-    def delete_model(self, model_id: str) -> StudioSettings | None:
+    def delete_model(self, model_id: str, owner_id: str) -> StudioSettings | None:
         with self._lock:
-            current = self.load()
+            current = self.load(owner_id)
             match = next((model for model in current.configured_models if model.id == model_id), None)
             if match is None:
                 return None
@@ -128,13 +166,26 @@ class StudioSettingsStore:
             ]
             if current.active_model == match.model:
                 data["active_model"] = ""
-            return self.save(_normalize_settings(StudioSettings.model_validate(data)))
+            return self.save(
+                _normalize_settings(StudioSettings.model_validate(data), owner_id),
+                owner_id,
+            )
 
-    def active_model_name(self, requested: str | None = None) -> str:
-        return self.active_model_config(requested).model
+    def active_model_name(
+        self,
+        requested: str | None = None,
+        *,
+        owner_id: str | None = None,
+    ) -> str:
+        return self.active_model_config(requested, owner_id=owner_id).model
 
-    def active_model_config(self, requested: str | None = None) -> AIModelConfig:
-        current = self.load()
+    def active_model_config(
+        self,
+        requested: str | None = None,
+        *,
+        owner_id: str | None = None,
+    ) -> AIModelConfig:
+        current = self.load(owner_id)
         if requested:
             match = next(
                 (model for model in current.configured_models if model.enabled and requested in {model.model, model.id}),
@@ -146,19 +197,30 @@ class StudioSettingsStore:
             return next(model for model in current.configured_models if model.model == current.active_model and model.enabled)
         return _env_model()
 
+    def _claim_legacy_settings(self, owner_id: str, destination: Path) -> None:
+        if (
+            not self._uses_default_root
+            or destination.exists()
+            or not LEGACY_SETTINGS_PATH.is_file()
+            or not claim_legacy_account_state(owner_id)
+        ):
+            return
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(LEGACY_SETTINGS_PATH, destination)
 
-def _default_settings() -> StudioSettings:
+
+def _default_settings(owner_id: str | None) -> StudioSettings:
     env_model = _env_model()
     return StudioSettings(
         active_model=env_model.model,
         configured_models=[env_model],
         installed_tools=[tool.name for tool in tool_registry.list() if tool.mounted],
-        installed_skills=[skill.name for skill in list_skills() if skill.enabled],
+        installed_skills=[skill.name for skill in list_skills(owner_id) if skill.enabled],
         mcp_configs=[],
     )
 
 
-def _normalize_settings(value: StudioSettings) -> StudioSettings:
+def _normalize_settings(value: StudioSettings, owner_id: str | None) -> StudioSettings:
     env_model = _env_model()
     models: list[AIModelConfig] = [env_model]
     seen_models: set[str] = {env_model.model}
@@ -176,7 +238,7 @@ def _normalize_settings(value: StudioSettings) -> StudioSettings:
     actual_tools = {tool.name for tool in tool_registry.list() if tool.mounted}
     installed_tools = sorted(actual_tools)
 
-    installed_skills = sorted(skill.name for skill in list_skills() if skill.enabled)
+    installed_skills = sorted(skill.name for skill in list_skills(owner_id) if skill.enabled)
 
     return StudioSettings(
         active_model=active_model,

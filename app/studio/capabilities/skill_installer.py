@@ -42,12 +42,20 @@ class SkillDownloadError(RuntimeError):
     pass
 
 
-def install_skill_files(entries: Iterable[tuple[str, bytes]]) -> SkillDefinition:
+def install_skill_files(
+    entries: Iterable[tuple[str, bytes]],
+    owner_id: str,
+) -> SkillDefinition:
     files = _normalize_package_files(entries)
-    return _install_normalized_files(files, source="folder-upload")
+    return _install_normalized_files(files, owner_id, source="folder-upload")
 
 
-def install_skill_archive(payload: bytes, *, source: str = "zip-upload") -> SkillDefinition:
+def install_skill_archive(
+    payload: bytes,
+    owner_id: str,
+    *,
+    source: str = "zip-upload",
+) -> SkillDefinition:
     if len(payload) > MAX_SKILL_ARCHIVE_BYTES:
         raise ValueError(f"Skill ZIP exceeds the {MAX_SKILL_ARCHIVE_BYTES} byte archive limit.")
     try:
@@ -56,17 +64,17 @@ def install_skill_archive(payload: bytes, *, source: str = "zip-upload") -> Skil
     except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
         raise ValueError("The supplied file is not a valid, readable Skill ZIP.") from exc
     files = _normalize_package_files(entries)
-    return _install_normalized_files(files, source=source)
+    return _install_normalized_files(files, owner_id, source=source)
 
 
-def install_skill_from_url(url: str) -> SkillDefinition:
+def install_skill_from_url(url: str, owner_id: str) -> SkillDefinition:
     try:
         payload = download_https_zip(url)
     except ValueError:
         raise
     except httpx.HTTPError as exc:
         raise SkillDownloadError(f"Unable to download Skill ZIP: {exc}") from exc
-    return install_skill_archive(payload, source="url")
+    return install_skill_archive(payload, owner_id, source="url")
 
 
 def download_https_zip(url: str, *, transport: httpx.BaseTransport | None = None) -> bytes:
@@ -119,40 +127,51 @@ def download_https_zip(url: str, *, transport: httpx.BaseTransport | None = None
     raise SkillDownloadError("Skill ZIP download did not complete.")
 
 
-def delete_user_skill(name: str) -> SkillDefinition:
-    definition = next((item for item in registry.list_skills() if item.name == name), None)
+def delete_user_skill(name: str, owner_id: str) -> SkillDefinition:
+    definition = next(
+        (item for item in registry.list_skills(owner_id) if item.name == name),
+        None,
+    )
     if definition is None:
         raise KeyError(name)
     if definition.kind != "user":
         raise PermissionError(f"System Skill '{name}' cannot be deleted.")
-    directory = registry.find_skill_directory(name)
+    directory = registry.find_skill_directory(name, owner_id)
     if directory is None:
         raise KeyError(name)
-    skill_root = registry.SYSTEM_SKILLS_ROOT.resolve()
+    skill_root = registry.user_skills_root(owner_id).resolve()
     resolved = directory.resolve()
     if resolved.parent != skill_root or directory.is_symlink() or _is_junction(directory):
         raise PermissionError("Refusing to delete a Skill outside the unified Skill store.")
-    if not registry.is_studio_managed_skill_directory(directory):
+    if not registry.is_studio_managed_skill_directory(directory, owner_id):
         raise PermissionError(f"Project-bundled Skill '{name}' cannot be deleted.")
     shutil.rmtree(resolved)
-    registry.forget_studio_managed_skill(name)
+    registry.forget_studio_managed_skill(name, owner_id)
     registry.clear_skill_registry_cache()
     return definition
 
 
-def _install_normalized_files(files: Mapping[str, bytes], *, source: str) -> SkillDefinition:
+def _install_normalized_files(
+    files: Mapping[str, bytes],
+    owner_id: str,
+    *,
+    source: str,
+) -> SkillDefinition:
     skill_text = _decode_skill_markdown(files["SKILL.md"])
     name = registry._frontmatter_value(skill_text, "name").strip()
     if not _SKILL_NAME_RE.fullmatch(name):
         raise ValueError("SKILL.md frontmatter name must be a lowercase kebab-case name of at most 64 characters.")
 
-    existing = next((item for item in registry.list_skills() if item.name == name), None)
+    existing = next(
+        (item for item in registry.list_skills(owner_id) if item.name == name),
+        None,
+    )
     if existing is not None:
         if existing.kind == "system":
             raise FileExistsError(f"A locked system Skill named '{name}' already exists.")
         raise FileExistsError(f"User Skill '{name}' is already installed.")
 
-    root = registry.SYSTEM_SKILLS_ROOT
+    root = registry.user_skills_root(owner_id)
     root.mkdir(parents=True, exist_ok=True)
     destination = root / name
     if destination.exists():
@@ -167,12 +186,19 @@ def _install_normalized_files(files: Mapping[str, bytes], *, source: str) -> Ski
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content)
         staging.rename(destination)
-        registry.record_studio_managed_skill(name, source=source)
+        registry.record_studio_managed_skill(name, owner_id, source=source)
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise
     registry.clear_skill_registry_cache()
-    installed = next((item for item in registry.list_skills() if item.name == name and item.kind == "user"), None)
+    installed = next(
+        (
+            item
+            for item in registry.list_skills(owner_id)
+            if item.name == name and item.kind == "user"
+        ),
+        None,
+    )
     if installed is None:
         shutil.rmtree(destination, ignore_errors=True)
         registry.clear_skill_registry_cache()

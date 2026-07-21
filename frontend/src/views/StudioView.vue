@@ -38,15 +38,6 @@
       <button class="activity active" :title="t('explorer')" :aria-label="t('explorer')">
         <el-icon><Files /></el-icon>
       </button>
-      <button
-        class="activity"
-        :title="t('graphs')"
-        :aria-label="t('graphs')"
-        :disabled="!current"
-        @click="openGraph('entity')"
-      >
-        <el-icon><Share /></el-icon>
-      </button>
       <button class="activity" :title="t('aiAssistant')" :aria-label="t('aiAssistant')">
         <el-icon><ChatDotRound /></el-icon>
       </button>
@@ -197,21 +188,6 @@
             />
           </section>
 
-          <section v-else-if="activeTab.kind === 'graph'" class="editor-panel graph-panel">
-            <header class="section-head">
-              <div>
-                <h1>{{ activeTab.title }}</h1>
-                <p>Mermaid / {{ activeTab.payload?.graphKind }}</p>
-              </div>
-              <el-button :icon="Refresh" @click="reloadGraph(activeTab.payload?.graphKind)">{{ t('refresh') }}</el-button>
-            </header>
-            <div class="mermaid-box" v-html="renderedMermaid" />
-            <details class="source-details">
-              <summary>Mermaid source</summary>
-              <pre>{{ activeTab.payload?.mermaid }}</pre>
-            </details>
-          </section>
-
           <section v-else-if="activeTab.kind === 'thinking'" class="editor-panel">
             <header class="section-head">
               <div>
@@ -244,7 +220,7 @@
           <section v-else-if="activeTab.kind === 'outputs'" class="editor-panel">
             <header class="section-head">
               <div>
-                <h1>output / skill-package</h1>
+                <h1>deliverables / skill-package</h1>
                 <p>{{ current.packages.length }} {{ t('packages') }}</p>
               </div>
             </header>
@@ -256,16 +232,6 @@
               </article>
               <p v-if="!current.packages.length" class="muted">{{ t('noPackage') }}</p>
             </section>
-          </section>
-
-          <section v-else-if="activeTab.kind === 'capabilities'" class="editor-panel">
-            <header class="section-head">
-              <div>
-                <h1>settings / capabilities.json</h1>
-                <p>{{ t('toolSkillMcpRefs') }}</p>
-              </div>
-            </header>
-            <pre>{{ JSON.stringify({ skills: context.skill_references, mcp: context.mcp_references, tools: context.tool_usages }, null, 2) }}</pre>
           </section>
 
           <section v-else-if="activeTab.kind === 'settings'" class="editor-panel settings-workbench">
@@ -691,7 +657,6 @@ import {
   VideoCamera,
   VideoPause,
 } from '@element-plus/icons-vue'
-import mermaid from 'mermaid'
 import { http } from '@/api/http'
 import AgentActivity from '@/components/AgentActivity.vue'
 import ClarificationSheet from '@/components/ClarificationSheet.vue'
@@ -714,7 +679,7 @@ import type {
 } from '@/types/studio'
 
 type ThemeMode = 'dark' | 'light' | 'contrast'
-type TabKind = 'description' | 'overview' | 'context' | 'file' | 'graph' | 'thinking' | 'outputs' | 'capabilities' | 'settings'
+type TabKind = 'description' | 'overview' | 'context' | 'file' | 'thinking' | 'outputs' | 'settings'
 type Tab = { id: string; title: string; kind: TabKind; payload?: any }
 type StreamTarget = { businessId: string; sessionId: string }
 type PendingResume = StreamTarget & { runId?: string; error: string }
@@ -745,7 +710,6 @@ const skills = ref<any[]>([])
 const settings = ref<any>({ active_model: '', configured_models: [], installed_tools: [], installed_skills: [], mcp_configs: [] })
 const tabs = ref<Tab[]>([])
 const activeTabId = ref('')
-const renderedMermaid = ref('')
 const fileInput = ref<HTMLInputElement | null>(null)
 const messagesContainer = ref<HTMLElement | null>(null)
 const composerInput = ref<HTMLTextAreaElement | null>(null)
@@ -882,8 +846,6 @@ const contextBlocks = computed(() => [
 ])
 const studioThemeClass = computed(() => `theme-${themeMode.value}`)
 
-initializeMermaid()
-
 onMounted(async () => {
   applyDocumentTheme()
   startChatBoxObserver()
@@ -898,27 +860,15 @@ onBeforeUnmount(() => {
   disposeLiveFileDrafts()
 })
 
-watch(activeTab, async (tab) => {
-  if (tab?.kind === 'graph' && tab.payload?.mermaid) {
-    await renderMermaid(tab.payload.mermaid)
-  } else {
-    renderedMermaid.value = ''
-  }
-})
-
 watch(uiLanguage, () => {
   localStorage.setItem('studio.language', uiLanguage.value)
   const tab = tabs.value.find((item) => item.id === 'settings')
   if (tab) tab.title = t('settings')
 })
 
-watch(themeMode, async () => {
+watch(themeMode, () => {
   localStorage.setItem('studio.theme', themeMode.value)
   applyDocumentTheme()
-  initializeMermaid()
-  if (activeTab.value?.kind === 'graph' && activeTab.value.payload?.mermaid) {
-    await renderMermaid(activeTab.value.payload.mermaid)
-  }
 })
 
 watch(openQuestions, (questions) => {
@@ -967,14 +917,6 @@ function startChatBoxObserver() {
   })
   chatBoxObserver.observe(chatBoxElement.value)
   chatBoxHeight.value = Math.ceil(chatBoxElement.value.getBoundingClientRect().height)
-}
-
-function initializeMermaid() {
-  mermaid.initialize({
-    startOnLoad: false,
-    theme: themeMode.value === 'light' ? 'default' : 'dark',
-    securityLevel: 'loose',
-  })
 }
 
 async function loadBusinesses() {
@@ -1201,28 +1143,12 @@ async function openFile(file: any) {
   await openWorkspaceFile({ name: file.filename, path: `data/${file.filename}` })
 }
 
-async function openGraph(kind: string) {
-  if (!current.value) return
-  const payload = (await http.get(`/businesses/${current.value.id}/graphs/${kind}`)).data
-  payload.graphKind = kind
-  const titleMap: Record<string, string> = { entity: 'entity.mmd', flow: 'flow.mmd', lineage: 'lineage.mmd', evidence: 'evidence.mmd' }
-  openTab({ id: `graphs/${titleMap[kind] || `${kind}.mmd`}`, title: titleMap[kind] || 'graph.mmd', kind: 'graph', payload })
-}
-
-async function reloadGraph(kind: string) {
-  if (kind) await openGraph(kind)
-}
-
 function openThinking() {
   openTab({ id: 'ai-understanding', title: t('aiUnderstanding'), kind: 'thinking' })
 }
 
 function openOutputs() {
-  openTab({ id: 'output/skill-package', title: 'skill-package', kind: 'outputs' })
-}
-
-function openCapabilities() {
-  openTab({ id: 'settings/capabilities.json', title: 'capabilities.json', kind: 'capabilities' })
+  openTab({ id: 'deliverables/skill-package', title: 'skill-package', kind: 'outputs' })
 }
 
 function openSettings(tab = 'general') {
@@ -1837,17 +1763,6 @@ async function updateSettings(payload: Record<string, any>) {
 async function copyMessage(content: string) {
   await navigator.clipboard.writeText(content)
   ElMessage.success(t('copied'))
-}
-
-async function renderMermaid(code: string) {
-  await nextTick()
-  try {
-    const id = `mmd-${Date.now()}`
-    const { svg } = await mermaid.render(id, code)
-    renderedMermaid.value = svg
-  } catch (error: any) {
-    renderedMermaid.value = `<pre>${String(error?.message || error)}</pre>`
-  }
 }
 
 function nodeIcon(node: WorkspaceNode) {

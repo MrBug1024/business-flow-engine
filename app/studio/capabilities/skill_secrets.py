@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from app.core.config import settings
+from app.core.storage_layout import ensure_storage_layout
 from app.studio.capabilities.registry import SYSTEM_SKILLS_ROOT
 
 
@@ -48,8 +49,9 @@ class SkillSecretStore:
         skill_environment_keys: Mapping[str, Iterable[str]] | None = None,
         environment: Mapping[str, str] | None = None,
     ) -> None:
+        ensure_storage_layout()
         self.path = path or (
-            settings.data_path / "business_studio" / "skill_secrets.json"
+            settings.studio_system_path / "skill_secrets.json"
         )
         self.skills_root = skills_root or SYSTEM_SKILLS_ROOT
         source_keys = (

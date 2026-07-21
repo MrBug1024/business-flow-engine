@@ -571,19 +571,6 @@ pre {
   font-size: 12px;
 }
 
-.mermaid-box {
-  min-height: 420px;
-  overflow: auto;
-  padding: 16px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--surface-2);
-}
-
-.source-details {
-  margin-top: 12px;
-}
-
 .question-list {
   display: grid;
   gap: 10px;

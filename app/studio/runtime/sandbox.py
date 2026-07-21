@@ -727,7 +727,7 @@ def _default_runtime_root() -> Path:
     configured = getattr(settings, "sandbox_root_path", None)
     if configured is not None:
         return Path(configured)
-    return settings.data_path / "business_studio" / "runtime"
+    return settings.sandbox_root_path
 
 
 def _configured_sandbox_manager() -> SandboxManager:

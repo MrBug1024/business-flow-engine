@@ -37,6 +37,10 @@ Operating contract:
   an action succeeded without checking its result.
 - Keep durable outputs in `/workspace`, verify important artifacts, and conclude with
   what was completed plus any genuine blocker or user decision still required.
+- Keep task-stage artifacts under `/workspace/outputs/<task>/`. The reserved
+  `/workspace/deliverables/skill-package/` path is only for the final, validated
+  business capability package. Never copy analysis files there, and do not create
+  it unless the user explicitly asks to build or finalize the complete Skill package.
 """
 
 

@@ -56,7 +56,7 @@ class CapabilityResult:
     emitted_events: list[dict[str, Any]] = field(default_factory=list)
 
 
-def discover_capabilities(_record: BusinessRecord | None = None) -> list[Capability]:
+def discover_capabilities(record: BusinessRecord | None = None) -> list[Capability]:
     """Build the model-visible catalog from the filesystem and saved MCP config."""
 
     capabilities: list[Capability] = []
@@ -86,7 +86,8 @@ def discover_capabilities(_record: BusinessRecord | None = None) -> list[Capabil
             )
         )
 
-    for entry in studio_settings.load().mcp_configs:
+    owner_id = record.owner_id if record is not None else None
+    for entry in studio_settings.load(owner_id).mcp_configs:
         if not entry.get("enabled"):
             continue
         config = entry.get("config") if isinstance(entry.get("config"), dict) else {}

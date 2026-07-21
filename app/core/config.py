@@ -109,6 +109,32 @@ class Settings(BaseSettings):
         return path
 
     @property
+    def business_accounts_path(self) -> Path:
+        """Contain only account-owned business workspaces."""
+
+        return self.data_path / "accounts"
+
+    @property
+    def studio_system_path(self) -> Path:
+        """Contain platform settings, secrets, and migration metadata."""
+
+        return self.system_path / "studio"
+
+    @property
+    def studio_users_path(self) -> Path:
+        """Contain account-scoped capability settings outside business data."""
+
+        return self.system_path / "users"
+
+    @property
+    def agent_runtime_path(self) -> Path:
+        return self.system_path / "runtime" / "agent"
+
+    @property
+    def skill_views_path(self) -> Path:
+        return self.system_path / "runtime" / "skill-views"
+
+    @property
     def env_model_name(self) -> str:
         return self.llm_model.strip() or "local-context-builder"
 
@@ -135,7 +161,7 @@ class Settings(BaseSettings):
             if not path.is_absolute():
                 path = PROJECT_ROOT / path
             return path.resolve()
-        return (self.data_path / "business_studio" / "system_sandbox").resolve()
+        return (self.system_path / "runtime" / "sandbox").resolve()
 
 
 @lru_cache(maxsize=1)

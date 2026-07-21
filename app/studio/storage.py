@@ -12,7 +12,14 @@ from time import time
 from typing import Any
 
 from app.core.config import settings
-from app.studio.graphs import entity_graph, evidence_graph, flow_graph, lineage_graph
+from app.core.storage_layout import (
+    LEGACY_STUDIO_ROOT,
+    UNASSIGNED_ACCOUNT,
+    account_business_root,
+    cleanup_legacy_data_root,
+    ensure_storage_layout,
+    safe_scope,
+)
 from app.studio.runtime.llm import strip_thinking_markup
 from app.studio.models import (
     AIRun,
@@ -44,13 +51,38 @@ class StudioStore:
     """Single-node persistence for Studio business workspaces."""
 
     def __init__(self, root: Path | None = None) -> None:
-        self.root = (root or settings.data_path) / "business_studio"
-        self.business_root = self.root / "businesses"
+        self.data_root = root or settings.data_path
+        if root is None:
+            ensure_storage_layout()
+        self.root = self.data_root
+        self.business_root = self.data_root / "accounts"
         self.business_root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._locations: dict[str, Path] = {}
+        self._migrate_legacy_businesses()
+        self._rebuild_location_index()
 
-    def business_dir(self, business_id: str) -> Path:
-        return self.business_root / business_id
+    def business_dir(self, business_id: str, owner_id: str | None = None) -> Path:
+        business = safe_scope(business_id, label="business id")
+        if owner_id is not None:
+            path = self._account_root(owner_id) / business
+            if path.exists():
+                self._locations[business] = path
+            return path
+        cached = self._locations.get(business)
+        if cached is not None:
+            return cached
+        matches = [
+            path.parent
+            for path in self.business_root.glob(f"*/{business}/business.json")
+            if path.is_file()
+        ]
+        if len(matches) == 1:
+            self._locations[business] = matches[0]
+            return matches[0]
+        if len(matches) > 1:
+            raise RuntimeError(f"Business id collision detected for {business!r}.")
+        return self._account_root(UNASSIGNED_ACCOUNT) / business
 
     def workspace_dir(self, business_id: str) -> Path:
         path = self.business_dir(business_id) / "workspace"
@@ -70,28 +102,18 @@ class StudioStore:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def graphs_dir(self, business_id: str) -> Path:
-        path = self.workspace_dir(business_id) / "graphs"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
     def context_dir(self, business_id: str) -> Path:
         path = self.workspace_dir(business_id) / "context"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def output_dir(self, business_id: str) -> Path:
-        path = self.workspace_dir(business_id) / "output"
+    def deliverables_dir(self, business_id: str) -> Path:
+        path = self.workspace_dir(business_id) / "deliverables"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
     def packages_dir(self, business_id: str) -> Path:
-        path = self.output_dir(business_id) / "skill-package"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
-    def settings_dir(self, business_id: str) -> Path:
-        path = self.workspace_dir(business_id) / "settings"
+        path = self.deliverables_dir(business_id) / "skill-package"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -112,8 +134,8 @@ class StudioStore:
                 return candidate
         return target.with_name(f"{stem}-{new_id('copy')}{suffix}")
 
-    def _meta_file(self, business_id: str) -> Path:
-        return self.business_dir(business_id) / "business.json"
+    def _meta_file(self, business_id: str, owner_id: str | None = None) -> Path:
+        return self.business_dir(business_id, owner_id) / "business.json"
 
     def create(
         self,
@@ -161,6 +183,10 @@ class StudioStore:
                     )
                 ],
             )
+            self._locations[business_id] = self.business_dir(
+                business_id,
+                owner_id or UNASSIGNED_ACCOUNT,
+            )
             self._ensure_workspace(record)
             self.description_markdown_path(business_id).write_text(_description_markdown(record), encoding="utf-8")
             self.create_version(record, "Created business workspace", "create_business")
@@ -170,32 +196,39 @@ class StudioStore:
     def list(self, owner_id: str | None = None) -> list[BusinessSummary]:
         with self._lock:
             items: list[BusinessSummary] = []
-            for meta in self.business_root.glob("*/business.json"):
+            pattern = (
+                self._account_root(owner_id).glob("*/business.json")
+                if owner_id is not None
+                else self.business_root.glob("*/*/business.json")
+            )
+            for meta in pattern:
                 try:
                     record = self._read(meta)
                 except Exception:  # noqa: BLE001
                     continue
                 if owner_id is not None and record.owner_id != owner_id:
                     continue
+                self._locations[record.id] = meta.parent
                 items.append(self.to_summary(record))
             items.sort(key=lambda item: item.updated_at, reverse=True)
             return items
 
     def get(self, business_id: str, owner_id: str | None = None) -> BusinessRecord | None:
         with self._lock:
-            meta = self._meta_file(business_id)
+            meta = self._meta_file(business_id, owner_id)
             if not meta.exists():
                 return None
             record = self._read(meta)
             if owner_id is not None and record.owner_id != owner_id:
                 return None
+            self._locations[record.id] = meta.parent
             changed = _sanitize_legacy_runtime_state(record)
             changed = _ensure_chat_sessions(record) or changed
             changed = self._ensure_workspace(record) or changed
             changed = _migrate_description_sources(record) or changed
-            self._write_workspace_artifacts(record)
+            self._write_business_context(record)
             if changed:
-                target = self._meta_file(record.id)
+                target = self._meta_file(record.id, record.owner_id or UNASSIGNED_ACCOUNT)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(record.model_dump_json(indent=2), encoding="utf-8")
             return record
@@ -208,14 +241,24 @@ class StudioStore:
 
     def save(self, record: BusinessRecord) -> BusinessRecord:
         with self._lock:
+            owner = record.owner_id or UNASSIGNED_ACCOUNT
+            business_id = safe_scope(record.id, label="business id")
+            expected = self.business_root / safe_scope(owner, label="account id") / business_id
+            current = self.business_dir(record.id)
+            if current != expected and current.exists():
+                if expected.exists():
+                    raise FileExistsError(expected)
+                expected.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(current), str(expected))
+            self._locations[record.id] = expected
             record.updated_at = now()
             record.context.name = record.name
             record.context.goal = record.goal or record.context.goal
             _ensure_chat_sessions(record)
             self._ensure_workspace(record)
             _migrate_description_sources(record)
-            self._write_workspace_artifacts(record)
-            target = self._meta_file(record.id)
+            self._write_business_context(record)
+            target = expected / "business.json"
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(record.model_dump_json(indent=2), encoding="utf-8")
             return record
@@ -225,7 +268,8 @@ class StudioStore:
 
         claimed: list[str] = []
         with self._lock:
-            for meta in self.business_root.glob("*/business.json"):
+            owner_root = self._account_root(owner_id)
+            for meta in self.business_root.glob("*/*/business.json"):
                 try:
                     record = self._read(meta)
                 except Exception:  # noqa: BLE001
@@ -233,7 +277,15 @@ class StudioStore:
                 if record.owner_id:
                     continue
                 record.owner_id = owner_id
-                meta.write_text(record.model_dump_json(indent=2), encoding="utf-8")
+                destination = owner_root / record.id
+                if destination.exists() and destination != meta.parent:
+                    raise FileExistsError(destination)
+                if destination != meta.parent:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(meta.parent), str(destination))
+                target = destination / "business.json"
+                target.write_text(record.model_dump_json(indent=2), encoding="utf-8")
+                self._locations[record.id] = destination
                 claimed.append(record.id)
         return claimed
 
@@ -243,7 +295,93 @@ class StudioStore:
             if not target.exists():
                 return False
             shutil.rmtree(target)
+            self._locations.pop(business_id, None)
             return True
+
+    def _account_root(self, owner_id: str) -> Path:
+        owner = safe_scope(owner_id, label="account id")
+        if self.data_root == settings.data_path:
+            return account_business_root(owner)
+        return self.business_root / owner
+
+    def _migrate_legacy_businesses(self) -> None:
+        legacy_roots = [self.data_root / "business_studio" / "businesses"]
+        if self.data_root == settings.data_path:
+            legacy_roots.append(LEGACY_STUDIO_ROOT / "businesses")
+        for legacy_root in dict.fromkeys(legacy_roots):
+            if not legacy_root.is_dir():
+                continue
+            for source in list(legacy_root.iterdir()):
+                meta = source / "business.json"
+                if not source.is_dir() or not meta.is_file():
+                    self._archive_legacy_business(source)
+                    continue
+                try:
+                    payload = json.loads(meta.read_text(encoding="utf-8"))
+                    business_id = safe_scope(
+                        str(payload.get("id") or source.name),
+                        label="business id",
+                    )
+                    owner_id = safe_scope(
+                        str(payload.get("owner_id") or UNASSIGNED_ACCOUNT),
+                        label="account id",
+                    )
+                except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+                    self._archive_legacy_business(source)
+                    continue
+                destination = self._account_root(owner_id) / business_id
+                if destination.exists():
+                    if self.data_root == settings.data_path:
+                        conflict_root = (
+                            settings.system_path
+                            / "migrations"
+                            / "conflicts"
+                            / "businesses"
+                        )
+                        conflict_root.mkdir(parents=True, exist_ok=True)
+                        conflict = conflict_root / source.name
+                        index = 2
+                        while conflict.exists():
+                            conflict = conflict_root / f"{source.name}-{index}"
+                            index += 1
+                        shutil.move(str(source), str(conflict))
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(source), str(destination))
+            try:
+                legacy_root.rmdir()
+            except OSError:
+                pass
+        if self.data_root == settings.data_path:
+            cleanup_legacy_data_root()
+
+    def _archive_legacy_business(self, source: Path) -> None:
+        if self.data_root != settings.data_path or not source.exists():
+            return
+        archive_root = settings.system_path / "legacy" / "unmigrated-businesses"
+        archive_root.mkdir(parents=True, exist_ok=True)
+        destination = archive_root / source.name
+        index = 2
+        while destination.exists():
+            destination = archive_root / f"{source.name}-{index}"
+            index += 1
+        shutil.move(str(source), str(destination))
+
+    def _rebuild_location_index(self) -> None:
+        self._locations.clear()
+        for meta in self.business_root.glob("*/*/business.json"):
+            try:
+                payload = json.loads(meta.read_text(encoding="utf-8"))
+                business_id = safe_scope(
+                    str(payload.get("id") or meta.parent.name),
+                    label="business id",
+                )
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+                continue
+            previous = self._locations.get(business_id)
+            if previous is not None and previous != meta.parent:
+                raise RuntimeError(f"Business id collision detected for {business_id!r}.")
+            self._locations[business_id] = meta.parent
 
     def workspace_tree(self, record: BusinessRecord) -> WorkspaceNode:
         self._ensure_workspace(record)
@@ -703,10 +841,7 @@ class StudioStore:
     def _ensure_workspace(self, record: BusinessRecord) -> bool:
         workspace = self.workspace_dir(record.id)
         self.files_dir(record.id)
-        self.graphs_dir(record.id)
         self.context_dir(record.id)
-        self.packages_dir(record.id)
-        self.settings_dir(record.id)
         changed = _migrate_legacy_description_file(workspace)
         description = self.description_markdown_path(record.id)
         if not description.exists() and not _workspace_path_is_deleted(record, DESCRIPTION_FILENAME):
@@ -714,7 +849,7 @@ class StudioStore:
             changed = True
         return changed
 
-    def _write_workspace_artifacts(self, record: BusinessRecord) -> None:
+    def _write_business_context(self, record: BusinessRecord) -> None:
         context_payload = record.context.model_dump(mode="json")
         # Rollback snapshots remain in the internal business record. The Agent-facing
         # workspace artifact exposes only current state and lean version metadata.
@@ -724,29 +859,6 @@ class StudioStore:
         if not _workspace_path_is_deleted(record, "context/business_context.json"):
             (self.context_dir(record.id) / "business_context.json").write_text(
                 json.dumps(context_payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-        graph_builders = {
-            "entity.mmd": entity_graph,
-            "flow.mmd": flow_graph,
-            "lineage.mmd": lineage_graph,
-            "evidence.mmd": evidence_graph,
-        }
-        for filename, builder in graph_builders.items():
-            relative = f"graphs/{filename}"
-            if not _workspace_path_is_deleted(record, relative):
-                (self.graphs_dir(record.id) / filename).write_text(
-                    builder(record.context)["mermaid"],
-                    encoding="utf-8",
-                )
-        capability_state = {
-            "skills": record.context.skill_references,
-            "mcp": record.context.mcp_references,
-            "tools": record.context.tool_usages,
-        }
-        if not _workspace_path_is_deleted(record, "settings/capabilities.json"):
-            (self.settings_dir(record.id) / "capabilities.json").write_text(
-                json.dumps(capability_state, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
 
@@ -772,8 +884,8 @@ def _description_markdown(record: BusinessRecord) -> str:
 ## Acceptance Criteria
 
 - Business Context is traceable.
-- Graphs are generated from context.
-- Skill package is exported under `output/skill-package`.
+- Stage outputs are derived from evidence and written under `outputs/<task>/`.
+- Do not create `deliverables/skill-package/` until the complete business scenario is validated and the user requests the final Skill package.
 """
 
 
@@ -941,11 +1053,9 @@ def _sort_key(path: Path) -> tuple[int, str]:
 def _folder_icon(name: str) -> str:
     return {
         "data": "database",
-        "graphs": "graph",
         "context": "brain",
-        "output": "package",
+        "deliverables": "package",
         "skill-package": "package",
-        "settings": "settings",
     }.get(name, "folder")
 
 
@@ -1101,7 +1211,7 @@ def _sanitize_legacy_runtime_state(record: BusinessRecord) -> bool:
                 message.content = cleaned
                 changed = True
 
-    real_skills = installed_skill_names()
+    real_skills = installed_skill_names(record.owner_id)
     clean_skill_refs = [item for item in record.context.skill_references if item.get("name") in real_skills]
     if len(clean_skill_refs) != len(record.context.skill_references):
         record.context.skill_references = clean_skill_refs

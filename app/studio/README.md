@@ -8,9 +8,14 @@ business workflow decisions into the runtime.
 - `orchestrator.py`: chat task lifecycle, progress messages, continuation, and recovery.
 - `settings.py`: model and capability configuration state.
 - `file_preview.py`: bounded previews for workspace artifacts.
-- `graphs.py`: compatibility views derived from `BusinessContext`.
 - `runtime/`: model gateway, LangGraph loop, sandbox, execution ledger, and tool context.
 - `capabilities/`: Tool, Skill, and MCP discovery, installation, secrets, and adapters.
+
+Persistent data follows two roots: `data/accounts/<account>/<business>` contains
+only account-owned business projects, while `system/` contains accounts, private
+capability settings, runtime databases, sandbox environments, logs, and migration
+state. Built-in Skills are shared from `system_skills/`; user-installed Skills and
+their runtime views are account-scoped under `system/`.
 
 Business-specific execution belongs in complete Skills or external MCP capabilities.
 The modules here provide only generic workspace, model, capability, and event-stream

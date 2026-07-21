@@ -18,7 +18,6 @@ from starlette.background import BackgroundTask
 
 from app.studio.file_preview import preview_workspace_file
 from app.auth.dependencies import current_account
-from app.studio.graphs import entity_graph, evidence_graph, flow_graph, lineage_graph
 from app.studio.models import (
     BusinessContext,
     BusinessFile,
@@ -37,7 +36,7 @@ from app.studio.models import (
     WorkspaceNode,
 )
 from app.studio.orchestrator import ResumeBlockedError, orchestrator
-from app.studio.capabilities.registry import SYSTEM_SKILLS_ROOT
+from app.studio.capabilities.registry import materialize_skill_view
 from app.studio.runtime import clear_runtime_thread
 from app.studio.runtime.sandbox import SandboxError, sandbox_manager
 from app.studio.storage import new_id, store
@@ -347,12 +346,12 @@ def project_sandbox_status(business_id: str) -> dict[str, Any]:
 
 @router.post("/businesses/{business_id}/sandbox/prepare")
 def prepare_project_sandbox(business_id: str) -> dict[str, Any]:
-    _record_or_404(business_id)
+    record = _record_or_404(business_id)
     try:
         sandbox_manager.backend_for(
             business_id=business_id,
             workspace_root=store.workspace_dir(business_id),
-            skills_root=SYSTEM_SKILLS_ROOT,
+            skills_root=materialize_skill_view(record.owner_id),
         )
     except SandboxError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -648,26 +647,6 @@ def rollback_context(business_id: str, payload: dict[str, int]) -> BusinessConte
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return record.context
-
-
-@router.get("/businesses/{business_id}/graphs/entity")
-def get_entity_graph(business_id: str) -> dict[str, Any]:
-    return entity_graph(_record_or_404(business_id).context)
-
-
-@router.get("/businesses/{business_id}/graphs/flow")
-def get_flow_graph(business_id: str) -> dict[str, Any]:
-    return flow_graph(_record_or_404(business_id).context)
-
-
-@router.get("/businesses/{business_id}/graphs/lineage")
-def get_lineage_graph(business_id: str) -> dict[str, Any]:
-    return lineage_graph(_record_or_404(business_id).context)
-
-
-@router.get("/businesses/{business_id}/graphs/evidence")
-def get_evidence_graph(business_id: str) -> dict[str, Any]:
-    return evidence_graph(_record_or_404(business_id).context)
 
 
 @router.get("/packages/{package_id}/download")

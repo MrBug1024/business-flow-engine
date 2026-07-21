@@ -222,7 +222,7 @@ flowchart TB
 
 | 模块 | 说明 |
 |---|---|
-| Business Workspace | 管理业务场景、文件、图谱、输出产物 |
+| Business Workspace | 管理业务场景、文件和业务输出产物 |
 | Business Context Service | 维护业务上下文、版本、证据、确认记录 |
 | AI Orchestrator | 负责任务计划、能力选择、调用 Tool/Skill/MCP |
 | Tool Registry | 注册和调用平台原子工具 |
@@ -247,27 +247,21 @@ Business Workspace 是用户在平台中的业务工作区，类似 Cursor 或 V
 ```text
 业务工作区
 ├── 电商客服 Agent
-│   ├── 数据
+│   ├── description.md
+│   ├── context
+│   │   └── business_context.json
+│   ├── data
 │   │   ├── order.xlsx
 │   │   ├── sku.csv
 │   │   ├── 商品说明.pdf
 │   │   └── 售后政策.docx
-│   ├── 图谱
-│   │   ├── 实体关系
-│   │   ├── 数据血缘
-│   │   ├── 业务流程
-│   │   └── 证据链
-│   ├── AI 理解
-│   │   ├── 当前假设
-│   │   ├── 待确认问题
-│   │   └── 用户确认记录
-│   └── 输出
+│   ├── outputs
+│   │   └── data-relations
+│   │       ├── relations.mmd
+│   │       ├── relations.md
+│   │       └── relations.json
+│   └── deliverables
 │       └── skill-package
-│           ├── system_prompt.md
-│           └── skills
-│               └── ecommerce_customer_service_skill
-│                   ├── SKILL.md
-│                   └── scripts
 ├── 合同审批
 ├── CRM 客户跟进
 └── ...
@@ -276,7 +270,7 @@ Business Workspace 是用户在平台中的业务工作区，类似 Cursor 或 V
 ### 6.2 工作区能力
 
 - 支持无限创建业务场景。
-- 每个业务场景独立维护文件、上下文、图谱、输出和版本。
+- 每个业务场景独立维护文件、上下文、业务输出和版本。
 - 支持上传任意格式文件，优先覆盖常见格式。
 - 支持业务场景复制、归档、删除、导出。
 - 支持业务上下文版本回溯。
@@ -317,10 +311,10 @@ Business Workspace 是用户在平台中的业务工作区，类似 Cursor 或 V
 --------------------------------------------------------------------------------
 左侧：Business Explorer       中间：动态编辑区 / 可视化区       右侧：AI Chat
 --------------------------------------------------------------------------------
-业务场景树                    文件预览 / 图谱 / 流程 / 输出       模型选择
+业务场景树                    文件预览 / 编辑 / 业务输出          模型选择
 文件列表                      Business Context                  对话输入
-图谱入口                      Evidence Chain                    Tool/Skill/MCP
-输出入口                      Skill Package                     设置与日志
+生成产物                      Evidence Chain                    Tool/Skill/MCP
+Skill Package                 任务进展                          设置与日志
 --------------------------------------------------------------------------------
 ```
 
@@ -333,8 +327,6 @@ Business Workspace 是用户在平台中的业务工作区，类似 Cursor 或 V
 - 新建业务场景
 - 上传业务资料
 - 展开文件目录
-- 查看图谱目录
-- 查看 AI 理解目录
 - 查看输出产物
 - 标记当前业务版本
 - 快速进入 Marketplace
@@ -343,13 +335,14 @@ Business Workspace 是用户在平台中的业务工作区，类似 Cursor 或 V
 
 ```text
 业务场景
-├── 数据
-├── 图谱
-├── AI 理解
-├── 能力引用
-├── 输出
-└── 设置
+├── description.md
+├── context
+├── data
+├── outputs
+└── deliverables
 ```
+
+资源树直接反映业务场景的真实文件结构。平台不预建专用图谱、能力引用、设置或终极交付目录；图谱、说明和结构化结果由 AI/Skill 按具体任务写入 `outputs/`。只有整体场景验收并明确生成最终 Skill 能力包时，才创建 `deliverables/skill-package/`。
 
 ### 7.2 中间：动态编辑区
 
@@ -1079,15 +1072,6 @@ GET /api/businesses/{business_id}/context
 PATCH /api/businesses/{business_id}/context
 GET /api/businesses/{business_id}/context/versions
 POST /api/businesses/{business_id}/context/rollback
-```
-
-图谱：
-
-```http
-GET /api/businesses/{business_id}/graphs/entity
-GET /api/businesses/{business_id}/graphs/flow
-GET /api/businesses/{business_id}/graphs/lineage
-GET /api/businesses/{business_id}/graphs/evidence
 ```
 
 能力：

@@ -23,6 +23,7 @@ description: >
 - 不为了图看起来完整而补关系。证据不足就删边或明确待确认。
 - main_chain 是兼容字段，语义上表示“主数据路径”，不是业务流程步骤。
 - 只有顶层 scenario-relationship.json 状态为 complete、无 validation-errors.json，且 relations.mmd、relation-report.md 均存在时才算完成。
+- 本 Skill 的全部过程与交付文件只能位于 /workspace/outputs/data-relations。不得复制到 /workspace/deliverables/skill-package，也不得创建或填充任何最终 Skill 能力包目录；能力包是完整业务场景验收后的另一项独立任务。
 - 命令运行环境使用宿主原生 Shell，不假设 Bash。每次只执行文档中的一条完整命令；不得使用 `|`、`&&`、重定向、`head`、`cat`、`wc`、heredoc 或内联 Python，也不得创建临时脚本来读取、裁剪或改写 JSON。
 
 ## 用户可见进展
@@ -143,6 +144,8 @@ python /skills/discover-data-relations/scripts/analyze_relations.py summary \
 - 宏观节点数、关系数和文件覆盖；
 - 哪些结论是直接证据、哪些仍有边界；
 - 三个主要交付文件的路径。
+
+完成即停在 /workspace/outputs/data-relations，不执行复制、打包或“顺便生成 Skill 包”。
 
 ## 恢复与上下文压缩
 

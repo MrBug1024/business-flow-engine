@@ -68,7 +68,10 @@ class BusinessOrchestrator:
     ) -> Iterator[dict[str, Any]]:
         _sync_workspace_metadata(record)
         session = store.require_chat_session(record, session_id)
-        selected_model = studio_settings.active_model_name(model)
+        selected_model = studio_settings.active_model_name(
+            model,
+            owner_id=record.owner_id,
+        )
         user_message = store.append_message(record, "user", message, session_id=session.id)
         task_id = new_id("task")
         run = self._new_run(
@@ -189,7 +192,10 @@ class BusinessOrchestrator:
         return ResumePreparation(
             session_id=session.id,
             source_run_id=source_run_id,
-            selected_model=studio_settings.active_model_name(model),
+            selected_model=studio_settings.active_model_name(
+                model,
+                owner_id=record.owner_id,
+            ),
             question_ids=tuple(str(item["question_id"]) for item in answers if item.get("question_id")),
             answers=tuple(answers),
             prompt=_resume_prompt(answers),
@@ -473,7 +479,10 @@ class BusinessOrchestrator:
             segment_index=max(1, segment_index),
             continued_from_run_id=continued_from_run_id,
             resumed_from_run_id=resumed_from_run_id,
-            model=studio_settings.active_model_name(model),
+            model=studio_settings.active_model_name(
+                model,
+                owner_id=record.owner_id,
+            ),
             started_at=time(),
         )
         store.append_run(record, run)

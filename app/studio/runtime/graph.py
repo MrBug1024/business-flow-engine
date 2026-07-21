@@ -44,7 +44,7 @@ from app.studio.runtime.capabilities import (
 from app.studio.runtime.ledger import ToolExecutionLedger
 from app.studio.runtime.model_adapter import ModelTurn, StudioChatModel
 from app.studio.models import AIRun, BusinessRecord
-from app.studio.capabilities.registry import SYSTEM_SKILLS_ROOT, list_skills
+from app.studio.capabilities.registry import list_skills, materialize_skill_view
 from app.studio.runtime.sandbox import sandbox_manager
 from app.studio.capabilities.skill_middleware import ReloadingSkillsMiddleware
 from app.studio.storage import new_id, store
@@ -193,7 +193,7 @@ class StudioGraphRuntime:
         ledger: ToolExecutionLedger | None = None,
         model_turn: ModelTurn | None = None,
     ) -> None:
-        runtime_root = settings.data_path / "business_studio" / "runtime"
+        runtime_root = settings.agent_runtime_path
         runtime_root.mkdir(parents=True, exist_ok=True)
         self._connection: sqlite3.Connection | None = None
         if checkpointer is None:
@@ -259,16 +259,17 @@ class StudioGraphRuntime:
             requested_model=requested_model,
             model_turn=self.model_turn,
         )
+        skill_view = materialize_skill_view(record.owner_id)
         sandbox = sandbox_manager.backend_for(
             business_id=record.id,
             workspace_root=store.workspace_dir(record.id),
-            skills_root=SYSTEM_SKILLS_ROOT,
+            skills_root=skill_view,
         )
         backend = CompositeBackend(
             default=sandbox,
             routes={
                 SKILL_SOURCE: FilesystemBackend(
-                    root_dir=SYSTEM_SKILLS_ROOT,
+                    root_dir=skill_view,
                     virtual_mode=True,
                 )
             },
@@ -451,7 +452,7 @@ class StudioGraphRuntime:
             return optional_capability_catalog(
                 tool_capabilities,
                 mcp_capabilities,
-                list_skills(),
+                list_skills(record.owner_id),
                 kind=kind,
                 query=query,
                 limit=limit,
