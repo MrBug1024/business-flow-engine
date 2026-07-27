@@ -2,18 +2,18 @@ import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { fileURLToPath, URL } from 'node:url'
 
-// 开发时前端跑在 5173，把 /api 代理到 FastAPI(8000)，含 SSE（关闭缓冲）。
+// 开发时前端跑在 3099，把 /api 代理到 FastAPI(8089)，含 SSE（关闭缓冲）。
 export default defineConfig({
   plugins: [vue()],
   resolve: {
     alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) },
   },
   server: {
-    port: 5173,
+    port: 3099,
     host: '0.0.0.0',
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:8000',
+        target: 'http://127.0.0.1:8089',
         changeOrigin: true,
         // SSE 流式：禁用代理缓冲
         configure: (proxy) => {

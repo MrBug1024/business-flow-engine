@@ -63,7 +63,7 @@ class Settings(BaseSettings):
     mail_timeout_seconds: int = 20
 
     host: str = "127.0.0.1"
-    port: int = 8000
+    port: int = 8089
 
     mcp_public_base_url: str = ""
     mcp_access_token: str = ""

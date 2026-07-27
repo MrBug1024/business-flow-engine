@@ -32,7 +32,12 @@ from langgraph.types import Command, interrupt
 from pydantic import BaseModel, Field
 
 from app.core.config import settings
-from app.studio.runtime.agent import _safe_arguments, _system_prompt
+from app.studio.runtime.agent import (
+    CONTEXT_SUMMARY_PROMPT,
+    SKILLS_SYSTEM_PROMPT,
+    _safe_arguments,
+    _system_prompt,
+)
 from app.studio.runtime.capabilities import (
     Capability,
     CapabilityResult,
@@ -51,16 +56,6 @@ from app.studio.storage import new_id, store
 
 
 SKILL_SOURCE = "/skills/"
-CONTEXT_SUMMARY_PROMPT = """You compress execution context for an ongoing AI Business
-Studio task. Preserve only information needed to continue accurately. Do not invent
-business steps. Return these concise sections: USER OBJECTIVE, AGREEMENTS AND
-ASSUMPTIONS, ACTIVE WORK ITEM AND WHY, VERIFIED RESULTS, ARTIFACTS/CHECKPOINTS,
-BLOCKERS, NEXT STEP. Preserve exact workspace paths, identifiers, validation errors,
-and user decisions. Omit repetitive tool transcripts and superseded attempts.
-
-<messages>
-{messages}
-</messages>"""
 _BUSINESS_LOCKS: defaultdict[str, threading.RLock] = defaultdict(threading.RLock)
 _FILE_TOOL_OPERATIONS = {
     "ls": "list",
@@ -277,7 +272,7 @@ class StudioGraphRuntime:
         skills_middleware = ReloadingSkillsMiddleware(
             backend=backend,
             sources=[(SKILL_SOURCE, "Studio")],
-            system_prompt=None,
+            system_prompt=SKILLS_SYSTEM_PROMPT,
         )
         filesystem_middleware = FilesystemMiddleware(
             backend=backend,
