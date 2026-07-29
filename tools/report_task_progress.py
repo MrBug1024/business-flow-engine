@@ -278,5 +278,14 @@ report_task_progress.metadata = {
     "studio": {
         "protocol": "task_progress",
         "retry_safe": True,
+        "capability": {
+            "id": "report-task-progress",
+            "responsibility": "Persist semantic task plans, verified progress, blockers, and completion state.",
+            "excludes": [
+                "Performing business analysis",
+                "Replacing Tool, Skill, or MCP execution",
+                "Emitting one event per low-level call",
+            ],
+        },
     }
 }

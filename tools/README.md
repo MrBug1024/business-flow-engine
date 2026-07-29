@@ -10,6 +10,17 @@ from langchain_core.tools import tool
 @tool(description="Describe exactly when and why the model should use this tool.")
 def example_tool(value: str) -> str:
     return value
+
+
+example_tool.metadata = {
+    "studio": {
+        "capability": {
+            "id": "example-operation",
+            "responsibility": "Perform one concrete operation.",
+            "excludes": ["Adjacent business workflows"],
+        }
+    }
+}
 ```
 
 Modules and directories whose names start with `_` or `.` are not scanned.
@@ -28,12 +39,24 @@ and event emission. Optional tool metadata is also discovered by the runtime:
 def example() -> dict:
     ...
 
-example.metadata = {"studio": {"retry_safe": True, "protocol": "custom"}}
+example.metadata = {
+    "studio": {
+        "retry_safe": True,
+        "protocol": "custom",
+        "capability": {
+            "id": "example-operation",
+            "responsibility": "Perform one concrete operation.",
+            "excludes": ["Adjacent business workflows"],
+        },
+    }
+}
 ```
 
 `retry_safe` controls crash recovery in the execution ledger. Protocol values
 are reserved for platform interaction adapters such as `user_input` and
-`task_progress`; ordinary tools should omit it.
+`task_progress`; ordinary tools should omit it. The capability contract is required
+for project Tools: `id` is stable, `responsibility` states the one owned operation,
+and `excludes` keeps adjacent work in separate Tool, Skill, or MCP capabilities.
 
 Skills are not installed as Tools. Standard `SKILL.md` packages are discovered by
 DeepAgents `SkillsMiddleware`; each complete package is mapped read-only at

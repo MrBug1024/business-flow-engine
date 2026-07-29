@@ -4,6 +4,13 @@ description: "向量知识库检索技能。当用户需要查询知识库、搜
 compatibility: 需要可联网的 Studio Python 运行环境（Python 3.11+），以及由平台注入的 VECTOR_KB_API_KEY。
 metadata:
   delivery_mode: explicit
+  capability:
+    id: retrieve-vector-knowledge
+    responsibility: 从配置的向量知识库检索与用户问题相关的证据片段和来源。
+    excludes:
+      - 扫描工作区文件
+      - 推导业务数据关系或流程
+      - 蒸馏或打包 Skill
 ---
 
 # 向量知识库检索技能

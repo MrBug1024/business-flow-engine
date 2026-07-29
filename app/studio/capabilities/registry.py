@@ -63,6 +63,17 @@ def list_skills(owner_id: str | None = None) -> list[SkillDefinition]:
         seen.add(normalized_name)
         description = str(frontmatter.get("description") or _first_paragraph(text) or name)
         metadata = frontmatter.get("metadata") if isinstance(frontmatter.get("metadata"), dict) else {}
+        capability = metadata.get("capability") if isinstance(metadata.get("capability"), dict) else {}
+        capability_id = str(capability.get("id") or "").strip()
+        responsibility = _clean_description(str(capability.get("responsibility") or ""))
+        raw_excludes = capability.get("excludes", [])
+        excludes_are_valid = isinstance(raw_excludes, list)
+        excludes_source = raw_excludes if excludes_are_valid else []
+        excludes = [
+            _clean_description(str(item))
+            for item in excludes_source
+            if str(item).strip()
+        ][:12]
         resources = _skill_resources(skill_dir)
         skills.append(
             SkillDefinition(
@@ -77,6 +88,14 @@ def list_skills(owner_id: str | None = None) -> list[SkillDefinition]:
                 digest=skill_content_digest(skill_dir),
                 location=f"/skills/{skill_dir.name}/SKILL.md",
                 resources=resources,
+                capability_id=capability_id,
+                responsibility=responsibility,
+                excludes=excludes,
+                contract_status=(
+                    "declared"
+                    if capability_id and responsibility and excludes_are_valid
+                    else "undeclared"
+                ),
             )
         )
     return skills
@@ -121,6 +140,39 @@ def find_skill_directory(name: str, owner_id: str | None = None) -> Path | None:
 
 def clear_skill_registry_cache() -> None:
     list_skills.cache_clear()
+
+
+def skill_discovery_issues(owner_id: str | None = None) -> list[dict[str, str]]:
+    """Validate the frontmatter contract used by DeepAgents SkillsMiddleware."""
+
+    issues: list[dict[str, str]] = []
+    seen_names: set[str] = set()
+    for kind, directory in iter_skill_directories(owner_id):
+        skill_file = directory / "SKILL.md"
+        text = skill_file.read_text(encoding="utf-8", errors="replace")
+        frontmatter = _parse_frontmatter(text)
+        name = str(frontmatter.get("name") or "").strip()
+        description = str(frontmatter.get("description") or "").strip()
+        error = ""
+        if not name or not description:
+            error = "SKILL.md requires YAML frontmatter with non-empty name and description."
+        elif name != directory.name:
+            error = "Skill frontmatter name must match its directory name."
+        elif name in seen_names:
+            error = "Skill name duplicates another visible Skill."
+        if name:
+            seen_names.add(name)
+        if error:
+            issues.append(
+                {
+                    "kind": "skill_discovery",
+                    "skill_kind": kind,
+                    "name": name or directory.name,
+                    "source": skill_file.as_posix(),
+                    "error": error,
+                }
+            )
+    return issues
 
 
 def is_studio_managed_skill_directory(directory: Path, owner_id: str) -> bool:

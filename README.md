@@ -8,6 +8,7 @@ AI Business Studio 是以模型为中心的业务能力工作区。平台代码�
 - **Skill**：自动扫描 `system_skills/<name>/SKILL.md`；激活后将整个目录作为一个能力包使用，内部脚本不会注册成 Tool。
 - **MCP**：按配置连接标准 MCP server，与 Tool、Skill 独立注册和追踪。
 - **Studio Runtime**：项目自动维护一个场景外的系统级共享 venv，并通过文件系统映射提供可写的 `/workspace` 与只读的 `/skills`。Skill 命令统一在该运行环境执行，不污染系统全局 Python，也不会在场景目录创建虚拟环境。
+- **Agent Prompts**：统一保存在 `prompts/` 的 Markdown 模板中；每轮注入有界能力索引，匹配能力时由 Agent 主动读取或调用，不依赖用户点名。
 
 ## 当前功能
 
@@ -15,6 +16,7 @@ AI Business Studio 是以模型为中心的业务能力工作区。平台代码�
 - 多业务场景资源树及完整的工作区文件增删改查、导入、导出和预览。
 - 基于 LangGraph 的流式 AI 任务、语义进展、人工确认、检查点恢复和长上下文续接。
 - Tool、完整 Skill 包和 MCP 的发现、配置与按需运行。
+- 首次启动能力预热、首轮兜底发现、能力就绪诊断和单一职责契约。
 - AI 文件写入事件驱动的动态编辑预览。
 
 ## 数据目录
@@ -32,4 +34,4 @@ AI Business Studio 是以模型为中心的业务能力工作区。平台代码�
 3. 后端运行 `python run.py`。首次需要执行 Skill 时，Studio 会自动准备系统级 Skill venv，无需额外的外部运行时。
 4. 前端在 `frontend/` 下运行 `npm install` 和 `npm run dev`。
 
-当前实现、架构、配置、数据、API、备份和已知边界见 [AI Business Studio 当前实现文档](docs/AI_Business_Studio_Implementation.md)。全部文档入口见 [docs/README.md](docs/README.md)。早期产品设想保留在 [历史设计文档](docs/AI_Business_Studio_Development_Document.md)，不作为当前实现完成状态的依据。
+当前实现、架构、配置、数据、API、备份和已知边界见 [AI Business Studio 当前实现文档](docs/AI_Business_Studio_Implementation.md)。能力拆分和未来流程推导、能力蒸馏、Skill 打包的交接规则见 [Agent 能力发现与单一职责规范](docs/CAPABILITY_GOVERNANCE.md)。全部文档入口见 [docs/README.md](docs/README.md)。早期产品设想保留在 [历史设计文档](docs/AI_Business_Studio_Development_Document.md)，不作为当前实现完成状态的依据。

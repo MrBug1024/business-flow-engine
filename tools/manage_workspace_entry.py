@@ -70,7 +70,19 @@ def manage_workspace_entry(
 
 
 manage_workspace_entry.metadata = {
-    "studio": {"protocol": "workspace_file", "retry_safe": False}
+    "studio": {
+        "protocol": "workspace_file",
+        "retry_safe": False,
+        "capability": {
+            "id": "manage-workspace-structure",
+            "responsibility": "Create directories and move or delete entries inside the active workspace.",
+            "excludes": [
+                "Reading or editing file contents",
+                "Access outside the active workspace",
+                "Business analysis or artifact validation",
+            ],
+        },
+    }
 }
 
 

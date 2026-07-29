@@ -6,6 +6,14 @@ description: >
   支持远程 URL、本地文件路径、Base64 内容三种输入方式，支持批量处理。
   凡涉及"文件解析"、"OCR"、"读取文档"、"提取文字"、"解析 PDF"、"识别图片文字"，均应使用本技能。
 compatibility: 需要可联网的 Studio Python 运行环境（Python 3.11+），以及由平台注入的 OCR_API_KEY。
+metadata:
+  capability:
+    id: parse-documents-with-ocr
+    responsibility: 使用 OCR 服务从 PDF 和图片类输入中提取机器可读文本。
+    excludes:
+      - 推导数据关系或业务流程
+      - 根据提取文本作业务结论
+      - 蒸馏或打包 Skill
 ---
 
 # OCR 文件解析技能

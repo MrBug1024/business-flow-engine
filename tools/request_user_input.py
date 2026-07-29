@@ -34,5 +34,14 @@ request_user_input.metadata = {
     "studio": {
         "protocol": "user_input",
         "retry_safe": True,
+        "capability": {
+            "id": "request-user-decision",
+            "responsibility": "Pause one Agent run and collect a missing user decision or authorization.",
+            "excludes": [
+                "Making the decision on the user's behalf",
+                "Executing business work",
+                "Reporting routine progress",
+            ],
+        },
     }
 }

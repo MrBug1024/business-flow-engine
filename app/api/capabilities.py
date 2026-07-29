@@ -29,6 +29,10 @@ from app.studio.capabilities.skill_installer import (
     install_skill_from_url,
 )
 from app.studio.capabilities.tools import tool_registry
+from app.studio.capabilities.readiness import (
+    capability_readiness,
+    refresh_platform_capabilities,
+)
 
 router = APIRouter(tags=["capabilities"])
 
@@ -40,13 +44,19 @@ def list_tools() -> list[dict]:
 
 @router.post("/tools/rescan")
 def rescan_tools() -> dict:
-    tools = tool_registry.refresh()
+    refresh_platform_capabilities()
+    tools = tool_registry.list()
     return {
         "generation": tool_registry.generation,
         "tools": [tool.model_dump(mode="json") for tool in tools],
         "mounted": sum(1 for tool in tools if tool.mounted),
         "errors": sum(1 for tool in tools if tool.status != "ready"),
     }
+
+
+@router.get("/capabilities/readiness")
+def capabilities_readiness() -> dict:
+    return capability_readiness(current_account().id)
 
 
 @router.get("/skills")

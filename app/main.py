@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -13,10 +14,21 @@ from app import __version__
 from app.api import api_router
 from app.core.config import settings
 from app.studio.settings import studio_settings
+from app.studio.capabilities.readiness import (
+    ensure_capability_readiness,
+    refresh_platform_capabilities,
+)
 
 
 ROOT = Path(__file__).resolve().parent.parent
 DIST_DIR = ROOT / "frontend" / "dist"
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    application.state.capability_readiness = refresh_platform_capabilities()
+    yield
+
 
 app = FastAPI(
     title="AI Business Studio",
@@ -25,6 +37,7 @@ app = FastAPI(
         "Tool, Skill, and MCP capabilities."
     ),
     version=__version__,
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -49,6 +62,7 @@ def health() -> dict:
         "llm_enabled": bool(active_key and active_base_url),
         "llm_model": active_model.model,
         "frontend_built": DIST_DIR.exists(),
+        "capabilities": ensure_capability_readiness(),
         "channels": {
             "spa": "/",
             "studio_api": "/api/businesses",

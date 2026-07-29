@@ -1,7 +1,7 @@
 # AI Business Studio 当前实现文档
 
 > 文档状态：当前实现基线  
-> 核对日期：2026-07-21  
+> 核对日期：2026-07-27
 > 适用仓库：`business-flow-engine`  
 > 信息来源：以当前代码、配置和目录结构为准，不以早期产品设想为准。
 
@@ -275,7 +275,7 @@ sequenceDiagram
 
 默认模型调用上限 64、图递归上限 512、自动续接上限 4 都是故障保险，不是工作流程目标。正常任务应该尽量在一个连续任务中完成；如果模型持续调用却没有形成可恢复业务进展，仍会以失败结束，防止无限消耗。
 
-系统提示词和工具 Schema 还有独立字符上限。Tool、Skill、MCP 目录和大量场景内容不再整体拼进 System Prompt，而是让模型在需要时发现、读取和调用，避免简单问候也产生超大请求。
+系统提示词和工具 Schema 还有独立字符上限。每轮只注入有界 Skill 元数据和有界 Tool/MCP 路由索引，完整 Skill 内容、可选能力 schema 和大量场景内容仍按需发现、读取和调用。非简单任务会先核对能力索引；描述匹配时必须主动读取或调用，不再依赖用户显式说出能力名称。
 
 ### 8.4 人在回路与恢复
 
@@ -293,6 +293,8 @@ SSE 主链路当前包含：文本 token、推理摘要、计划、模型调用�
 
 `tools/` 是可信本地 Tool 目录。注册表递归发现可用的 LangChain `BaseTool`，校验名称和描述，检测重名，并把导入错误显示到能力管理界面。
 
+应用完成导入后会在 FastAPI lifespan 中再次原子刷新 Tool，并预热系统 Skill；绕过 Web 启动链路的首个 Agent 运行也会执行相同兜底。因此导入期暂时失败的 Tool 不需要靠第二次重启才出现。平台和账户级真实状态分别通过 `/api/health` 与 `/api/capabilities/readiness` 查看。
+
 当前内置协议 Tool：
 
 | Tool | 用途 |
@@ -308,6 +310,8 @@ SSE 主链路当前包含：文本 token、推理摘要、计划、模型调用�
 Skill 以完整目录为单位，根目录必须包含 `SKILL.md`。`scripts/`、`references/`、`assets/` 和依赖声明都是该 Skill 的内部资源，脚本不会被逐个注册成 Tool。
 
 运行时只把 Skill 概要暴露给模型；模型选择后再读取 `SKILL.md` 和所需资源。系统 Skill 来自源码目录 `system_skills/`，所有账户共享且不能通过用户接口删除。用户 Skill 安装到 `system/users/<account_id>/skills/`，只能被所属账户发现和删除。
+
+Skill 概要现在会实际进入每次模型请求，并受数量和描述长度限制。系统 Skill 还必须在 frontmatter 的 `metadata.capability` 中声明稳定 ID、唯一责任和排除项；缺失声明会使能力就绪状态降级。完整规范及未来流程推导、能力蒸馏和 Skill 打包的独立交接边界见 [Agent 能力发现与单一职责规范](CAPABILITY_GOVERNANCE.md)。
 
 Agent 启动前会根据内容摘要，把“系统 Skill + 当前账户用户 Skill”物化为 `system/runtime/skill-views/<account_id>/`。沙箱只挂载这一个账户专属视图为只读 `/skills/<name>`，因此其他账户的 Skill 名称、说明和文件都不会进入当前 Agent。工作产物仍写入当前场景的 `/workspace`。上传和 HTTPS ZIP 安装器会限制文件数量、单文件大小、总大小和路径，并要求显式安装同意。
 

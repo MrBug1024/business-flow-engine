@@ -2,6 +2,14 @@
 name: discover-data-relations
 description: >
   从任意业务场景的异构数据、规则和结果材料中推导一张宏观、可核验、可供后续流程推导使用的数据关系图。适用于 CSV、XLSX、JSONL、Parquet、SQLite、文本、PDF、DOCX、PPTX 和图片混合场景。先以有界扫描蒸馏字段级证据，再由 Agent 综合为少量业务数据域、规则、判定与结果节点；字段、记录值和底层匹配只作证据，不进入最终图。用于整体数据关系、业务数据血缘、跨材料关联、规则约束和审计输入输出分析。
+metadata:
+  capability:
+    id: discover-data-relations
+    responsibility: 从业务材料中提取有界证据并生成可核验的宏观数据关系交付物。
+    excludes:
+      - 推导端到端业务流程或操作时序
+      - 将完整业务场景蒸馏为新 Skill
+      - 校验、复制或打包最终 Skill 能力包
 ---
 
 # 业务场景宏观数据关系发现

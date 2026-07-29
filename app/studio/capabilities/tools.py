@@ -40,6 +40,10 @@ class ToolMetadata(BaseModel):
     error: str | None = None
     mounted: bool = False
     record_type: ToolDiscoveryType = "tool"
+    capability_id: str = ""
+    responsibility: str = ""
+    excludes: list[str] = Field(default_factory=list)
+    contract_status: Literal["declared", "undeclared"] = "undeclared"
 
 
 class DynamicToolRegistry:
@@ -286,6 +290,19 @@ class DynamicToolRegistry:
                     )
                 )
                 continue
+            try:
+                capability_id, responsibility, excludes = self._capability_contract(tool)
+            except ValueError as exc:
+                metadata.append(
+                    self._tool_error(
+                        tool,
+                        source,
+                        module,
+                        f"Invalid capability contract: {exc}",
+                        name=name,
+                    )
+                )
+                continue
             metadata.append(
                 ToolMetadata(
                     name=name,
@@ -295,6 +312,12 @@ class DynamicToolRegistry:
                     module=module,
                     status="ready",
                     mounted=True,
+                    capability_id=capability_id,
+                    responsibility=responsibility,
+                    excludes=excludes,
+                    contract_status=(
+                        "declared" if capability_id and responsibility else "undeclared"
+                    ),
                 )
             )
             mounted[name] = tool
@@ -307,6 +330,31 @@ class DynamicToolRegistry:
             )
         )
         return metadata, mounted
+
+    @staticmethod
+    def _capability_contract(tool: BaseTool) -> tuple[str, str, list[str]]:
+        metadata = tool.metadata if isinstance(tool.metadata, dict) else {}
+        studio = metadata.get("studio") if isinstance(metadata.get("studio"), dict) else metadata
+        raw = studio.get("capability") if isinstance(studio, dict) else None
+        if raw is None:
+            return "", "", []
+        if not isinstance(raw, dict):
+            raise ValueError("studio.capability metadata must be an object.")
+        capability_id = str(raw.get("id") or "").strip()
+        responsibility = re.sub(r"\s+", " ", str(raw.get("responsibility") or "")).strip()
+        raw_excludes = raw.get("excludes") or []
+        if not isinstance(raw_excludes, list):
+            raise ValueError("studio.capability.excludes must be a list.")
+        excludes = [
+            re.sub(r"\s+", " ", str(item)).strip()[:300]
+            for item in raw_excludes
+            if str(item).strip()
+        ][:12]
+        if not capability_id or not responsibility:
+            raise ValueError(
+                "studio.capability requires non-empty id and responsibility fields."
+            )
+        return capability_id[:128], responsibility[:500], excludes
 
     @staticmethod
     def _tool_error(

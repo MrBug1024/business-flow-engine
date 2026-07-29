@@ -32,12 +32,14 @@ from langgraph.types import Command, interrupt
 from pydantic import BaseModel, Field
 
 from app.core.config import settings
+from app.studio.prompt_loader import load_prompt
 from app.studio.runtime.agent import _safe_arguments, _system_prompt
 from app.studio.runtime.capabilities import (
     Capability,
     CapabilityResult,
     discover_capabilities,
     execute_capability,
+    optional_capability_index,
     optional_capability_catalog,
     result_for_model,
 )
@@ -51,16 +53,7 @@ from app.studio.storage import new_id, store
 
 
 SKILL_SOURCE = "/skills/"
-CONTEXT_SUMMARY_PROMPT = """You compress execution context for an ongoing AI Business
-Studio task. Preserve only information needed to continue accurately. Do not invent
-business steps. Return these concise sections: USER OBJECTIVE, AGREEMENTS AND
-ASSUMPTIONS, ACTIVE WORK ITEM AND WHY, VERIFIED RESULTS, ARTIFACTS/CHECKPOINTS,
-BLOCKERS, NEXT STEP. Preserve exact workspace paths, identifiers, validation errors,
-and user decisions. Omit repetitive tool transcripts and superseded attempts.
-
-<messages>
-{messages}
-</messages>"""
+CONTEXT_SUMMARY_PROMPT = load_prompt("runtime/context-summary.md")
 _BUSINESS_LOCKS: defaultdict[str, threading.RLock] = defaultdict(threading.RLock)
 _FILE_TOOL_OPERATIONS = {
     "ls": "list",
@@ -277,7 +270,7 @@ class StudioGraphRuntime:
         skills_middleware = ReloadingSkillsMiddleware(
             backend=backend,
             sources=[(SKILL_SOURCE, "Studio")],
-            system_prompt=None,
+            system_prompt=load_prompt("agent/skills-system.md"),
         )
         filesystem_middleware = FilesystemMiddleware(
             backend=backend,
@@ -294,7 +287,13 @@ class StudioGraphRuntime:
         agent = create_agent(
             model,
             tools,
-            system_prompt=_system_prompt(record),
+            system_prompt=_system_prompt(
+                record,
+                optional_capability_index=optional_capability_index(
+                    optional_tool_capabilities,
+                    mcp_capabilities,
+                ),
+            ),
             middleware=[
                 skills_middleware,
                 filesystem_middleware,

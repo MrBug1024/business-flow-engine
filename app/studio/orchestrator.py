@@ -10,6 +10,7 @@ from typing import Any
 
 from app.core.config import settings as env_settings
 from app.studio.models import AIRun, BusinessRecord
+from app.studio.prompt_loader import render_prompt
 from app.studio.runtime import run_agent
 from app.studio.settings import studio_settings
 from app.studio.storage import new_id, store
@@ -780,12 +781,7 @@ def _resume_prompt(answers: list[dict[str, Any]]) -> str:
         f"- 问题：{item['question'] or item['question_id']}\n  用户确认：{item['answer']}"
         for item in answers
     )
-    return f"""用户已经完成待确认问题。请在同一任务上下文中继续之前的工作。
-
-确认内容：
-{answer_lines}
-
-请先复核这些确认对 Business Context 和原任务的影响，按需调用真实 Tool、Skill 或 MCP 更新结果，然后完成原任务。不要要求用户重复回答，也不要把这段内部续跑提示描述成新的用户消息。"""
+    return render_prompt("runtime/resume.md", answers=answer_lines)
 
 
 def _is_recoverable_segment_error(message: str, run: AIRun) -> bool:
@@ -832,29 +828,13 @@ def _auto_continuation_prompt(
     source_run: AIRun,
     error: str,
 ) -> str:
-    return f"""这是同一用户任务的内部第 {source_run.segment_index + 1} 阶段。上一阶段达到单段上下文或执行边界，平台已切换到新的模型上下文；不要把它描述成新的用户请求。
-
-平台职责边界：
-- 平台只提供新模型上下文、工作区、Tool/Skill/MCP 调用、事件流和持久化检查点。
-- 平台不定义这个业务任务应该怎么做；具体策略必须来自用户目标、已激活 Skill、Tool/MCP 返回结果和工作区产物。
-- 多阶段接力的目的只是避免上下文过长，不是为了满足固定轮次或固定调用次数。
-
-原始目标：
-{original_prompt[:4000]}
-
-上一阶段触发接力的原因：
-{error[:1000]}
-
-压缩后的任务恢复清单：
-{_task_manifest_text(record, source_run, original_prompt)}
-
-继续规则：
-- 先恢复语义任务状态：查看上方任务清单、相关 Skill 的 SKILL.md，以及该 Skill 自己声明的有界状态/摘要产物。
-- 不要为了重建上下文而重新读取原始大文件、完整证据库或旧运行日志；优先使用工作区检查点、摘要产物、校验错误和已生成结果。
-- 从第一个未完成的工作项继续。若 `report_task_progress` 可用，先用它说明本阶段继续什么、为什么、预期验收是什么。
-- 只有当你按用户目标和所用 Skill/Tool 的验收标准确认完成时，才报告 complete 并给最终答复；如果需要用户确认或外部状态，报告 block 并提出明确问题。
-- 最终答复必须只面向用户说明结果、证据或阻塞，不要把内部续跑提示当成用户请求本身。
-"""
+    return render_prompt(
+        "runtime/auto-continuation.md",
+        segment_index=source_run.segment_index + 1,
+        original_goal=original_prompt[:4000],
+        continuation_error=error[:1000],
+        task_manifest=_task_manifest_text(record, source_run, original_prompt),
+    )
 
 
 def _task_manifest_text(record: BusinessRecord, source_run: AIRun, original_prompt: str) -> str:

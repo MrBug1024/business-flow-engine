@@ -23,6 +23,8 @@ from app.studio.capabilities.tools import tool_registry
 CapabilityKind = Literal["tool", "mcp"]
 MAX_TOOL_OUTPUT = 32_000
 MAX_DISCOVERY_DESCRIPTION = 500
+MAX_PROMPT_INDEX_ITEMS = 10
+MAX_PROMPT_INDEX_DESCRIPTION = 160
 
 
 @dataclass(slots=True)
@@ -37,6 +39,9 @@ class Capability:
     handler: BaseTool | None = None
     protocol: str = ""
     source: str = ""
+    capability_id: str = ""
+    responsibility: str = ""
+    excludes: list[str] = field(default_factory=list)
 
     def model_tool(self) -> dict[str, Any]:
         return {
@@ -59,10 +64,14 @@ class CapabilityResult:
 def discover_capabilities(record: BusinessRecord | None = None) -> list[Capability]:
     """Build the model-visible catalog from the filesystem and saved MCP config."""
 
+    from app.studio.capabilities.readiness import ensure_capability_readiness
+
+    ensure_capability_readiness(record.owner_id if record is not None else None)
+
     capabilities: list[Capability] = []
     function_names: set[str] = set()
-    tool_sources = {
-        item.name: item.source
+    tool_states = {
+        item.name: item
         for item in tool_registry.list()
         if item.status == "ready" and item.mounted
     }
@@ -70,6 +79,7 @@ def discover_capabilities(record: BusinessRecord | None = None) -> list[Capabili
     for installed_tool in tool_registry.get_tools():
         metadata = installed_tool.metadata if isinstance(installed_tool.metadata, dict) else {}
         studio_metadata = metadata.get("studio") if isinstance(metadata.get("studio"), dict) else metadata
+        tool_state = tool_states.get(str(installed_tool.name))
         function_name = _unique_function_name(str(installed_tool.name), function_names)
         function_names.add(function_name)
         capabilities.append(
@@ -82,7 +92,10 @@ def discover_capabilities(record: BusinessRecord | None = None) -> list[Capabili
                 retry_safe=bool(studio_metadata.get("retry_safe", False)),
                 handler=installed_tool,
                 protocol=str(studio_metadata.get("protocol") or ""),
-                source=tool_sources.get(str(installed_tool.name), "tools"),
+                source=tool_state.source if tool_state is not None else "tools",
+                capability_id=tool_state.capability_id if tool_state is not None else "",
+                responsibility=tool_state.responsibility if tool_state is not None else "",
+                excludes=list(tool_state.excludes) if tool_state is not None else [],
             )
         )
 
@@ -125,6 +138,12 @@ def discover_capabilities(record: BusinessRecord | None = None) -> list[Capabili
                     },
                     retry_safe=bool(remote_tool.get("idempotent", False)),
                     source=server_name,
+                    capability_id=f"mcp:{server_name}:{remote_name}",
+                    responsibility=str(
+                        remote_tool.get("description")
+                        or config.get("description")
+                        or f"Call {server_name}.{remote_name} through MCP."
+                    ),
                 )
             )
     return capabilities
@@ -193,6 +212,9 @@ def optional_capability_catalog(
                 "name": skill.name,
                 "description": _bounded_description(skill.description),
                 "instruction_path": skill.location,
+                "capability_id": skill.capability_id,
+                "responsibility": skill.responsibility,
+                "excludes": skill.excludes,
             }
             for skill in skills
             if skill.enabled
@@ -205,6 +227,9 @@ def optional_capability_catalog(
                 "display_name": capability.display_name,
                 "source": capability.source,
                 "description": _bounded_description(capability.description),
+                "capability_id": capability.capability_id,
+                "responsibility": _bounded_description(capability.responsibility),
+                "excludes": capability.excludes,
                 "_capability": capability,
             }
             for capability in tool_capabilities
@@ -217,6 +242,9 @@ def optional_capability_catalog(
                 "display_name": capability.display_name,
                 "server": capability.source,
                 "description": _bounded_description(capability.description),
+                "capability_id": capability.capability_id,
+                "responsibility": _bounded_description(capability.responsibility),
+                "excludes": capability.excludes,
                 "_capability": capability,
             }
             for capability in mcp_capabilities
@@ -230,7 +258,13 @@ def optional_capability_catalog(
                 str(entry.get(key) or "")
                 for key in ("name", "display_name", "server")
             ).casefold()
-            description_haystack = str(entry.get("description") or "").casefold()
+            description_haystack = " ".join(
+                [
+                    str(entry.get("description") or ""),
+                    str(entry.get("responsibility") or ""),
+                    *(str(item) for item in entry.get("excludes") or []),
+                ]
+            ).casefold()
             score = sum(
                 30 if term in name_haystack else 10 if term in description_haystack else 0
                 for term in terms
@@ -270,6 +304,43 @@ def optional_capability_catalog(
             "to call_tool or call_mcp respectively."
         ),
     }
+
+
+def optional_capability_index(
+    tool_capabilities: list[Capability],
+    mcp_capabilities: list[Capability],
+) -> str:
+    """Render a bounded routing index; invocation schemas remain on demand."""
+
+    lines: list[str] = []
+    remaining = MAX_PROMPT_INDEX_ITEMS
+    for label, capabilities in (
+        ("Optional Tools", tool_capabilities),
+        ("MCP capabilities", mcp_capabilities),
+    ):
+        ordered = sorted(
+            capabilities,
+            key=lambda item: (item.source.casefold(), item.display_name.casefold()),
+        )
+        selected = ordered[:remaining]
+        lines.append(f"- {label}: {len(ordered)} available")
+        for capability in selected:
+            description = _bounded_text(
+                capability.responsibility or capability.description,
+                MAX_PROMPT_INDEX_DESCRIPTION,
+            )
+            source = f" from {capability.source}" if capability.source else ""
+            lines.append(
+                f"  - `{capability.function_name}`{source}: {description}"
+            )
+        remaining -= len(selected)
+        omitted = len(ordered) - len(selected)
+        if omitted:
+            lines.append(
+                f"  - {omitted} more omitted; search this family with "
+                "`discover_studio_capabilities`."
+            )
+    return "\n".join(lines)
 
 
 def _execute_tool(capability: Capability, arguments: dict[str, Any]) -> CapabilityResult:
@@ -361,6 +432,13 @@ def _bounded_description(value: str) -> str:
     if len(normalized) <= MAX_DISCOVERY_DESCRIPTION:
         return normalized
     return normalized[: MAX_DISCOVERY_DESCRIPTION - 3].rstrip() + "..."
+
+
+def _bounded_text(value: str, limit: int) -> str:
+    normalized = re.sub(r"\s+", " ", str(value)).strip()
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(0, limit - 3)].rstrip() + "..."
 
 
 def _function_slug(value: str) -> str:

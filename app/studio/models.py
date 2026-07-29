@@ -241,6 +241,10 @@ class SkillDefinition(BaseModel):
     digest: str = ""
     location: str = ""
     resources: list[str] = Field(default_factory=list)
+    capability_id: str = ""
+    responsibility: str = ""
+    excludes: list[str] = Field(default_factory=list)
+    contract_status: Literal["declared", "undeclared"] = "undeclared"
 
 
 
