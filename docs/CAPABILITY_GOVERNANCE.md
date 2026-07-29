@@ -94,7 +94,7 @@ MCP Server 可以暴露多个远端 Tool，但 Studio 将每个远端 Tool 视�
 | 能力 | 状态 | 唯一责任 | 标准交接产物 |
 | --- | --- | --- | --- |
 | `discover-data-relations` | 已实现 | 从材料证据推导宏观数据关系 | `outputs/data-relations/scenario-relationship.json` |
-| `derive-business-flow` | 待实现为独立 Skill | 基于已验收关系和业务证据推导流程、状态与分支 | `outputs/business-flow/business-flow.json` |
+| `derive-business-flow` | 已实现 | 基于已验收关系和业务证据推导宏观流程、状态、控制与分支 | `outputs/business-flow/business-flow.json` |
 | `distill-business-capability` | 待实现为独立 Skill | 将已验收的场景关系、流程、规则和约束蒸馏为 Skill 源文件 | `outputs/capability-distillation/` |
 | `package-business-skill` | 待实现为独立 Skill | 校验 Skill 结构、依赖、契约和可移植性并生成最终包 | `deliverables/skill-package/` |
 

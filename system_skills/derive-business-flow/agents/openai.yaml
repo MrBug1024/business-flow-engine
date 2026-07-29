@@ -1,0 +1,4 @@
+interface:
+  display_name: "业务场景宏观流程推导"
+  short_description: "仅基于已验收关系图谱推导可核验的场景级宏观业务流程"
+  default_prompt: "使用 $derive-business-flow 基于已完成的数据关系产出推导整个业务场景的宏观流程。"
