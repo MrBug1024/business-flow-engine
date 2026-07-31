@@ -83,6 +83,38 @@ Skill 可以包含多个内部脚本、参考资料和步骤，但它们必须�
 结果。脚本不是独立 Tool。系统或用户 Skill 缺失职责声明时，就绪状态为 degraded；
 为了兼容标准 Skill 包，安装流程不会只因缺少扩展字段而破坏包内容。
 
+会生成工作区交付物的 Skill 还应声明可由平台直接执行的完成契约：
+
+```yaml
+metadata:
+  completion:
+    triggers:
+      - 用户请求中可稳定识别该交付目标的短语
+    required_artifacts:
+      - outputs/example/result.json
+      - outputs/example/report.md
+    forbidden_artifacts:
+      - outputs/example/validation-errors.json
+    status_checks:
+      - artifact: outputs/example/result.json
+        field: status
+        allowed: [complete]
+    fingerprints:
+      - artifact: outputs/example/result.json
+        field: source.fingerprint
+        source: outputs/upstream/result.json
+```
+
+路径一律相对于 `/workspace`，不能指向 Skill 源码或平台目录。`triggers` 只描述能力
+目标，不包含某个客户或业务场景名称。平台同时使用已激活 Skill 和请求触发词匹配
+契约，因此即使模型漏读了明显匹配的 Skill，也不能绕过交付验收。
+
+`report_task_progress(action="complete")` 必须显式报告最终文件。平台会检查文件真实
+存在、非空、位于工作区内，随后执行状态、禁止文件和 SHA-256 上游指纹检查。验收
+失败时 complete 被降为 running，并把具体缺项返回给 Agent。编排器还会在最终答复
+落库前重复验收；虚假完成文本不会进入对话，而是携带检查点自动续跑。连续续跑仍
+不能通过时，任务明确失败，不能显示为成功。
+
 ### 4.3 MCP
 
 MCP Server 可以暴露多个远端 Tool，但 Studio 将每个远端 Tool 视为独立能力，
@@ -93,9 +125,11 @@ MCP Server 可以暴露多个远端 Tool，但 Studio 将每个远端 Tool 视�
 
 | 能力 | 状态 | 唯一责任 | 标准交接产物 |
 | --- | --- | --- | --- |
-| `discover-data-relations` | 已实现 | 从材料证据推导宏观数据关系 | `outputs/data-relations/scenario-relationship.json` |
-| `derive-business-flow` | 已实现 | 基于已验收关系和业务证据推导宏观流程、状态、控制与分支 | `outputs/business-flow/business-flow.json` |
-| `distill-business-capability` | 待实现为独立 Skill | 将已验收的场景关系、流程、规则和约束蒸馏为 Skill 源文件 | `outputs/capability-distillation/` |
+| `discover-data-relations` | 已实现 | 从材料证据推导宏观数据关系及结构化/非结构化可执行数据契约 | `outputs/data-relations/scenario-relationship.json`、`operational-data-contract.json` |
+| `derive-business-flow` | 已实现 | 基于已验收关系和数据执行契约推导规则优先的宏观流程、状态、控制与分支 | `outputs/business-flow/business-flow.json` |
+| `distill-business-capability` | 已实现 | 将已验收关系、流程和执行约束蒸馏为可移植的场景编排、逐节点、按需基础 Skill 源码及第三方 Agent 提示词 | `outputs/capability-distillation/capability-manifest.json`、`agent_prompts.md` |
+
+蒸馏产物的每个 Skill 都必须包含稳定脚本入口。阶段 Skill 通过工作单与交接脚本约束输入输出，总控 Skill 通过状态机脚本维护流程顺序；不得把重复文件处理、HTTP 客户端或流程状态留给第三方 Agent 临时实现。场景需要已有 OCR、知识库等系统 Skill 时，生成器完整继承其运行资源和配置字段/值，只重建场景描述、触发条件、角色和绑定；已配置凭据按原字段继承，但只在 manifest 中暴露配置状态而不回显值。
 | `package-business-skill` | 待实现为独立 Skill | 校验 Skill 结构、依赖、契约和可移植性并生成最终包 | `deliverables/skill-package/` |
 
 禁止跨层代办：数据关系 Skill 不推流程；流程 Skill 不生成 Skill；蒸馏 Skill 不

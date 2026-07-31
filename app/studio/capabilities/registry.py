@@ -66,6 +66,11 @@ def list_skills(owner_id: str | None = None) -> list[SkillDefinition]:
         capability = metadata.get("capability") if isinstance(metadata.get("capability"), dict) else {}
         capability_id = str(capability.get("id") or "").strip()
         responsibility = _clean_description(str(capability.get("responsibility") or ""))
+        completion = (
+            metadata.get("completion")
+            if isinstance(metadata.get("completion"), dict)
+            else {}
+        )
         raw_excludes = capability.get("excludes", [])
         excludes_are_valid = isinstance(raw_excludes, list)
         excludes_source = raw_excludes if excludes_are_valid else []
@@ -91,6 +96,7 @@ def list_skills(owner_id: str | None = None) -> list[SkillDefinition]:
                 capability_id=capability_id,
                 responsibility=responsibility,
                 excludes=excludes,
+                completion=completion,
                 contract_status=(
                     "declared"
                     if capability_id and responsibility and excludes_are_valid

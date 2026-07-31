@@ -13,6 +13,7 @@ ocr_service.py — OCR 服务客户端
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import mimetypes
 import os
@@ -180,7 +181,11 @@ class OCRService:
             return _result("provider_unavailable", "输入文件地址当前不可达。")
 
         image_mode = _is_image(payload.filename)
-        return self._do_post(payload, image_mode=image_mode)
+        return {
+            **self._do_post(payload, image_mode=image_mode),
+            "source_digest": hashlib.sha256(payload.content).hexdigest(),
+            "source_digest_kind": "original_input_sha256",
+        }
 
     # ── 构建请求载体 ──────────────────────────
     def _build_payload(
@@ -294,6 +299,12 @@ class OCRService:
                 data={"text": text},
                 sources=[{"filename": payload.filename}],
                 text=text,
+                ocr_provenance={
+                    "provider_fields": sorted(str(key) for key in data.keys())[:50],
+                    "has_page_metadata": any(key in data for key in ("pages", "page", "page_count")),
+                    "has_block_metadata": any(key in data for key in ("blocks", "layout", "elements")),
+                    "has_confidence_metadata": any(key in data for key in ("confidence", "score", "scores")),
+                },
             )
 
         except httpx.RequestError:

@@ -30,7 +30,7 @@ from typing import Any, Callable, Iterable, Iterator, Sequence
 from xml.etree import ElementTree
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 TABULAR_EXTENSIONS = {".csv", ".tsv", ".xlsx", ".jsonl", ".ndjson", ".parquet", ".sqlite", ".sqlite3", ".db"}
 TEXT_EXTENSIONS = {".txt", ".md", ".markdown", ".log", ".sql", ".json", ".xml", ".html", ".htm", ".yaml", ".yml", ".ini", ".cfg", ".conf"}
 DOCUMENT_EXTENSIONS = TEXT_EXTENSIONS | {".pdf", ".docx", ".pptx"}
@@ -42,7 +42,9 @@ ROLE_TERMS = {
     "dictionary", "mapping", "template", "sample", "example", "result", "output", "spec",
     "规则", "政策", "配置", "参考", "字典", "映射", "模板", "样例", "示例", "结果", "输出", "规范",
 }
-MAX_EVIDENCE = 12
+MAX_EVIDENCE = 8
+HEADER_SAMPLE_ROWS = 64
+MAX_HEADER_SAMPLE_COLUMNS = 2048
 
 
 @dataclass
@@ -64,6 +66,9 @@ class TableMeta:
     column_count: int
     columns: list[ColumnMeta]
     engine: str
+    header_row: int = 0
+    header_confidence: float = 1.0
+    header_detection: str = "default_first_row"
 
     @property
     def estimated_cells(self) -> int | None:
@@ -145,10 +150,15 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def atomic_json(path: Path, payload: Any) -> None:
+def atomic_json(path: Path, payload: Any, *, compact: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    serialized = (
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        if compact
+        else json.dumps(payload, ensure_ascii=False, indent=2)
+    )
+    temporary.write_text(serialized, encoding="utf-8")
     os.replace(temporary, path)
 
 
@@ -263,11 +273,18 @@ class BottomK:
 class CardinalitySketch:
     """Small HyperLogLog sketch used only to suppress low-cardinality expansion."""
 
-    def __init__(self, nonempty: int = 0, registers: Sequence[int] | None = None) -> None:
+    def __init__(
+        self,
+        nonempty: int = 0,
+        registers: Sequence[int] | None = None,
+        distinct_estimate: float | None = None,
+    ) -> None:
         self.nonempty = nonempty
         self.registers = list(registers) if registers is not None else [0] * 256
+        self.distinct_estimate = distinct_estimate
 
     def add(self, fingerprint: str) -> None:
+        self.distinct_estimate = None
         value = int(fingerprint[:16], 16)
         bucket = value & 0xFF
         remainder = value >> 8
@@ -276,6 +293,8 @@ class CardinalitySketch:
         self.nonempty += 1
 
     def estimate(self) -> float:
+        if self.distinct_estimate is not None:
+            return self.distinct_estimate
         size = len(self.registers)
         raw = 0.7213 / (1 + 1.079 / size) * size * size / sum(2.0 ** -value for value in self.registers)
         zeroes = self.registers.count(0)
@@ -287,8 +306,17 @@ class CardinalitySketch:
     def ratio(self) -> float:
         return min(1.0, self.estimate() / self.nonempty) if self.nonempty else 0.0
 
+    def observe_summary(self, nonempty: int, distinct: int) -> None:
+        self.nonempty = max(0, int(nonempty))
+        self.distinct_estimate = float(max(0, distinct))
+
     def to_json(self) -> dict[str, Any]:
-        return {"nonempty": self.nonempty, "registers": self.registers}
+        payload: dict[str, Any] = {"nonempty": self.nonempty}
+        if self.distinct_estimate is None:
+            payload["registers"] = self.registers
+        else:
+            payload["distinct_estimate"] = self.distinct_estimate
+        return payload
 
 
 class SeedIndex:
@@ -296,8 +324,12 @@ class SeedIndex:
         self.max_values = max_values
         self.max_sources_per_value = max_sources_per_value
         self.by_fingerprint: dict[str, list[ValueSource]] = {}
+        self.normalized_by_fingerprint: dict[str, str] = {}
 
     def add(self, source: ValueSource) -> bool:
+        normalized = getattr(source, "_normalized_value", "")
+        if normalized:
+            self.normalized_by_fingerprint[source.fingerprint] = normalized
         sources = self.by_fingerprint.get(source.fingerprint)
         if sources is None:
             if len(self.by_fingerprint) >= self.max_values:
@@ -323,6 +355,14 @@ class SeedIndex:
 
     def signatures(self) -> set[tuple[str, str]]:
         return {(source.kind, source.base) for sources in self.by_fingerprint.values() for source in sources}
+
+    def matching_values_for_file(self, file_path: str, minimum_specificity: int = 2) -> list[str]:
+        values = []
+        for fingerprint, normalized in self.normalized_by_fingerprint.items():
+            sources = self.by_fingerprint.get(fingerprint, [])
+            if any(source.file_path != file_path and source.specificity >= minimum_specificity for source in sources):
+                values.append(normalized)
+        return sorted(set(values))
 
     def to_json(self) -> list[dict[str, Any]]:
         return [asdict(source) for sources in self.by_fingerprint.values() for source in sources]
@@ -503,13 +543,223 @@ def _fastexcel() -> Any | None:
     return fastexcel
 
 
-def _fastexcel_xlsx_headers(path: Path, sheet: str) -> list[str]:
+HEADER_HINTS = (
+    "id", "编号", "编码", "代码", "名称", "姓名", "类型", "类别", "日期", "时间",
+    "金额", "数量", "单价", "比例", "状态", "标志", "规则", "政策", "清单", "分类",
+    "用途", "示例", "说明", "描述", "结果", "机构", "人员", "项目", "结算", "就诊",
+    "field", "column", "name", "type", "date", "time", "amount", "status", "rule",
+)
+
+
+def _row_values(values: Sequence[Any]) -> list[str]:
+    return [normalize_text(value) for value in values if normalize_text(value)]
+
+
+def _looks_numeric_or_date(value: str) -> bool:
+    if re.fullmatch(r"[-+]?\d+(?:[.,]\d+)?%?", value):
+        return True
+    return bool(re.fullmatch(r"\d{4}[-/.]\d{1,2}(?:[-/.]\d{1,2})?(?:[ T].*)?", value))
+
+
+def header_candidate_score(
+    values: Sequence[Any],
+    *,
+    max_width: int | None = None,
+    following_rows: Sequence[Sequence[Any]] = (),
+) -> float:
+    normalized = [normalize_text(value) for value in values]
+    nonempty = [value for value in normalized if value]
+    if len(nonempty) < 2:
+        return float("-inf")
+    observed_width = max(2, max_width or len(nonempty))
+    unique_ratio = len(set(nonempty)) / len(nonempty)
+    short_ratio = sum(len(value) <= 64 for value in nonempty) / len(nonempty)
+    long_ratio = sum(len(value) > 128 for value in nonempty) / len(nonempty)
+    numeric_ratio = sum(_looks_numeric_or_date(value) for value in nonempty) / len(nonempty)
+    text_ratio = sum(any(char.isalpha() or "\u4e00" <= char <= "\u9fff" for char in value) for value in nonempty) / len(nonempty)
+    hint_ratio = sum(any(hint in value.casefold() for hint in HEADER_HINTS) for value in nonempty) / len(nonempty)
+    semantic_ratio = sum(header_semantic(value)[0] != "other" for value in nonempty) / len(nonempty)
+    density = min(1.0, len(nonempty) / observed_width)
+    following = [_row_values(row) for row in following_rows]
+    following = [row for row in following if row]
+    stable_rows = sum(len(row) >= max(2, round(len(nonempty) * 0.6)) for row in following)
+    stability = stable_rows / len(following) if following else 0.0
+    following_numeric = (
+        sum(_looks_numeric_or_date(value) for row in following for value in row)
+        / max(1, sum(len(row) for row in following))
+    )
+    type_contrast = min(text_ratio, following_numeric)
+    return (
+        unique_ratio * 2.0
+        + short_ratio
+        + text_ratio
+        + density * 3.0
+        + stability * 2.0
+        + type_contrast * 1.5
+        + hint_ratio * 5.0
+        + semantic_ratio * 3.0
+        - numeric_ratio * 3.0
+        - long_ratio * 2.0
+    )
+
+
+def detect_header_row(rows: Sequence[Sequence[Any]]) -> tuple[int, float]:
+    populated_widths = [len(_row_values(row)) for row in rows]
+    max_width = max(populated_widths, default=0)
+    scored = []
+    for index, row in enumerate(rows):
+        following = rows[index + 1:index + 9]
+        score = header_candidate_score(row, max_width=max_width, following_rows=following)
+        if score != float("-inf"):
+            # When structural scores are close, the first stable rectangular row is
+            # more likely to be the header than a later data row.
+            score -= index * 0.025
+        scored.append((score, index))
+    viable = sorted(
+        (item for item in scored if item[0] != float("-inf")),
+        key=lambda item: (-item[0], item[1]),
+    )
+    if not viable:
+        return 0, 0.0
+    best_score, best_index = viable[0]
+    second_score = viable[1][0] if len(viable) > 1 else 0.0
+    confidence = max(0.0, min(1.0, 0.35 + best_score / 24 + max(0.0, best_score - second_score) / 12))
+    return best_index, round(confidence, 3)
+
+
+def _excel_column_index(reference: str) -> int:
+    match = re.match(r"([A-Z]+)", reference, re.IGNORECASE)
+    if not match:
+        return 0
+    value = 0
+    for char in match.group(1).upper():
+        value = value * 26 + ord(char) - 64
+    return max(0, value - 1)
+
+
+def _ooxml_sheet_sample(
+    archive: zipfile.ZipFile,
+    entry: str,
+    max_rows: int,
+) -> tuple[list[list[Any]], set[int]]:
+    rows: list[list[Any]] = []
+    shared_indexes: set[int] = set()
+    with archive.open(entry) as stream:
+        for _event, element in ElementTree.iterparse(stream, events=("end",)):
+            if not element.tag.endswith("}row"):
+                continue
+            try:
+                row_number = int(element.attrib.get("r", len(rows) + 1))
+            except ValueError:
+                row_number = len(rows) + 1
+            if row_number > max_rows:
+                element.clear()
+                break
+            while len(rows) < row_number - 1:
+                rows.append([])
+            cells: dict[int, Any] = {}
+            for cell in element:
+                if not cell.tag.endswith("}c"):
+                    continue
+                column_index = _excel_column_index(cell.attrib.get("r", ""))
+                if column_index >= MAX_HEADER_SAMPLE_COLUMNS:
+                    continue
+                cell_type = cell.attrib.get("t", "")
+                value_node = next((node for node in cell if node.tag.endswith("}v")), None)
+                if cell_type == "inlineStr":
+                    value: Any = "".join(
+                        node.text or "" for node in cell.iter() if node.tag.endswith("}t")
+                    )
+                elif value_node is None:
+                    value = ""
+                elif cell_type == "s":
+                    try:
+                        shared_index = int(value_node.text or "-1")
+                    except ValueError:
+                        shared_index = -1
+                    if shared_index >= 0:
+                        shared_indexes.add(shared_index)
+                        value = ("__shared_string__", shared_index)
+                    else:
+                        value = ""
+                elif cell_type == "b":
+                    value = "true" if value_node.text == "1" else "false"
+                else:
+                    value = value_node.text or ""
+                cells[column_index] = value
+            width = max(cells, default=-1) + 1
+            row = [cells.get(index, "") for index in range(width)]
+            if len(rows) == row_number - 1:
+                rows.append(row)
+            else:
+                rows[row_number - 1] = row
+            element.clear()
+    return rows, shared_indexes
+
+
+def _ooxml_shared_strings(archive: zipfile.ZipFile, wanted: set[int]) -> dict[int, str]:
+    if not wanted:
+        return {}
+    resolved: dict[int, str] = {}
+    try:
+        stream = archive.open("xl/sharedStrings.xml")
+    except KeyError:
+        return resolved
+    highest = max(wanted)
+    index = -1
+    with stream:
+        for _event, element in ElementTree.iterparse(stream, events=("end",)):
+            if not element.tag.endswith("}si"):
+                continue
+            index += 1
+            if index in wanted:
+                resolved[index] = "".join(
+                    node.text or "" for node in element.iter() if node.tag.endswith("}t")
+                )
+            element.clear()
+            if index >= highest:
+                break
+    return resolved
+
+
+def _ooxml_xlsx_samples(
+    path: Path,
+    layouts: Sequence[tuple[str, str, int | None, int | None, str]],
+    max_rows: int = HEADER_SAMPLE_ROWS,
+) -> dict[str, list[list[Any]]]:
+    samples: dict[str, list[list[Any]]] = {}
+    wanted: set[int] = set()
+    with zipfile.ZipFile(path) as archive:
+        for sheet, entry, _rows, _columns, _end_column in layouts:
+            rows, references = _ooxml_sheet_sample(archive, entry, max_rows)
+            samples[sheet] = rows
+            wanted.update(references)
+        shared = _ooxml_shared_strings(archive, wanted)
+    for rows in samples.values():
+        for row in rows:
+            for index, value in enumerate(row):
+                if isinstance(value, tuple) and len(value) == 2 and value[0] == "__shared_string__":
+                    row[index] = shared.get(int(value[1]), "")
+    return samples
+
+
+def _fastexcel_xlsx_headers(path: Path, sheet: str) -> tuple[list[Any], int, float]:
     fastexcel = _fastexcel()
     if fastexcel is None:
         raise RuntimeError("fastexcel unavailable")
     reader = fastexcel.read_excel(str(path))
-    batch = reader.load_sheet_eager(sheet, header_row=0, n_rows=1, dtypes="string", dtype_coercion="coerce")
-    return list(batch.schema.names)
+    batch = reader.load_sheet_eager(
+        sheet,
+        header_row=None,
+        n_rows=HEADER_SAMPLE_ROWS,
+        dtypes="string",
+        dtype_coercion="coerce",
+    )
+    schema_names = list(batch.schema.names)
+    rows = [[record.get(name) for name in schema_names] for record in batch.to_pylist()]
+    header_row, confidence = detect_header_row(rows)
+    headers = list(rows[header_row]) if rows else []
+    return headers, header_row, confidence
 
 
 def _duckdb_xlsx_headers(path: Path, sheet: str, end_column: str) -> list[str]:
@@ -528,18 +778,27 @@ def _duckdb_xlsx_headers(path: Path, sheet: str, end_column: str) -> list[str]:
 def inspect_xlsx(file_id: int, relative: str, path: Path) -> list[TableMeta]:
     layouts = _xlsx_layouts(path)
     tables: list[TableMeta] = []
-    fallback_headers: dict[str, list[Any]] = {}
+    try:
+        samples = _ooxml_xlsx_samples(path, layouts)
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile, ElementTree.ParseError):
+        samples = {}
+    fallback_samples: dict[str, list[list[Any]]] = {}
     for sheet, _entry, rows, columns, end_column in layouts:
-        engine = "fastexcel"
-        try:
-            headers = _fastexcel_xlsx_headers(path, sheet)
-        except Exception:
-            engine = "duckdb"
+        engine = "fastexcel" if _fastexcel() is not None else "duckdb" if _duckdb() is not None else "openpyxl"
+        header_row = 0
+        header_confidence = 0.0
+        header_detection = f"ooxml_sampled_first_{HEADER_SAMPLE_ROWS}_rows"
+        sampled_rows = samples.get(sheet, [])
+        if sampled_rows:
+            header_row, header_confidence = detect_header_row(sampled_rows)
+            headers = list(sampled_rows[header_row]) if header_row < len(sampled_rows) else []
+        else:
+            header_detection = f"library_sampled_first_{HEADER_SAMPLE_ROWS}_rows"
             try:
-                headers = _duckdb_xlsx_headers(path, sheet, end_column)
+                headers, header_row, header_confidence = _fastexcel_xlsx_headers(path, sheet)
             except Exception:
                 engine = "openpyxl"
-                if not fallback_headers:
+                if not fallback_samples:
                     try:
                         import openpyxl
                     except ImportError as exc:
@@ -547,13 +806,28 @@ def inspect_xlsx(file_id: int, relative: str, path: Path) -> list[TableMeta]:
                     workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
                     try:
                         for worksheet in workbook.worksheets:
-                            first = next(worksheet.iter_rows(min_row=1, max_row=1, values_only=True), ())
-                            fallback_headers[worksheet.title] = list(first)
+                            fallback_samples[worksheet.title] = [
+                                list(row) for row in worksheet.iter_rows(
+                                    min_row=1,
+                                    max_row=HEADER_SAMPLE_ROWS,
+                                    values_only=True,
+                                )
+                            ]
                     finally:
                         workbook.close()
-                headers = [normalize_text(value) or f"column_{index + 1}" for index, value in enumerate(fallback_headers.get(sheet, []))]
+                sampled_rows = fallback_samples.get(sheet, [])
+                header_row, header_confidence = detect_header_row(sampled_rows)
+                headers = list(sampled_rows[header_row]) if header_row < len(sampled_rows) else []
+        expected_columns = min(MAX_HEADER_SAMPLE_COLUMNS, max(columns or 0, len(headers)))
+        if len(headers) < expected_columns:
+            headers.extend([None] * (expected_columns - len(headers)))
         table_columns = make_columns(headers)
-        tables.append(TableMeta(f"{file_id}:{sheet}", file_id, relative, sheet, rows, columns or len(table_columns), table_columns, engine))
+        data_rows = max(0, rows - header_row - 1) if rows is not None else None
+        tables.append(TableMeta(
+            f"{file_id}:{sheet}", file_id, relative, sheet, data_rows,
+            columns or len(table_columns), table_columns, engine,
+            header_row, header_confidence, header_detection,
+        ))
     return tables
 
 
@@ -570,9 +844,14 @@ def inspect_csv(file_id: int, relative: str, path: Path) -> list[TableMeta]:
             except csv.Error:
                 dialect = "excel"
             reader = csv.reader(stream, dialect=dialect)
-        headers = next(reader, [])
+        rows = list(itertools.islice(reader, HEADER_SAMPLE_ROWS))
+        header_row, header_confidence = detect_header_row(rows)
+        headers = rows[header_row] if rows else []
     columns = make_columns(headers)
-    return [TableMeta(f"{file_id}:{path.name}", file_id, relative, path.name, None, len(columns), columns, "csv")]
+    return [TableMeta(
+        f"{file_id}:{path.name}", file_id, relative, path.name, None, len(columns), columns, "csv",
+        header_row, header_confidence, f"sampled_first_{HEADER_SAMPLE_ROWS}_rows",
+    )]
 
 
 def inspect_jsonl(file_id: int, relative: str, path: Path) -> list[TableMeta]:
@@ -656,24 +935,70 @@ def _quoted_identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
-def iter_table_rows(table: TableMeta, path: Path, selected: Sequence[ColumnMeta], start_offset: int = 0) -> Iterator[tuple[int, dict[str, Any]]]:
+def excel_column_name(index: int) -> str:
+    value = ""
+    while index > 0:
+        index, remainder = divmod(index - 1, 26)
+        value = chr(65 + remainder) + value
+    return value or "A"
+
+
+def iter_table_rows(
+    table: TableMeta,
+    path: Path,
+    selected: Sequence[ColumnMeta],
+    start_offset: int = 0,
+    row_limit: int | None = None,
+) -> Iterator[tuple[int, dict[str, Any]]]:
     if not selected:
         return
+    if path.suffix.casefold() == ".xlsx":
+        duckdb = _duckdb()
+        if duckdb is not None:
+            connection = duckdb.connect()
+            try:
+                projection = ", ".join(_quoted_identifier(column.query_name) for column in selected)
+                cell_range = (
+                    f"A{table.header_row + 1}:"
+                    f"{excel_column_name(max(1, table.column_count))}1048576"
+                )
+                limit_clause = f"LIMIT {max(0, int(row_limit))} " if row_limit is not None else ""
+                query = (
+                    f"SELECT row_number() OVER () + {table.header_row + 1} AS __row_number, {projection} "
+                    "FROM read_xlsx(?, sheet=?, range=?, header=true, all_varchar=true, ignore_errors=true) "
+                    f"{limit_clause}OFFSET {int(start_offset)}"
+                )
+                cursor = connection.execute(query, [str(path), table.table_name, cell_range])
+                while rows := cursor.fetchmany(4096):
+                    for row in rows:
+                        yield int(row[0]), {
+                            column.name: row[index + 1] for index, column in enumerate(selected)
+                        }
+                return
+            except Exception:
+                pass
+            finally:
+                connection.close()
     if table.engine == "fastexcel":
         fastexcel = _fastexcel()
         if fastexcel is not None:
             reader = fastexcel.read_excel(str(path))
             batch = reader.load_sheet_eager(
                 table.table_name,
-                header_row=0,
+                header_row=table.header_row,
                 use_columns=[column.index for column in selected],
+                n_rows=(start_offset + row_limit) if row_limit is not None else None,
                 dtypes="string",
                 dtype_coercion="coerce",
             )
-            for batch_offset in range(start_offset, batch.num_rows, 4096):
-                records = batch.slice(batch_offset, min(4096, batch.num_rows - batch_offset)).to_pylist()
+            end_offset = min(
+                batch.num_rows,
+                start_offset + row_limit if row_limit is not None else batch.num_rows,
+            )
+            for batch_offset in range(start_offset, end_offset, 4096):
+                records = batch.slice(batch_offset, min(4096, end_offset - batch_offset)).to_pylist()
                 for record_offset, record in enumerate(records):
-                    row_number = batch_offset + record_offset + 2
+                    row_number = batch_offset + record_offset + table.header_row + 2
                     yield row_number, {
                         column.name: record.get(batch.schema.names[index])
                         for index, column in enumerate(selected)
@@ -685,10 +1010,11 @@ def iter_table_rows(table: TableMeta, path: Path, selected: Sequence[ColumnMeta]
             connection = duckdb.connect()
             try:
                 projection = ", ".join(_quoted_identifier(column.query_name) for column in selected)
+                limit_clause = f"LIMIT {max(0, int(row_limit))} " if row_limit is not None else ""
                 query = (
                     f"SELECT row_number() OVER () + 1 AS __row_number, {projection} "
                     "FROM read_xlsx(?, sheet=?, header=true, all_varchar=true, ignore_errors=true) "
-                    f"OFFSET {int(start_offset)}"
+                    f"{limit_clause}OFFSET {int(start_offset)}"
                 )
                 cursor = connection.execute(query, [str(path), table.table_name])
                 while rows := cursor.fetchmany(4096):
@@ -721,10 +1047,12 @@ def iter_table_rows(table: TableMeta, path: Path, selected: Sequence[ColumnMeta]
         workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
         try:
             worksheet = workbook[table.table_name]
-            for data_index, row in enumerate(worksheet.iter_rows(min_row=2, values_only=True), 1):
+            for data_index, row in enumerate(worksheet.iter_rows(min_row=table.header_row + 2, values_only=True), 1):
                 if data_index <= start_offset:
                     continue
-                yield data_index + 1, {column.name: row[column.index] if column.index < len(row) else None for column in selected}
+                if row_limit is not None and data_index > start_offset + row_limit:
+                    break
+                yield data_index + table.header_row + 1, {column.name: row[column.index] if column.index < len(row) else None for column in selected}
         finally:
             workbook.close()
         return
@@ -741,17 +1069,24 @@ def iter_table_rows(table: TableMeta, path: Path, selected: Sequence[ColumnMeta]
                 except csv.Error:
                     dialect = "excel"
                 reader = csv.reader(stream, dialect=dialect)
-            next(reader, None)
+            for _ in range(table.header_row + 1):
+                next(reader, None)
             for data_index, row in enumerate(reader, 1):
                 if data_index <= start_offset:
                     continue
-                yield data_index + 1, {column.name: row[column.index] if column.index < len(row) else None for column in selected}
+                if row_limit is not None and data_index > start_offset + row_limit:
+                    break
+                yield data_index + table.header_row + 1, {
+                    column.name: row[column.index] if column.index < len(row) else None for column in selected
+                }
         return
     if path.suffix.casefold() in {".jsonl", ".ndjson"}:
         with path.open("r", encoding=detect_encoding(path), errors="replace") as stream:
             for data_index, line in enumerate(stream, 1):
                 if data_index <= start_offset:
                     continue
+                if row_limit is not None and data_index > start_offset + row_limit:
+                    break
                 try:
                     item = json.loads(line)
                 except json.JSONDecodeError:
@@ -764,7 +1099,8 @@ def iter_table_rows(table: TableMeta, path: Path, selected: Sequence[ColumnMeta]
         escaped_table = _quoted_identifier(table.table_name)
         projection = ", ".join(_quoted_identifier(column.name) for column in selected)
         try:
-            cursor = connection.execute(f"SELECT rowid, {projection} FROM {escaped_table} LIMIT -1 OFFSET ?", (start_offset,))
+            limit = int(row_limit) if row_limit is not None else -1
+            cursor = connection.execute(f"SELECT rowid, {projection} FROM {escaped_table} LIMIT ? OFFSET ?", (limit, start_offset))
             for row in cursor:
                 yield int(row[0]), {column.name: row[index + 1] for index, column in enumerate(selected)}
         finally:
@@ -863,11 +1199,15 @@ def source_from_cell(file_path: str, table: TableMeta, column: ColumnMeta, row_n
     normalized = valid_join_value(value, column.kind)
     if normalized is None:
         return None
-    return ValueSource(
+    source = ValueSource(
         value_fingerprint(normalized), file_path, table.table_name, column.name, column.kind, column.base,
         f"table:{table.table_name};row:{row_number};column:{column.name}", safe_preview(column.kind, normalized),
         specificity(normalized, column.kind), origin,
     )
+    # Keep normalized values in memory for vectorized matching. They are
+    # deliberately not dataclass fields and are never written to artifacts.
+    source._normalized_value = normalized
+    return source
 
 
 class ProgressiveAnalyzer:
@@ -889,6 +1229,7 @@ class ProgressiveAnalyzer:
         self.partial_table: dict[str, Any] | None = None
         self.scan_stats: dict[str, dict[str, Any]] = {}
         self.warnings: list[str] = []
+        self.phase_timings: dict[str, float] = {}
         self.signature = ""
         self.resumed = False
 
@@ -897,7 +1238,9 @@ class ProgressiveAnalyzer:
             raise DeadlineReached
 
     def load_or_initialize(self, goal: set[str]) -> None:
+        started = time.perf_counter()
         self.files, inventory_warnings = inventory(self.input_root, goal)
+        self.phase_timings["inventory_seconds"] = round(time.perf_counter() - started, 3)
         self.warnings.extend(inventory_warnings)
         self.file_by_id = {item.id: item for item in self.files}
         self.tables = {table.key: table for item in self.files for table in item.tables}
@@ -926,7 +1269,11 @@ class ProgressiveAnalyzer:
                         for key, values in state.get("frontier_profiles", {}).items()
                     }
                     self.column_stats = {
-                        key: CardinalitySketch(int(value.get("nonempty", 0)), value.get("registers", []))
+                        key: CardinalitySketch(
+                            int(value.get("nonempty", 0)),
+                            value.get("registers"),
+                            value.get("distinct_estimate"),
+                        )
                         for key, value in state.get("column_stats", {}).items()
                     }
                     self.match_counts = {
@@ -976,8 +1323,9 @@ class ProgressiveAnalyzer:
             "partial_table": self.partial_table,
             "scan_stats": self.scan_stats,
             "warnings": list(dict.fromkeys(self.warnings)),
+            "phase_timings": self.phase_timings,
         }
-        atomic_json(self.output_root / "progress.json", payload)
+        atomic_json(self.output_root / "progress.json", payload, compact=True)
 
     def connect_and_add(self, source: ValueSource, relation_type: str = "seeded_value_link") -> bool:
         matched = False
@@ -1016,6 +1364,40 @@ class ProgressiveAnalyzer:
             tables = [min(self.tables.values(), key=lambda table: table.estimated_cells or self.file_by_id[table.file_id].size)]
         return tables, documents
 
+    def rehydrate_seed_values(self) -> None:
+        """Restore transient normalized values after loading a privacy-safe checkpoint."""
+        seed_tables, _documents = self.seed_candidates()
+        for table in seed_tables:
+            columns = [column for column in table.columns if column.kind in JOIN_KINDS]
+            if not columns:
+                continue
+            source_file = self.file_by_id[table.file_id]
+            bootstrap = (
+                table.estimated_cells is not None
+                and table.estimated_cells > self.args.seed_cell_budget
+                and source_file.size > self.args.seed_file_bytes
+            )
+            for row_index, (row_number, values) in enumerate(
+                iter_table_rows(
+                    table,
+                    Path(source_file.absolute_path),
+                    columns,
+                    row_limit=self.args.bootstrap_rows if bootstrap else None,
+                ),
+                1,
+            ):
+                for column in columns:
+                    source = source_from_cell(
+                        table.file_path,
+                        table,
+                        column,
+                        row_number,
+                        values.get(column.name),
+                        "seed_rehydrate",
+                    )
+                    if source is not None and source.fingerprint in self.seeds.by_fingerprint:
+                        self.seeds.add(source)
+
     def process_seed_table(self, table: TableMeta, bootstrap: bool = False) -> None:
         if table.key in self.scanned_tables and not bootstrap:
             return
@@ -1025,15 +1407,20 @@ class ProgressiveAnalyzer:
         text_reservoir = BottomK(self.args.max_text_seeds)
         path = Path(self.file_by_id[table.file_id].absolute_path)
         rows = 0
-        for row_number, values in iter_table_rows(table, path, columns):
+        scanned_columns = join_columns if bootstrap else columns
+        for row_number, values in iter_table_rows(
+            table,
+            path,
+            scanned_columns,
+            row_limit=self.args.bootstrap_rows if bootstrap else None,
+        ):
             rows += 1
-            if bootstrap and rows > self.args.bootstrap_rows:
-                break
             for column in join_columns:
                 source = source_from_cell(table.file_path, table, column, row_number, values.get(column.name), "seed_table")
                 if source:
                     reservoirs[column.name].add(source)
                     self.profile_for(table, column).add(source)
+                    self.stats_for(table, column).add(source.fingerprint)
             if not bootstrap:
                 combined = "\t".join(normalize_text(value) for value in values.values() if value not in (None, ""))
                 for source in extract_text_values(combined, f"table:{table.table_name};row:{row_number}", table.file_path):
@@ -1131,8 +1518,207 @@ class ProgressiveAnalyzer:
         size = table.estimated_cells or self.file_by_id[table.file_id].size
         return score, -float(size)
 
+    def probe_columns(self, table: TableMeta) -> list[ColumnMeta]:
+        signatures = self.seeds.signatures()
+        scored: list[tuple[float, int, int, ColumnMeta]] = []
+        kind_priority = {"id": 5, "code": 4, "reference": 4, "email": 3, "phone": 3, "url": 3, "name": 1}
+        for column in table.columns:
+            if column.kind not in JOIN_KINDS:
+                continue
+            compatibility = 0.0
+            for kind, base in signatures:
+                synthetic = ValueSource("", "", "", "", kind, base, "", "", 0, "")
+                compatibility = max(compatibility, column_compatibility(synthetic, column))
+            scored.append((compatibility, kind_priority.get(column.kind, 0), -column.index, column))
+        scored.sort(key=lambda item: (-item[0], -item[1], -item[2]))
+        compatible = [item for item in scored if item[0] >= 0.72]
+        fallback = [item for item in scored if item[0] < 0.72 and item[1] >= 3]
+        # Semantically reachable columns come first. A small bounded fallback
+        # keeps cross-named strong identifiers discoverable without scanning
+        # every name-like field in a wide table.
+        combined = compatible + fallback[: self.args.fallback_probe_columns]
+        return [item[3] for item in combined[: self.args.max_probe_columns]]
+
+    @staticmethod
+    def _sample_positions(row_count: int, limit: int) -> list[int]:
+        if row_count <= 0 or limit <= 0:
+            return []
+        if row_count <= limit:
+            return list(range(row_count))
+        return sorted({min(row_count - 1, int(index * row_count / limit)) for index in range(limit)})
+
+    def scan_large_xlsx_arrow(
+        self,
+        table: TableMeta,
+        path: Path,
+        selected: Sequence[ColumnMeta],
+        start_offset: int,
+    ) -> bool:
+        fastexcel = _fastexcel()
+        if fastexcel is None:
+            return False
+        try:
+            import pyarrow as pa
+            import pyarrow.compute as pc
+        except ImportError:
+            return False
+        match_values = self.seeds.matching_values_for_file(table.file_path)
+        if not match_values:
+            match_values = sorted(set(self.seeds.normalized_by_fingerprint.values()))
+        if not match_values:
+            return False
+
+        started = time.perf_counter()
+        self.check_deadline()
+        reader = fastexcel.read_excel(str(path))
+        batch = reader.load_sheet_eager(
+            table.table_name,
+            header_row=table.header_row,
+            use_columns=[column.index for column in selected],
+            dtypes="string",
+            dtype_coercion="coerce",
+        )
+        if start_offset:
+            batch = batch.slice(start_offset)
+        seed_array = pa.array(match_values, type=pa.string())
+        match_rows: set[int] = set()
+        sample_positions = self._sample_positions(batch.num_rows, self.args.profile_sample_rows)
+        sample_records = (
+            batch.take(pa.array(sample_positions, type=pa.int64())).to_pylist()
+            if sample_positions else []
+        )
+
+        for batch_index, column in enumerate(selected):
+            raw_array = pc.cast(batch.column(batch_index), pa.string(), safe=False)
+            normalized = pc.fill_null(raw_array, "")
+            if hasattr(pc, "utf8_normalize"):
+                normalized = pc.utf8_normalize(normalized, form="NFKC")
+            normalized = pc.utf8_lower(normalized)
+            normalized = pc.replace_substring_regex(normalized, pattern=r"\s+", replacement="")
+            nonempty_mask = pc.not_equal(normalized, "")
+            nonempty = int(pc.sum(pc.cast(nonempty_mask, pa.int64())).as_py() or 0)
+            distinct = int(pc.count_distinct(pc.filter(normalized, nonempty_mask)).as_py() or 0)
+            self.stats_for(table, column).observe_summary(nonempty, distinct)
+
+            schema_name = batch.schema.names[batch_index]
+            for row_index, record in zip(sample_positions, sample_records):
+                source = source_from_cell(
+                    table.file_path,
+                    table,
+                    column,
+                    start_offset + row_index + table.header_row + 2,
+                    record.get(schema_name),
+                    "large_profile_sample",
+                )
+                if source is not None:
+                    self.profile_for(table, column).add(source)
+
+            encoded = pc.index_in(normalized, value_set=seed_array)
+            present = pc.drop_null(encoded)
+            if len(present) == 0:
+                continue
+            counts = pc.value_counts(present).to_pylist()
+            rare = [
+                int(item["values"])
+                for item in counts
+                if int(item["counts"]) <= self.args.max_matches_per_seed
+            ]
+            common = [
+                int(item["values"])
+                for item in counts
+                if int(item["counts"]) > self.args.max_matches_per_seed
+            ]
+            if rare:
+                rare_mask = pc.fill_null(
+                    pc.is_in(encoded, value_set=pa.array(rare, type=encoded.type)),
+                    False,
+                )
+                match_rows.update(int(item.as_py()) for item in pc.indices_nonzero(rare_mask))
+            for seed_index in common:
+                common_mask = pc.fill_null(pc.equal(encoded, seed_index), False)
+                indexes = pc.indices_nonzero(common_mask).slice(0, self.args.max_matches_per_seed)
+                match_rows.update(int(item.as_py()) for item in indexes)
+
+        ordered_rows = sorted(match_rows)
+        if len(ordered_rows) > self.args.max_matched_rows_per_table:
+            positions = self._sample_positions(len(ordered_rows), self.args.max_matched_rows_per_table)
+            ordered_rows = [ordered_rows[index] for index in positions]
+            self.warnings.append(
+                f"Matched-row materialization budget reached for {table.file_path} / {table.table_name}; "
+                "exact matches were deterministically sampled after per-seed caps."
+            )
+        records = (
+            batch.take(pa.array(ordered_rows, type=pa.int64())).to_pylist()
+            if ordered_rows else []
+        )
+        matches = int(self.scan_stats.get(table.key, {}).get("matches", 0))
+        table_match_counts = self.match_counts.setdefault(table.key, {})
+        columns_by_name = {column.name: column for column in selected}
+        for row_index, record in zip(ordered_rows, records):
+            row_number = start_offset + row_index + table.header_row + 2
+            row_sources: list[ValueSource] = []
+            row_matched = False
+            for batch_index, column in enumerate(selected):
+                source = source_from_cell(
+                    table.file_path,
+                    table,
+                    column,
+                    row_number,
+                    record.get(batch.schema.names[batch_index]),
+                    "large_arrow_probe",
+                )
+                if source is None:
+                    continue
+                row_sources.append(source)
+                self.profile_for(table, column).add(source)
+                if table_match_counts.get(source.fingerprint, 0) >= self.args.max_matches_per_seed:
+                    continue
+                for existing, compatibility in self.seeds.matching(source):
+                    minimum_specificity = min(existing.specificity, source.specificity)
+                    confirmed = (
+                        compatibility >= 0.95 and minimum_specificity >= 2
+                    ) or (
+                        compatibility >= 0.82 and minimum_specificity >= 3
+                    )
+                    confidence = min(
+                        0.99,
+                        0.82 + 0.12 * compatibility + 0.015 * minimum_specificity,
+                    )
+                    self.relations.add(
+                        existing,
+                        source,
+                        "seeded_value_link",
+                        confidence,
+                        "confirmed" if confirmed else "supported_hypothesis",
+                        "exact_value_match",
+                        f"A bounded seed exactly matches this candidate column (column compatibility {compatibility:.2f}).",
+                    )
+                    row_matched = True
+                    matches += 1
+                    table_match_counts[source.fingerprint] = table_match_counts.get(source.fingerprint, 0) + 1
+            if row_matched:
+                for source in row_sources:
+                    self.frontier_for(table, columns_by_name[source.column]).add(source)
+
+        self.expand_completed_table(table, selected)
+        self.scanned_tables.add(table.key)
+        self.partial_table = None
+        self.scan_stats[table.key] = {
+            "mode": "arrow_directed_probe",
+            "rows_scanned": start_offset + batch.num_rows,
+            "rows_materialized": len(ordered_rows),
+            "profile_sample_rows": len(sample_positions),
+            "candidate_columns": [column.name for column in selected],
+            "matches": matches,
+            "engine": "fastexcel+pyarrow",
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+        }
+        self.check_deadline()
+        self.save_progress()
+        return True
+
     def scan_large_table(self, table: TableMeta, start_offset: int = 0) -> None:
-        selected = [column for column in table.columns if column.kind in JOIN_KINDS]
+        selected = self.probe_columns(table)
         if not selected:
             self.scanned_tables.add(table.key)
             self.scan_stats[table.key] = {"mode": "schema_only", "rows_scanned": 0, "candidate_columns": [], "matches": 0, "engine": table.engine}
@@ -1140,7 +1726,36 @@ class ProgressiveAnalyzer:
             self.save_progress()
             return
         path = Path(self.file_by_id[table.file_id].absolute_path)
+        if path.suffix.casefold() == ".xlsx":
+            large_xlsx = (
+                (table.estimated_cells or 0) > self.args.xlsx_python_fallback_cell_budget
+                or path.stat().st_size > self.args.seed_file_bytes
+            )
+            if large_xlsx and _fastexcel() is None:
+                raise RuntimeError(
+                    "Large XLSX probing requires fastexcel[pyarrow]. Install this Skill's "
+                    "requirements.txt; refusing the unbounded openpyxl fallback."
+                )
+            try:
+                if self.scan_large_xlsx_arrow(table, path, selected, start_offset):
+                    return
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                self.warnings.append(
+                    f"Arrow acceleration unavailable for {table.file_path} / {table.table_name}: "
+                    f"{type(exc).__name__}: {exc}; using streaming fallback."
+                )
+                if large_xlsx:
+                    raise RuntimeError(
+                        "Accelerated XLSX probing failed; refusing the unbounded Python fallback. "
+                        f"Root cause: {type(exc).__name__}: {exc}"
+                    ) from exc
+            if large_xlsx:
+                raise RuntimeError(
+                    "Large XLSX probing requires both fastexcel and pyarrow; refusing the "
+                    "unbounded Python fallback."
+                )
         rows_scanned = start_offset
+        started = time.perf_counter()
         matches = int(self.scan_stats.get(table.key, {}).get("matches", 0))
         table_match_counts = self.match_counts.setdefault(table.key, {})
         for row_number, values in iter_table_rows(table, path, selected, start_offset):
@@ -1186,6 +1801,7 @@ class ProgressiveAnalyzer:
         self.scan_stats[table.key] = {
             "mode": "directed_probe", "rows_scanned": rows_scanned,
             "candidate_columns": [column.name for column in selected], "matches": matches, "engine": table.engine,
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
         }
         self.save_progress()
 
@@ -1223,6 +1839,7 @@ class ProgressiveAnalyzer:
                 )
 
     def run(self) -> dict[str, Any]:
+        run_started = time.perf_counter()
         if not self.input_root.is_dir():
             raise ValueError(f"Input directory does not exist: {self.input_root}")
         if self.input_root == self.output_root or self.input_root in self.output_root.parents:
@@ -1251,6 +1868,24 @@ class ProgressiveAnalyzer:
                     for item in seed_documents:
                         self.process_seed_document(item, all_names)
                         self.check_deadline()
+                if not self.seeds.normalized_by_fingerprint:
+                    bootstrap_candidates = [
+                        table
+                        for table in self.tables.values()
+                        if table.key not in self.scanned_tables
+                        and any(column.kind in JOIN_KINDS for column in table.columns)
+                    ]
+                    if bootstrap_candidates:
+                        bootstrap_table = min(
+                            bootstrap_candidates,
+                            key=lambda table: table.estimated_cells
+                            or self.file_by_id[table.file_id].size,
+                        )
+                        self.process_seed_table(bootstrap_table, bootstrap=True)
+                        self.check_deadline()
+            else:
+                self.rehydrate_seed_values()
+                self.check_deadline()
             remaining = [table for table in self.tables.values() if table.key not in self.scanned_tables]
             if self.partial_table and self.partial_table.get("key") in self.tables:
                 table = self.tables[self.partial_table["key"]]
@@ -1267,23 +1902,40 @@ class ProgressiveAnalyzer:
             status = "partial"
             self.warnings.append("Time budget reached; rerun the same command to resume from progress.json.")
             self.save_progress()
+        self.phase_timings["analysis_seconds"] = round(time.perf_counter() - run_started, 3)
         return self.write_result(status)
 
     def write_result(self, status: str) -> dict[str, Any]:
         relations = self.relations.values()
         chains = build_chains(relations)
         files_completed = {self.tables[key].file_path for key in self.scanned_tables if key in self.tables}
+        column_statistics = []
+        for table in self.tables.values():
+            for column in table.columns:
+                sketch = self.column_stats.get(f"{table.key}\0{column.name}")
+                if sketch is None:
+                    continue
+                column_statistics.append({
+                    "table_key": table.key,
+                    "file": table.file_path,
+                    "table": table.table_name,
+                    "column": column.name,
+                    "nonempty": sketch.nonempty,
+                    "approx_distinct": round(sketch.estimate()),
+                    "distinct_ratio": round(sketch.ratio(), 6),
+                })
         result = {
             "schema_version": SCHEMA_VERSION,
             "status": status,
             "generated_at": utc_now(),
             "input_root": str(self.input_root),
             "strategy": "progressive_seeded_probe",
+            "timings": dict(sorted(self.phase_timings.items())),
             "coverage": {
                 "files_discovered": len(self.files),
                 "tables_discovered": len(self.tables),
                 "tables_completed": len([key for key in self.scanned_tables if key in self.tables]),
-            "files_with_completed_table_scan": len(files_completed),
+                "files_with_completed_table_scan": len(files_completed),
                 "seed_value_count": len(self.seeds.by_fingerprint),
                 "profile_value_count": sum(len(profile.items) for profile in self.profiles.values()),
                 "frontier_value_count": sum(len(profile.items) for profile in self.frontier_profiles.values()),
@@ -1293,6 +1945,10 @@ class ProgressiveAnalyzer:
             },
             "files": [self.file_json(item) for item in self.files],
             "scan_stats": self.scan_stats,
+            "column_statistics": sorted(
+                column_statistics,
+                key=lambda item: (item["file"], item["table"], item["column"]),
+            ),
             "relations": relations,
             "chains": chains,
             "artifacts": {
@@ -1475,12 +2131,17 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--seed-values-per-column", type=int, default=256)
     analyze.add_argument("--max-seed-values", type=int, default=20_000)
     analyze.add_argument("--max-text-seeds", type=int, default=2_000)
-    analyze.add_argument("--profile-size", type=int, default=128)
-    analyze.add_argument("--frontier-values-per-column", type=int, default=128)
+    analyze.add_argument("--profile-size", type=int, default=64)
+    analyze.add_argument("--frontier-values-per-column", type=int, default=64)
     analyze.add_argument("--min-expansion-distinct-ratio", type=float, default=0.01)
     analyze.add_argument("--max-matches-per-seed", type=int, default=50)
+    analyze.add_argument("--max-probe-columns", type=int, default=64)
+    analyze.add_argument("--fallback-probe-columns", type=int, default=16)
+    analyze.add_argument("--profile-sample-rows", type=int, default=512)
+    analyze.add_argument("--max-matched-rows-per-table", type=int, default=100_000)
+    analyze.add_argument("--xlsx-python-fallback-cell-budget", type=int, default=250_000)
     analyze.add_argument("--bootstrap-rows", type=int, default=1_000)
-    analyze.add_argument("--checkpoint-rows", type=int, default=50_000)
+    analyze.add_argument("--checkpoint-rows", type=int, default=100_000)
     analyze.add_argument("--document-character-budget", type=int, default=5_000_000)
     analyze.add_argument("--summary-limit", type=int, default=20)
     summary = commands.add_parser("summary")

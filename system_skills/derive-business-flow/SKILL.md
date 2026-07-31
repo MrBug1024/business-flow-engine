@@ -3,6 +3,31 @@ name: derive-business-flow
 description: >
   仅在 discover-data-relations 已生成并验收 complete 的 scenario-relationship.json、relations.mmd 和 relation-report.md 后，消费这些产出推导整个业务场景的宏观业务流程、阶段流转、状态、控制和分支，并生成可核验的业务流程图、报告与结构化 JSON。用于“根据关系图谱推导业务流程”“梳理端到端业务阶段”“识别宏观状态、决策、交接和例外”等请求。主数据路径只作依赖骨架，不直接视为流程；历史记录只用于验证、参照和对账，不能固化为逐记录、逐字段或偶然操作顺序。缺少或未验收上游关系产物时必须阻塞，不得直接从原始数据猜流程。
 metadata:
+  completion:
+    triggers:
+      - 推导业务流程
+      - 业务流程推导
+      - 生成业务流程
+      - 宏观业务流程
+      - derive-business-flow
+    required_artifacts:
+      - outputs/business-flow/business-flow.json
+      - outputs/business-flow/business-flow.mmd
+      - outputs/business-flow/business-flow-report.md
+      - outputs/business-flow/flow-claims.json
+    forbidden_artifacts:
+      - outputs/business-flow/validation-errors.json
+    status_checks:
+      - artifact: outputs/business-flow/business-flow.json
+        field: status
+        allowed: [complete]
+    fingerprints:
+      - artifact: outputs/business-flow/business-flow.json
+        field: source.fingerprint
+        source: outputs/data-relations/scenario-relationship.json
+      - artifact: outputs/business-flow/business-flow.json
+        field: source.operational_data_contract.fingerprint
+        source: outputs/data-relations/operational-data-contract.json
   capability:
     id: derive-business-flow
     responsibility: 基于已验收的数据关系产物推导并验收一个场景级宏观业务流程交付物。
@@ -18,7 +43,7 @@ metadata:
 
 ## 不可违反的边界
 
-- 唯一标准输入是 `/workspace/outputs/data-relations/scenario-relationship.json`；其 `status` 必须为 `complete`。
+- 标准输入是 `/workspace/outputs/data-relations/scenario-relationship.json` 及同目录 `operational-data-contract.json`；前者必须 `complete`，后者必须 `ready` 且 fingerprint 匹配。
 - 同目录必须存在 `relations.mmd` 和 `relation-report.md`，且不得存在 `validation-errors.json`。
 - 缺少上游验收产物时只生成阻塞状态并停止。不得读取 `/workspace/data`，不得代替 `discover-data-relations` 扫描材料。
 - 上游 `main_chain`/`primary_data_path` 是主数据依赖路径，不是现成的业务步骤或时序证据。
@@ -27,6 +52,8 @@ metadata:
 - `explicit` 时序只可由上游 `triggers`、`precedes`、`branches_to` 或 `returns_to` 关系支撑。
 - 历史数据只验证覆盖、顺序一致性、可追溯性、分支合理性、控制符合性和结果对账；不得通过“多数记录恰好如此”定义标准流程。
 - 规则是约束 `control`，数据域是阶段输入/输出或验证对象；不要机械地把每个关系节点变成一个流程阶段。
+- 存在规则源和大数据源时，主流程必须先用独立宏观阶段定位并交付完整规则记录，再进入大表查询或业务上下文汇聚。不得先加载几十万行再寻找规则。
+- 流程必须保留固定执行策略：Agent 不直接读文件；大表走有界只读 SQL；连接键有证据且运行时验证扇出；非结构化材料走解析/OCR后的可追溯分块检索。
 - 全部过程与交付文件只能位于 `/workspace/outputs/business-flow`。不得创建或填充能力蒸馏、最终 Skill 包或 `/workspace/deliverables/skill-package`。
 - 命令运行环境使用宿主原生 Shell，不假设 Bash。每次只执行文档中的一条完整命令；不得使用管道、重定向、heredoc 或临时脚本裁剪 JSON。
 
@@ -79,6 +106,7 @@ python /skills/derive-business-flow/scripts/derive_business_flow.py brief --brie
 - 每个阶段、流转和状态都声明 `explicit` 或 `structural`、置信度、推导理由和上游证据。
 - 为全部上游节点和关系做覆盖交代：进入流程骨架的列入 `used`，只作上下文的列入 `context_only` 并说明原因。
 - 把历史数据的作用写成 `validation_checks`；这些检查只能验证候选流程，不能生成新步骤。
+- 把 `operational-data-contract.json` 的 required_sequence 当作不可改写的执行边界；规则优先不等于把每条规则或 SQL 写成微观流程节点。
 
 允许使用一次 `write_file` 写完整候选。不要逐字段、逐记录或逐节点拼装，也不要覆盖 `flow-claims.template.json`。
 
@@ -124,8 +152,9 @@ python /skills/derive-business-flow/scripts/derive_business_flow.py summary --re
 - `flow-claims.json` 存在；
 - 不存在 `validation-errors.json`；
 - `source.fingerprint` 与当前上游 `scenario-relationship.json` 一致。
+- `source.operational_data_contract.fingerprint` 与当前数据执行契约一致，且 `execution_policy` 未被改写。
 
-调用 `report_task_progress(action="complete")`，并说明场景业务结果、宏观阶段数、主流程、分支与状态、显式/结构性推断边界、历史验证角色和三个主要交付路径。完成即停止，不执行蒸馏或打包。
+调用 `report_task_progress(action="complete")`，`artifacts` 必须显式列出 `business-flow.json`、`business-flow.mmd`、`business-flow-report.md` 和 `flow-claims.json`；并说明场景业务结果、宏观阶段数、主流程、分支与状态、显式/结构性推断边界、历史验证角色和主要交付路径。完成即停止，不执行蒸馏或打包。
 
 ## 恢复与上下文压缩
 

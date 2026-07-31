@@ -51,6 +51,13 @@ _READ_OUTPUT_LIMIT = 500 * 1024
 _VIRTUAL_ROOT_PATTERN = re.compile(
     r"/(?:workspace|skills|tmp)(?:/[^\s\"';&|<>)]*)?"
 )
+_SKILL_REFERENCE_PATTERN = re.compile(r"/skills/([^/\s\"';&|<>]+)/")
+_EXPLICIT_REQUIREMENT_PATTERN = re.compile(
+    r"(?:-r|--requirement)\s+[\"']?/skills/([^/\s\"';&|<>]+)/requirements\.txt",
+    re.IGNORECASE,
+)
+_SAFE_SKILL_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_SKILL_REQUIREMENTS_LOCK = threading.RLock()
 
 
 class SandboxError(RuntimeError):
@@ -155,16 +162,35 @@ class LocalVenvSandboxBackend(BaseSandbox):
         )
         environment = self._base_environment()
         environment.update(scoped_environment)
-        translated = self._translate_command(command)
+        explicit_requirement_skills = _explicit_requirement_skill_names(command)
+        dependency_error = self._ensure_skill_dependencies(
+            _referenced_skill_names(command) - explicit_requirement_skills,
+            environment,
+        )
+        if dependency_error:
+            return ExecuteResponse(
+                output=_redact_values(dependency_error, secret_values),
+                exit_code=1,
+                truncated=False,
+            )
+        direct_python = self._direct_python_invocation(command)
+        if direct_python is None:
+            executable: str | list[str] = self._translate_command(command)
+            execution_cwd = self.workspace_root
+            use_shell = True
+        else:
+            executable, execution_cwd = direct_python
+            use_shell = False
 
         try:
             with self._execution_lock:
                 output, exit_code, timed_out, truncated = _run_command(
-                    translated,
-                    cwd=self.workspace_root,
+                    executable,
+                    cwd=execution_cwd,
                     environment=environment,
                     timeout=effective_timeout,
                     output_limit=self._max_output_bytes,
+                    shell=use_shell,
                 )
         except OSError as exc:
             output = f"Error starting managed runtime command: {type(exc).__name__}: {exc}"
@@ -172,6 +198,8 @@ class LocalVenvSandboxBackend(BaseSandbox):
             return ExecuteResponse(output=output, exit_code=1, truncated=False)
 
         output = _redact_values(output, secret_values)
+        if exit_code == 0:
+            self._record_skill_dependencies(explicit_requirement_skills)
         if timed_out:
             suffix = f"\n\nError: command timed out after {effective_timeout:g} seconds."
             output, suffix_truncated = _append_with_limit(
@@ -192,6 +220,89 @@ class LocalVenvSandboxBackend(BaseSandbox):
             exit_code=exit_code,
             truncated=truncated,
         )
+
+    def _ensure_skill_dependencies(
+        self,
+        skill_names: set[str],
+        environment: dict[str, str],
+    ) -> str | None:
+        if not skill_names:
+            return None
+        with _SKILL_REQUIREMENTS_LOCK:
+            for skill_name in sorted(skill_names):
+                requirements = self.skills_root / skill_name / "requirements.txt"
+                if not requirements.is_file():
+                    continue
+                marker = self._skill_requirements_marker(skill_name)
+                try:
+                    digest = hashlib.sha256(requirements.read_bytes()).hexdigest()
+                    installed_digest = (
+                        marker.read_text(encoding="ascii", errors="ignore").strip()
+                        if marker.is_file()
+                        else ""
+                    )
+                except OSError as exc:
+                    return (
+                        f"Error reading dependencies for Skill '{skill_name}': "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                if installed_digest == digest:
+                    continue
+                try:
+                    completed = subprocess.run(
+                        [
+                            str(self.python_executable),
+                            "-m",
+                            "pip",
+                            "install",
+                            "--disable-pip-version-check",
+                            "--no-input",
+                            "-r",
+                            str(requirements),
+                        ],
+                        cwd=self.workspace_root,
+                        env=environment,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        timeout=self._max_execute_timeout,
+                        check=False,
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    return (
+                        f"Error preparing dependencies for Skill '{skill_name}': "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                if completed.returncode != 0:
+                    detail = completed.stdout.decode("utf-8", errors="replace")
+                    detail, _truncated = _truncate_utf8(detail, self._max_output_bytes // 2)
+                    return (
+                        f"Error preparing dependencies for Skill '{skill_name}' "
+                        f"(pip exit {completed.returncode}).\n{detail}"
+                    )
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                temporary = marker.with_suffix(".tmp")
+                temporary.write_text(digest, encoding="ascii")
+                os.replace(temporary, marker)
+        return None
+
+    def _record_skill_dependencies(self, skill_names: set[str]) -> None:
+        if not skill_names:
+            return
+        with _SKILL_REQUIREMENTS_LOCK:
+            for skill_name in sorted(skill_names):
+                requirements = self.skills_root / skill_name / "requirements.txt"
+                if not requirements.is_file():
+                    continue
+                marker = self._skill_requirements_marker(skill_name)
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                digest = hashlib.sha256(requirements.read_bytes()).hexdigest()
+                temporary = marker.with_suffix(".tmp")
+                temporary.write_text(digest, encoding="ascii")
+                os.replace(temporary, marker)
+
+    def _skill_requirements_marker(self, skill_name: str) -> Path:
+        identifier = hashlib.sha256(skill_name.encode("utf-8")).hexdigest()[:24]
+        return self.venv_root.parent / "requirements-state" / f"{identifier}.sha256"
 
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
         responses: list[FileUploadResponse] = []
@@ -444,6 +555,49 @@ class LocalVenvSandboxBackend(BaseSandbox):
             translated = translated.replace("/dev/null", "NUL")
         return translated
 
+    def _direct_python_invocation(self, command: str) -> tuple[list[str], Path] | None:
+        """Parse a narrow ``python -c`` form without passing its code through a shell.
+
+        On Windows, multiline code inside a shell command can exit successfully
+        while producing no captured output. Direct argv execution preserves the
+        code and stdout. All other commands retain the existing shell behavior.
+        """
+
+        try:
+            tokens = shlex.split(command, posix=True)
+        except ValueError:
+            return None
+        cwd = self.workspace_root
+        if len(tokens) >= 3 and tokens[0].casefold() == "cd" and tokens[2] == "&&":
+            try:
+                cwd = self._resolve_virtual_path(
+                    tokens[1],
+                    writable=False,
+                    allow_root=True,
+                )
+            except (PermissionError, ValueError):
+                return None
+            tokens = tokens[3:]
+        if (
+            len(tokens) != 3
+            or tokens[0].casefold() not in {"python", "python3"}
+            or tokens[1] != "-c"
+        ):
+            return None
+        code = _VIRTUAL_ROOT_PATTERN.sub(self._replace_python_virtual_path, tokens[2])
+        return [str(self.python_executable), "-c", code], cwd
+
+    def _replace_python_virtual_path(self, match: re.Match[str]) -> str:
+        requested = match.group(0)
+        try:
+            return self._resolve_virtual_path(
+                requested,
+                writable=False,
+                allow_root=True,
+            ).as_posix()
+        except (PermissionError, ValueError):
+            return requested
+
     def _resolve_virtual_path(
         self,
         requested_path: str,
@@ -647,12 +801,13 @@ class SandboxManager:
 
 
 def _run_command(
-    command: str,
+    command: str | list[str],
     *,
     cwd: Path,
     environment: dict[str, str],
     timeout: float,
     output_limit: int,
+    shell: bool = True,
 ) -> tuple[str, int, bool, bool]:
     creationflags = 0
     popen_kwargs: dict[str, object] = {"start_new_session": True}
@@ -661,7 +816,7 @@ def _run_command(
         popen_kwargs = {"creationflags": creationflags}
     process = subprocess.Popen(  # noqa: S602 - model shell access is the runtime's purpose
         command,
-        shell=True,
+        shell=shell,
         cwd=cwd,
         env=environment,
         stdout=subprocess.PIPE,
@@ -693,6 +848,8 @@ def _run_command(
     reader.join(timeout=2)
     if reader.is_alive():
         truncated = True
+    else:
+        process.stdout.close()
     return captured.decode("utf-8", errors="replace"), exit_code, timed_out, truncated
 
 
@@ -746,7 +903,32 @@ def _configured_sandbox_manager() -> SandboxManager:
 def _skill_sandbox_environment(command: str) -> dict[str, str]:
     from app.studio.capabilities.skill_secrets import skill_secret_store  # noqa: PLC0415
 
-    return skill_secret_store.sandbox_environment(command)
+    normalized = command.replace("\\", "/").casefold()
+    inherited_skill_names: tuple[str, ...] = ()
+    if (
+        "/skills/distill-business-capability/" in normalized
+        and re.search(r"distill_capabilities\.py[\"']?\s+finalize(?:\s|$)", normalized)
+    ):
+        # Finalize is the only phase that materializes complete third-party
+        # derivatives of these system Skills.
+        inherited_skill_names = ("ocr-parser", "vector-kb")
+    return skill_secret_store.sandbox_environment(command, skill_names=inherited_skill_names)
+
+
+def _referenced_skill_names(command: str) -> set[str]:
+    return {
+        match.group(1)
+        for match in _SKILL_REFERENCE_PATTERN.finditer(command)
+        if _SAFE_SKILL_NAME_PATTERN.fullmatch(match.group(1))
+    }
+
+
+def _explicit_requirement_skill_names(command: str) -> set[str]:
+    return {
+        match.group(1)
+        for match in _EXPLICIT_REQUIREMENT_PATTERN.finditer(command)
+        if _SAFE_SKILL_NAME_PATTERN.fullmatch(match.group(1))
+    }
 
 
 def _resolve_execution_environment(

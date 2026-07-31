@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import tempfile
 from pathlib import Path
 
 # 将 scripts 目录的父目录加入路径，确保相对导入正常工作
@@ -75,6 +76,10 @@ def main() -> int:
         default="text",
         help="输出格式：text（默认）或 json",
     )
+    parser.add_argument(
+        "--output",
+        help="可选 JSON 输出文件。设置后不把可能很长的 OCR 正文写入 Agent 上下文。",
+    )
     args = parser.parse_args()
 
     if not any([args.url, args.path, args.b64]):
@@ -88,7 +93,23 @@ def main() -> int:
         return 1
 
     # ── 输出 ──────────────────────────────────
-    if args.format == "json":
+    if args.output:
+        output = Path(args.output).expanduser().resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        temporary_handle = tempfile.NamedTemporaryFile(
+            prefix=f"{output.name}.", suffix=".tmp", dir=output.parent, delete=False
+        )
+        temporary = Path(temporary_handle.name)
+        temporary_handle.close()
+        temporary.write_text(json.dumps(results, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(output)
+        print(json.dumps({
+            "status": "success" if all(item.get("status") == "success" for item in results) else "partial",
+            "output": str(output),
+            "result_count": len(results),
+            "success_count": sum(1 for item in results if item.get("status") == "success"),
+        }, ensure_ascii=False, indent=2))
+    elif args.format == "json":
         print(json.dumps(results, ensure_ascii=False, indent=2))
     else:
         for item in results:

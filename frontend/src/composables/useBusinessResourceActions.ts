@@ -150,7 +150,11 @@ export function useBusinessResourceActions(options: ResourceActionOptions) {
   ) {
     if (!files.length) return
     const form = new FormData()
-    files.forEach((file) => form.append('files', file))
+    files.forEach((file) => {
+      const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name
+      form.append('files', file, file.name)
+      form.append('paths', relativePath)
+    })
     form.append('target_path', target.root ? '' : target.node.path)
     try {
       const response = await http.post(

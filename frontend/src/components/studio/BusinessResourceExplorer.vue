@@ -53,6 +53,15 @@
     </div>
 
     <input ref="importInput" class="hidden-input" type="file" multiple @change="completeImport" />
+    <input
+      ref="importFolderInput"
+      class="hidden-input"
+      type="file"
+      multiple
+      webkitdirectory=""
+      directory=""
+      @change="completeImport"
+    />
 
     <Teleport to="body">
       <div
@@ -75,8 +84,11 @@
           <button role="menuitem" @click="runAction('new-folder')">
             <el-icon><FolderAdd /></el-icon><span>{{ text.newFolder }}</span>
           </button>
-          <button role="menuitem" @click="beginImport">
-            <el-icon><Upload /></el-icon><span>{{ text.import }}</span>
+          <button role="menuitem" @click="beginImport('files')">
+            <el-icon><Upload /></el-icon><span>{{ text.importFiles }}</span>
+          </button>
+          <button role="menuitem" @click="beginImport('folder')">
+            <el-icon><FolderAdd /></el-icon><span>{{ text.importFolder }}</span>
           </button>
         </template>
         <button role="menuitem" @click="runAction('export')">
@@ -154,16 +166,17 @@ const expanded = ref<Set<string>>(new Set())
 const contextMenu = ref<ContextMenu | null>(null)
 const contextMenuElement = ref<HTMLElement | null>(null)
 const importInput = ref<HTMLInputElement | null>(null)
+const importFolderInput = ref<HTMLInputElement | null>(null)
 const importTarget = ref<BusinessResourceTarget | null>(null)
 
 const copy = {
   zh: {
     title: '业务资源管理器', refresh: '刷新', newBusiness: '新建业务场景', empty: '新建业务场景', open: '打开',
-    newFile: '新建文件', newFolder: '新建文件夹', import: '导入文件...', export: '导出', rename: '重命名', delete: '删除',
+    newFile: '新建文件', newFolder: '新建文件夹', importFiles: '导入文件...', importFolder: '导入文件夹...', export: '导出', rename: '重命名', delete: '删除',
   },
   en: {
     title: 'Business Explorer', refresh: 'Refresh', newBusiness: 'New business', empty: 'Create business workspace', open: 'Open',
-    newFile: 'New File', newFolder: 'New Folder', import: 'Import Files...', export: 'Export', rename: 'Rename', delete: 'Delete',
+    newFile: 'New File', newFolder: 'New Folder', importFiles: 'Import Files...', importFolder: 'Import Folder...', export: 'Export', rename: 'Rename', delete: 'Delete',
   },
 }
 
@@ -284,10 +297,11 @@ function runAction(action: BusinessResourceAction) {
   if (target) emit('action', action, target)
 }
 
-function beginImport() {
+function beginImport(kind: 'files' | 'folder') {
   importTarget.value = contextMenu.value?.target || null
   closeContextMenu()
-  importInput.value?.click()
+  if (kind === 'folder') importFolderInput.value?.click()
+  else importInput.value?.click()
 }
 
 function completeImport(event: Event) {

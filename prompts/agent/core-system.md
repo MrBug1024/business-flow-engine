@@ -19,8 +19,19 @@ Skill, Tool, or MCP capability.
   of assuming their contents. Read persisted business context only when relevant.
 - Use visible tool schemas and capability results as the source of truth. Never
   invent a capability or claim an action succeeded without checking its result.
+- Prefer a matching Skill's bounded `brief`/`summary` command and structured file
+  Tools over ad-hoc inline Python for inspecting large or generated data. If one
+  diagnostic returns no observable output, do not spend the run reformulating the
+  same command through different shells, interpreters, redirections, or echo files;
+  switch to the documented Skill interface or record a checkpoint and continue.
 - Keep durable outputs in `/workspace`, verify important artifacts, and conclude
   with what was completed plus any genuine blocker or user decision still required.
+- Artifact-producing Skills can declare a filesystem completion contract. A completion
+  statement is not accepted until every required file exists, status and source
+  fingerprint checks pass, forbidden validation-error files are absent, and
+  `report_task_progress(action="complete")` accepts the explicit artifact list.
+- Never put completion language in the final answer before that acceptance. A rejected
+  completion is an instruction to repair or resume the task, not a result to paraphrase.
 - Keep task-stage artifacts under `/workspace/outputs/<task>/`. The reserved
   `/workspace/deliverables/skill-package/` path is only for the final, validated
   business capability package. Do not create it unless the user explicitly asks

@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from langchain_core.tools import tool
 
+from app.studio.completion import active_skill_names, validate_task_completion
 from app.studio.runtime.tool_context import get_tool_context
 
 
@@ -21,7 +22,9 @@ ProgressAction = Literal["plan", "start", "update", "complete", "block", "compac
         "Maintain the user-facing state of one substantial task. A plan must describe "
         "meaningful business work items with why/expected outcomes. Reuse each stable "
         "work_item_id when starting or updating it, then record actual results and "
-        "verification. Mark the task complete only after acceptance criteria pass, "
+        "verification. For artifact-producing work, completion is accepted only when "
+        "every reported workspace file exists and any activated or request-matched Skill "
+        "completion contract passes. Mark the task complete only after acceptance criteria pass, "
         "block only for a real decision/dependency, and compact only after saving a "
         "bounded checkpoint. For plan/start/update/block/compact, include `message`: "
         "a concise user-facing update that says what was learned or will happen next, "
@@ -53,45 +56,103 @@ def report_task_progress(
     normalized_items = [_normalize_work_item(item) for item in (work_items or [])]
     normalized_items = [item for item in normalized_items if item["title"]]
     previous = _previous_task_progress(context.record.runs, task_id)
+    completion_validation: dict[str, Any] | None = None
+    effective_action: ProgressAction = action
+    effective_message = str(message or "").strip()[:4000]
+    effective_summary = summary
+    effective_result = result
+    effective_verification = verification
+    effective_next_step = next_step
+    if action == "complete":
+        validation = validate_task_completion(
+            context.workspace_path,
+            artifacts=artifacts or [],
+            prompt=_latest_user_prompt(context.record, run),
+            active_skills=active_skill_names(context.record.runs, task_id),
+            owner_id=str(getattr(context.record, "owner_id", "") or "") or None,
+        )
+        if validation.skills:
+            validation = validate_task_completion(
+                context.workspace_path,
+                artifacts=artifacts or [],
+                prompt=_latest_user_prompt(context.record, run),
+                active_skills=active_skill_names(context.record.runs, task_id),
+                owner_id=str(getattr(context.record, "owner_id", "") or "") or None,
+                require_reported_artifacts=True,
+            )
+        completion_validation = validation.as_dict()
+        if not validation.valid:
+            effective_action = "update"
+            effective_message = "交付验收未通过，正在补齐缺失、无效或已过期的产物。"
+            effective_summary = "交付完成声明已被磁盘验收拒绝。"
+            effective_result = ""
+            effective_verification = ""
+            effective_next_step = "修复完成验收问题后重新报告 complete：" + "; ".join(
+                validation.issues[:6]
+            )
     state = _merge_progress_state(
         previous,
-        action=action,
+        action=effective_action,
         task_id=task_id,
         objective=objective,
         work_items=normalized_items,
         work_item_id=work_item_id,
         title=title,
-        summary=summary,
+        summary=effective_summary,
         why=why,
-        result=result,
-        verification=verification,
+        result=effective_result,
+        verification=effective_verification,
         artifacts=artifacts or [],
         acceptance_criteria=acceptance_criteria or [],
-        next_step=next_step,
+        next_step=effective_next_step,
     )
+    if completion_validation is not None:
+        state["completion_validation"] = completion_validation
     if run is not None:
         run.task_progress = deepcopy(state)
         run.plan = [item["title"] for item in state["work_items"]][:12]
 
     event = deepcopy(state) | {
         "type": "agent_progress",
-        "action": action,
+        "action": effective_action,
+        "requested_action": action,
         "work_item_id": _clean_optional_id(work_item_id or title),
-        "message": str(message or "").strip()[:4000],
+        "message": effective_message,
     }
     context.emit(event)
     if action == "plan" and state["work_items"]:
         context.emit({"type": "plan", "items": [item["title"] for item in state["work_items"]]})
     context.save()
     return {
-        "status": "recorded",
+        "status": (
+            "rejected"
+            if action == "complete" and completion_validation and not completion_validation["valid"]
+            else "recorded"
+        ),
         "action": action,
+        "recorded_action": effective_action,
         "task_id": task_id,
         "task_status": state["status"],
         "summary": state["summary"] or state["title"] or action,
         "work_item_count": len(state["work_items"]),
         "revision": state["revision"],
+        **({"completion_validation": completion_validation} if completion_validation is not None else {}),
     }
+
+
+def _latest_user_prompt(record: Any, run: Any) -> str:
+    session_id = str(getattr(run, "session_id", "") or "")
+    started_at = float(getattr(run, "started_at", 0) or 0)
+    for item in reversed(getattr(record, "messages", []) or []):
+        if str(getattr(item, "role", "") or "") != "user":
+            continue
+        if session_id and str(getattr(item, "session_id", "") or "") != session_id:
+            continue
+        created_at = float(getattr(item, "created_at", 0) or 0)
+        if started_at and created_at > started_at:
+            continue
+        return str(getattr(item, "content", "") or "")
+    return ""
 
 
 def _previous_task_progress(runs: list[Any], task_id: str) -> dict[str, Any]:

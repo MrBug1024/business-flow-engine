@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import re
 import tempfile
 import zipfile
 from collections.abc import Iterator
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from time import time
 from typing import Any
 from urllib.parse import quote
@@ -172,6 +173,7 @@ def delete_workspace_entry(
 async def import_workspace_files(
     business_id: str,
     files: list[UploadFile] = File(...),
+    paths: list[str] | None = Form(default=None),
     target_path: str = Form(default="data"),
 ) -> dict[str, Any]:
     record = _record_or_404(business_id)
@@ -182,11 +184,13 @@ async def import_workspace_files(
     )
     if not target.is_dir():
         raise HTTPException(status_code=400, detail="导入目标必须是工作区目录。")
+    upload_paths = _normalized_upload_paths(files, paths)
+    workspace = store.workspace_dir(business_id).resolve()
     imported: list[dict[str, Any]] = []
     registered: list[BusinessFile] = []
-    for upload in files:
-        filename = _safe_filename(upload.filename or "upload.bin")
-        destination = _next_available_path(target, filename)
+    for upload, upload_path in zip(files, upload_paths, strict=True):
+        destination = _prepare_upload_destination(workspace, target, upload_path)
+        filename = destination.name
         size = 0
         try:
             with destination.open("wb") as handle:
@@ -203,9 +207,7 @@ async def import_workspace_files(
         finally:
             await upload.close()
         relative_path = destination.relative_to(store.workspace_dir(business_id)).as_posix()
-        record.workspace_deleted_paths = [
-            item for item in record.workspace_deleted_paths if item != relative_path
-        ]
+        _clear_import_tombstones(record, relative_path)
         metadata = BusinessFile(
             id=new_id("file"),
             business_id=business_id,
@@ -377,14 +379,18 @@ def release_project_sandbox(business_id: str) -> dict[str, Any]:
 async def upload_business_files(
     business_id: str,
     files: list[UploadFile] = File(...),
+    paths: list[str] | None = Form(default=None),
 ) -> BusinessRecord:
     record = _record_or_404(business_id)
+    upload_paths = _normalized_upload_paths(files, paths)
+    workspace = store.workspace_dir(business_id).resolve()
+    data_root = store.files_dir(business_id).resolve()
     uploaded: list[BusinessFile] = []
-    for upload in files:
-        filename = _safe_filename(upload.filename or "upload.bin")
+    for upload, upload_path in zip(files, upload_paths, strict=True):
+        dest = _prepare_upload_destination(workspace, data_root, upload_path)
+        filename = dest.name
         suffix = Path(filename).suffix.lower()
         file_id = new_id("file")
-        dest = store.next_data_file_path(business_id, filename)
         size = 0
         try:
             with dest.open("wb") as fp:
@@ -409,10 +415,8 @@ async def upload_business_files(
             uploaded_at=time(),
         )
         record.files.append(meta)
-        uploaded_path = f"data/{dest.name}"
-        record.workspace_deleted_paths = [
-            item for item in record.workspace_deleted_paths if item != uploaded_path
-        ]
+        uploaded_path = dest.relative_to(workspace).as_posix()
+        _clear_import_tombstones(record, uploaded_path)
         uploaded.append(meta)
 
     record.status = "files_uploaded"
@@ -701,6 +705,75 @@ def _safe_filename(filename: str) -> str:
     if not cleaned:
         return "upload.bin"
     return cleaned[:180]
+
+
+def _safe_upload_relative_path(raw_path: str, fallback_name: str = "upload.bin") -> str:
+    raw = str(raw_path or fallback_name).replace("\\", "/")
+    normalized = raw.strip("/")
+    if (
+        not normalized
+        or "\x00" in normalized
+        or len(normalized) > 4096
+        or raw.startswith("/")
+        or re.match(r"^[A-Za-z]:", raw)
+    ):
+        raise HTTPException(status_code=400, detail="无效的上传相对路径。")
+    parts = PurePosixPath(normalized).parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise HTTPException(status_code=400, detail="无效的上传相对路径。")
+    for part in parts:
+        if len(part) > 180 or re.search(r'[<>:"|?*\x00-\x1f]', part) or part.rstrip(" .") != part:
+            raise HTTPException(status_code=400, detail=f"上传路径包含无效名称：{part}")
+    return PurePosixPath(*parts).as_posix()
+
+
+def _normalized_upload_paths(
+    files: list[UploadFile], paths: list[str] | None,
+) -> list[str]:
+    if paths and len(paths) != len(files):
+        raise HTTPException(status_code=422, detail="paths 必须为每个上传文件提供一个相对路径。")
+    values = paths if paths else [upload.filename or "upload.bin" for upload in files]
+    normalized = [
+        _safe_upload_relative_path(value, upload.filename or "upload.bin")
+        for upload, value in zip(files, values, strict=True)
+    ]
+    if len(normalized) != len({item.casefold() for item in normalized}):
+        raise HTTPException(status_code=409, detail="上传内容包含重复的相对文件路径。")
+    return normalized
+
+
+def _upload_destination(workspace: Path, target: Path, relative_path: str) -> Path:
+    workspace = workspace.resolve()
+    target = target.resolve()
+    candidate = (target / Path(*PurePosixPath(relative_path).parts)).resolve()
+    if (
+        (target != workspace and workspace not in target.parents)
+        or candidate == workspace
+        or workspace not in candidate.parents
+    ):
+        raise HTTPException(status_code=400, detail="上传路径超出业务工作区。")
+    return candidate
+
+
+def _prepare_upload_destination(workspace: Path, target: Path, relative_path: str) -> Path:
+    destination = _upload_destination(workspace, target, relative_path)
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+    except (FileExistsError, NotADirectoryError, OSError) as exc:
+        raise HTTPException(status_code=409, detail=f"无法创建上传目录：{relative_path}") from exc
+    return _next_available_path(destination.parent, destination.name)
+
+
+def _clear_import_tombstones(record: BusinessRecord, relative_path: str) -> None:
+    normalized = relative_path.replace("\\", "/").strip("/")
+    record.workspace_deleted_paths = [
+        item
+        for item in record.workspace_deleted_paths
+        if not (
+            normalized == item.replace("\\", "/").strip("/")
+            or normalized.startswith(item.replace("\\", "/").strip("/") + "/")
+        )
+    ]
 
 
 def _resolve_workspace_entry(

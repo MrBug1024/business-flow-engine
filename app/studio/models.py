@@ -244,6 +244,7 @@ class SkillDefinition(BaseModel):
     capability_id: str = ""
     responsibility: str = ""
     excludes: list[str] = Field(default_factory=list)
+    completion: dict[str, Any] = Field(default_factory=dict)
     contract_status: Literal["declared", "undeclared"] = "undeclared"
 
 

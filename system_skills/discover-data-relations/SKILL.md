@@ -1,8 +1,29 @@
 ---
 name: discover-data-relations
 description: >
-  从任意业务场景的异构数据、规则和结果材料中推导一张宏观、可核验、可供后续流程推导使用的数据关系图。适用于 CSV、XLSX、JSONL、Parquet、SQLite、文本、PDF、DOCX、PPTX 和图片混合场景。先以有界扫描蒸馏字段级证据，再由 Agent 综合为少量业务数据域、规则、判定与结果节点；字段、记录值和底层匹配只作证据，不进入最终图。用于整体数据关系、业务数据血缘、跨材料关联、规则约束和审计输入输出分析。
+  从任意业务场景的异构数据、规则和结果材料中推导宏观关系图与可执行数据契约。适用于 CSV、XLSX、JSONL、Parquet、SQLite、文本、PDF、DOCX、PPTX 和图片混合场景。先自动识别真实表头，以有界扫描和基数统计追踪字段链路，再由 Agent 综合业务数据域、规则、判定与结果节点；同时输出经证据排序的连接键、非结构化解析/OCR检索路径和质量门禁，供流程推导及能力蒸馏使用。
 metadata:
+  completion:
+    triggers:
+      - 推导数据关系
+      - 挖掘数据关系
+      - 生成关系图谱
+      - 发现数据关系
+      - discover-data-relations
+    required_artifacts:
+      - outputs/data-relations/scenario-relationship.json
+      - outputs/data-relations/relations.mmd
+      - outputs/data-relations/relation-report.md
+      - outputs/data-relations/operational-data-contract.json
+    forbidden_artifacts:
+      - outputs/data-relations/validation-errors.json
+    status_checks:
+      - artifact: outputs/data-relations/scenario-relationship.json
+        field: status
+        allowed: [complete]
+      - artifact: outputs/data-relations/operational-data-contract.json
+        field: status
+        allowed: [ready]
   capability:
     id: discover-data-relations
     responsibility: 从业务材料中提取有界证据并生成可核验的宏观数据关系交付物。
@@ -28,9 +49,13 @@ metadata:
 - 不把字段、工作表、单条记录、ID、代码、金额、日期或具体取值画成节点。
 - _field-evidence/ 仅是内部字段证据，绝不是用户交付物。
 - 精确字段指纹只证明可关联或可追溯，不能独立证明时序、触发或因果。
+- 不能只凭同名字段选连接键。候选必须结合字段语义、基数、唯一性和结果反向追踪排序，并在运行时再次校验空值、未匹配与连接放大。
+- TXT、Markdown、Word、PDF 和图片通过带页码/段落/行号的解析或 OCR 证据参与关系推导；语义相似不能替代结构化业务主键。
+- 历史结果文件只能定义 `design_time_template`：保留格式、字段/章节、类型、定位和可选的有界脱敏示例，原文件不得成为第三方运行时依赖。CSV、Excel、PDF、图片、Word、TXT、Markdown 等所有格式都遵守同一生命周期规则。
+- 外部知识库、爬虫、Web 检索和远程 API 必须建模为 `system` 能力节点，不得把本地结果样例或其他物理文件证据分配给它们。是否调用由 Agent 根据用户请求和完整规则记录判断。
 - 不为了图看起来完整而补关系。证据不足就删边或明确待确认。
 - main_chain 是兼容字段，语义上表示“主数据路径”，不是业务流程步骤。
-- 只有顶层 scenario-relationship.json 状态为 complete、无 validation-errors.json，且 relations.mmd、relation-report.md 均存在时才算完成。
+- 只有顶层 scenario-relationship.json 状态为 complete、`operational-data-contract.json` 为 ready、无 validation-errors.json，且 relations.mmd、relation-report.md 均存在时才算完成。
 - 本 Skill 的全部过程与交付文件只能位于 /workspace/outputs/data-relations。不得复制到 /workspace/deliverables/skill-package，也不得创建或填充任何最终 Skill 能力包目录；能力包是完整业务场景验收后的另一项独立任务。
 - 命令运行环境使用宿主原生 Shell，不假设 Bash。每次只执行文档中的一条完整命令；不得使用 `|`、`&&`、重定向、`head`、`cat`、`wc`、heredoc 或内联 Python，也不得创建临时脚本来读取、裁剪或改写 JSON。
 
@@ -50,6 +75,8 @@ metadata:
 ## 执行
 
 Skill 目录为 /skills/discover-data-relations，可写工作区为 /workspace。
+
+Studio 在首次执行本 Skill 或 `requirements.txt` 摘要变化时，自动把依赖串行安装到共享 venv 并记录摘要；不要为每次分析重复安装。若脱离 Studio 单独运行，必须先执行 `python -m pip install -r requirements.txt`。大型 XLSX 的定向扫描要求 `fastexcel` 与 `pyarrow` 可用；依赖准备失败时应立即报告运行时错误，不得静默使用逐单元格慢路径运行几十分钟。
 
 ### 1. 准备证据
 
@@ -146,11 +173,12 @@ python /skills/discover-data-relations/scripts/analyze_relations.py summary \
   --offset 0 --limit 20
 ~~~
 
-调用 report_task_progress(action="complete")，在 message 和最终答复中说明：
+调用 report_task_progress(action="complete")，`artifacts` 必须显式列出上述四个最终产物；在 message 和最终答复中说明：
 
 - 场景范围与主数据路径；
 - 宏观节点数、关系数和文件覆盖；
 - 哪些结论是直接证据、哪些仍有边界；
+- 数据执行契约是否通过表头、输入网络、结果反向追踪和非结构化检索路径门禁；
 - 三个主要交付文件的路径。
 
 完成即停在 /workspace/outputs/data-relations，不执行复制、打包或“顺便生成 Skill 包”。
@@ -172,6 +200,7 @@ python /skills/discover-data-relations/scripts/analyze_relations.py summary \
 - relations.mmd：宏观 Mermaid 数据关系图。
 - relation-report.md：逐关系说明、证据、置信度和覆盖边界。
 - scenario-relationship.json：供后续 Skill 使用的结构化关系；同时含 main_chain 和同义的 primary_data_path。
+- operational-data-contract.json：来源生命周期、运行时绑定、正确表头、列/章节、规则/结果角色、排序后的字段连接、外部增强能力、非结构化检索路径及质量门禁。
 - relations.json：兼容副本。
 - evidence.sqlite3：仅保存最终关系引用过的证据。
 - evidence-cards.json、synthesis-brief.json：有界中间证据。

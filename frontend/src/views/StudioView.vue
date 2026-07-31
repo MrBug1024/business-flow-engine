@@ -550,6 +550,18 @@
                 <el-icon><Upload /></el-icon>
               </button>
               <input ref="fileInput" class="file-input" type="file" multiple @change="uploadFiles" />
+              <button class="composer-tool" :title="t('uploadFolder')" :aria-label="t('uploadFolder')" @click="triggerFolderUpload">
+                <el-icon><Folder /></el-icon>
+              </button>
+              <input
+                ref="folderInput"
+                class="file-input"
+                type="file"
+                multiple
+                webkitdirectory=""
+                directory=""
+                @change="uploadFiles"
+              />
               <button
                 class="composer-tool mention-tool"
                 type="button"
@@ -711,6 +723,7 @@ const settings = ref<any>({ active_model: '', configured_models: [], installed_t
 const tabs = ref<Tab[]>([])
 const activeTabId = ref('')
 const fileInput = ref<HTMLInputElement | null>(null)
+const folderInput = ref<HTMLInputElement | null>(null)
 const messagesContainer = ref<HTMLElement | null>(null)
 const composerInput = ref<HTMLTextAreaElement | null>(null)
 const chatBoxElement = ref<HTMLElement | null>(null)
@@ -1113,13 +1126,22 @@ function triggerUpload() {
   fileInput.value?.click()
 }
 
+function triggerFolderUpload() {
+  if (isBusy.value) return
+  folderInput.value?.click()
+}
+
 async function uploadFiles(event: Event) {
   if (!current.value || isBusy.value) return
   const input = event.target as HTMLInputElement
   const files = Array.from(input.files || [])
   if (!files.length) return
   const form = new FormData()
-  files.forEach((file) => form.append('files', file))
+  files.forEach((file) => {
+    const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name
+    form.append('files', file, file.name)
+    form.append('paths', relativePath)
+  })
   current.value = (await http.post(`/businesses/${current.value.id}/files`, form)).data
   input.value = ''
   await refreshWorkspace()

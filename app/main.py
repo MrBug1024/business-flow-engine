@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -21,7 +22,10 @@ from app.studio.capabilities.readiness import (
 
 
 ROOT = Path(__file__).resolve().parent.parent
-DIST_DIR = ROOT / "frontend" / "dist"
+DIST_DIR = Path(
+    os.environ.get("STUDIO_FRONTEND_DIST", "").strip()
+    or ROOT / "frontend" / "dist"
+).expanduser().resolve()
 
 
 @asynccontextmanager

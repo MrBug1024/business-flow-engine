@@ -18,6 +18,7 @@ SCHEMA_VERSION = 1
 UPSTREAM_CAPABILITY = "discover-data-relations"
 MAX_SOURCE_BYTES = 1 * 1024 * 1024
 MAX_CARDS_BYTES = 8 * 1024 * 1024
+MAX_OPERATIONAL_CONTRACT_BYTES = 8 * 1024 * 1024
 MAX_CANDIDATE_BYTES = 96 * 1024
 MAX_BRIEF_CARDS = 40
 MAX_STAGES = 10
@@ -171,6 +172,31 @@ def source_indexes(source: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], d
     return node_by_id, edge_by_id, evidence_ids
 
 
+def operational_context(
+    source: dict[str, Any], source_path: Path,
+) -> tuple[Path, dict[str, Any], str, list[str]]:
+    errors: list[str] = []
+    claim = source.get("operational_contract") if isinstance(source.get("operational_contract"), dict) else {}
+    expected_path = source_path.parent / "operational-data-contract.json"
+    try:
+        claimed_path = Path(str(claim.get("artifact", ""))).resolve()
+    except OSError:
+        claimed_path = Path("__invalid__")
+    if claimed_path != expected_path.resolve():
+        errors.append("上游缺少当前 operational-data-contract.json 的精确引用")
+    try:
+        operational = load_json(expected_path, MAX_OPERATIONAL_CONTRACT_BYTES)
+    except ContractError as exc:
+        return expected_path, {}, "", errors + [str(exc)]
+    fingerprint = file_sha256(expected_path)
+    if claim.get("fingerprint") != fingerprint:
+        errors.append("上游 operational-data-contract.json fingerprint 已过期")
+    if claim.get("status") != "ready" or operational.get("status") != "ready":
+        blockers = operational.get("quality_gates", {}).get("blockers", [])
+        errors.append("上游数据执行契约未通过质量门禁：" + "；".join(str(item) for item in blockers))
+    return expected_path, operational, fingerprint, errors
+
+
 def validate_upstream(path: Path) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
     try:
@@ -217,6 +243,8 @@ def validate_upstream(path: Path) -> tuple[dict[str, Any], list[str]]:
             errors.append(f"上游 complete 交付不完整，缺少 {required}")
     if (upstream_root / "validation-errors.json").exists():
         errors.append("上游目录仍存在 validation-errors.json，必须先由 discover-data-relations 修复")
+    _, _, _, operational_errors = operational_context(payload, path)
+    errors.extend(operational_errors)
     return payload, errors
 
 
@@ -238,7 +266,10 @@ def compact_card(card: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_brief(source: dict[str, Any], source_path: Path, fingerprint: str) -> dict[str, Any]:
+def build_brief(
+    source: dict[str, Any], source_path: Path, fingerprint: str,
+    operational_path: Path, operational: dict[str, Any], operational_fingerprint: str,
+) -> dict[str, Any]:
     node_by_id, edge_by_id, cited_evidence_ids = source_indexes(source)
     cards_path = source_path.parent / "evidence-cards.json"
     selected_cards: list[dict[str, Any]] = []
@@ -267,6 +298,11 @@ def build_brief(source: dict[str, Any], source_path: Path, fingerprint: str) -> 
             "artifact": str(source_path),
             "fingerprint": fingerprint,
             "status": source.get("status"),
+            "operational_data_contract": {
+                "artifact": str(operational_path),
+                "fingerprint": operational_fingerprint,
+                "status": operational.get("status"),
+            },
         },
         "scenario": source.get("scenario", {}),
         "primary_data_path": source.get("primary_data_path", source.get("main_chain", [])),
@@ -295,6 +331,57 @@ def build_brief(source: dict[str, Any], source_path: Path, fingerprint: str) -> 
         "explicit_order_edge_ids": explicit_order_edges,
         "evidence_cards": selected_cards,
         "evidence_card_warning": card_warning,
+        "operational_execution": {
+            "query_policy": operational.get("query_policy", {}),
+            "large_sources": [
+                {
+                    "source_id": item.get("source_id"),
+                    "path": item.get("path"),
+                    "roles": item.get("roles", []),
+                    "tables": [
+                        {
+                            "sheet_or_table": table.get("sheet_or_table"),
+                            "row_count": table.get("row_count"),
+                            "header": table.get("header", {}),
+                        }
+                        for table in item.get("tables", [])
+                    ],
+                }
+                for item in operational.get("sources", []) if item.get("is_large")
+            ],
+            "non_tabular_sources": [
+                {
+                    "source_id": item.get("source_id"),
+                    "path": item.get("path"),
+                    "roles": item.get("roles", []),
+                    "content_retrieval": item.get("content_retrieval", {}),
+                }
+                for item in operational.get("sources", []) if item.get("kind") != "tabular"
+            ],
+            "rule_source_ids": operational.get("rule_source_ids", []),
+            "links": [
+                {
+                    "link_id": item.get("link_id"),
+                    "source_file": item.get("source_file"),
+                    "target_file": item.get("target_file"),
+                    "recommended_candidate": item.get("recommended_candidate"),
+                }
+                for item in operational.get("links", []) if item.get("recommended_candidate")
+            ],
+            "semantic_routes": [
+                {
+                    "route_id": item.get("route_id"),
+                    "source_id": item.get("source_id"),
+                    "target_id": item.get("target_id"),
+                    "relation_type": item.get("relation_type"),
+                    "runtime_validation": item.get("runtime_validation", []),
+                }
+                for item in operational.get("semantic_routes", []) if isinstance(item, dict)
+            ],
+            "required_flow_order": (
+                "先定位并交付完整规则记录，再根据该规则选择字段、连接和谓词，最后对大表执行有界 SQL。"
+            ),
+        },
         "inference_policy": {
             "grain": "macro_business_scenario",
             "allowed": [
@@ -316,7 +403,10 @@ def build_brief(source: dict[str, Any], source_path: Path, fingerprint: str) -> 
     }
 
 
-def claims_template(source: dict[str, Any], source_path: Path, fingerprint: str) -> dict[str, Any]:
+def claims_template(
+    source: dict[str, Any], source_path: Path, fingerprint: str,
+    operational_path: Path, operational_fingerprint: str,
+) -> dict[str, Any]:
     node_by_id, edge_by_id, _ = source_indexes(source)
     scenario = source.get("scenario", {})
     return {
@@ -325,6 +415,10 @@ def claims_template(source: dict[str, Any], source_path: Path, fingerprint: str)
             "capability": UPSTREAM_CAPABILITY,
             "artifact": str(source_path),
             "fingerprint": fingerprint,
+            "operational_data_contract": {
+                "artifact": str(operational_path),
+                "fingerprint": operational_fingerprint,
+            },
         },
         "scenario": {
             "name": str(scenario.get("name", "")),
@@ -335,6 +429,14 @@ def claims_template(source: dict[str, Any], source_path: Path, fingerprint: str)
         "history_policy": {
             "role": "validation_only",
             "statement": "历史数据仅用于验证流程覆盖、顺序一致性、状态、分支和结果，不用于定义标准流程。",
+        },
+        "execution_policy": {
+            "rule_resolution": "complete_rule_record_before_bulk_query",
+            "bulk_data_access": "bounded_read_only_sql",
+            "join_policy": "evidence_backed_keys_with_runtime_fanout_validation",
+            "agent_direct_file_read": False,
+            "unstructured_access": "parse_or_ocr_then_provenance_chunk_search",
+            "unstructured_access": "parse_or_ocr_then_provenance_chunk_search",
         },
         "stages": [],
         "transitions": [],
@@ -373,8 +475,13 @@ def prepare(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         return 2, payload
 
     fingerprint = file_sha256(source_path)
-    brief = build_brief(source, source_path, fingerprint)
-    template = claims_template(source, source_path, fingerprint)
+    operational_path, operational, operational_fingerprint, operational_errors = operational_context(source, source_path)
+    if operational_errors:
+        raise ContractError("；".join(operational_errors))
+    brief = build_brief(
+        source, source_path, fingerprint, operational_path, operational, operational_fingerprint
+    )
+    template = claims_template(source, source_path, fingerprint, operational_path, operational_fingerprint)
     atomic_json(output_root / "flow-brief.json", brief)
     atomic_json(output_root / "flow-claims.template.json", template)
     payload = {
@@ -487,6 +594,8 @@ def validate_candidate(
 ) -> list[str]:
     errors: list[str] = []
     node_by_id, edge_by_id, evidence_ids = source_indexes(source)
+    operational_path, operational, operational_fingerprint, operational_errors = operational_context(source, source_path)
+    errors.extend(operational_errors)
     source_claim = claims.get("source")
     if not isinstance(source_claim, dict):
         errors.append("source 必须是对象")
@@ -501,6 +610,18 @@ def validate_candidate(
             claimed_path = Path("__invalid__")
         if claimed_path != source_path:
             errors.append("source.artifact 必须精确指向本次验收的 scenario-relationship.json")
+        operational_claim = source_claim.get("operational_data_contract")
+        if not isinstance(operational_claim, dict):
+            errors.append("source.operational_data_contract 必须引用上游数据执行契约")
+        else:
+            try:
+                claimed_operational_path = Path(str(operational_claim.get("artifact", ""))).resolve()
+            except OSError:
+                claimed_operational_path = Path("__invalid__")
+            if claimed_operational_path != operational_path.resolve():
+                errors.append("source.operational_data_contract.artifact 不得改写")
+            if operational_claim.get("fingerprint") != operational_fingerprint:
+                errors.append("source.operational_data_contract.fingerprint 已过期")
 
     scenario = claims.get("scenario")
     if not isinstance(scenario, dict):
@@ -522,6 +643,16 @@ def validate_candidate(
         errors.append("history_policy.role 必须是 validation_only")
     elif len(str(history_policy.get("statement", "")).strip()) < 8:
         errors.append("history_policy.statement 必须明确历史数据不定义规范流程")
+
+    expected_execution_policy = {
+        "rule_resolution": "complete_rule_record_before_bulk_query",
+        "bulk_data_access": "bounded_read_only_sql",
+        "join_policy": "evidence_backed_keys_with_runtime_fanout_validation",
+        "agent_direct_file_read": False,
+        "unstructured_access": "parse_or_ocr_then_provenance_chunk_search",
+    }
+    if claims.get("execution_policy") != expected_execution_policy:
+        errors.append("execution_policy 是上游数据规模与链路决定的执行边界，不得改写")
 
     stages = claims.get("stages")
     transitions = claims.get("transitions")
@@ -661,6 +792,7 @@ def validate_candidate(
     if branch_count > MAX_BRANCH_TRANSITIONS:
         errors.append(f"条件、异常和返回流转合计最多 {MAX_BRANCH_TRANSITIONS} 条")
 
+    main_ids: list[str] = []
     if not isinstance(main_flow, list) or len(main_flow) < 3:
         errors.append("main_flow 至少包含三个宏观阶段")
     else:
@@ -677,6 +809,36 @@ def validate_candidate(
             final_type = stage_by_id[main_ids[-1]].get("stage_type")
             if final_type not in {"fulfillment", "closure"}:
                 errors.append("main_flow 最后阶段应是 fulfillment 或 closure，表达场景级业务结果")
+
+    rule_node_ids = {
+        node_id for node_id, node in node_by_id.items() if str(node.get("type", "")) == "rule"
+    }
+    large_node_ids = {
+        str(role.get("node_id", ""))
+        for source_item in operational.get("sources", [])
+        if isinstance(source_item, dict) and source_item.get("is_large")
+        for role in source_item.get("roles", [])
+        if isinstance(role, dict) and str(role.get("node_type", "")) in {"input", "object"}
+    }
+    if main_ids and rule_node_ids and large_node_ids:
+        rule_positions = [
+            index for index, stage_id in enumerate(main_ids)
+            if stage_id in stage_by_id
+            and set(unique_strings(stage_by_id[stage_id].get("output_node_ids"))).intersection(rule_node_ids)
+            and not set(unique_strings(stage_by_id[stage_id].get("input_node_ids"))).intersection(large_node_ids)
+        ]
+        bulk_positions = [
+            index for index, stage_id in enumerate(main_ids)
+            if stage_id in stage_by_id
+            and (
+                set(unique_strings(stage_by_id[stage_id].get("input_node_ids")))
+                | set(unique_strings(stage_by_id[stage_id].get("output_node_ids")))
+            ).intersection(large_node_ids)
+        ]
+        if not rule_positions:
+            errors.append("存在规则源和大表时，主流程必须先有独立阶段定位并交付完整规则记录")
+        elif bulk_positions and min(rule_positions) >= min(bulk_positions):
+            errors.append("完整规则记录必须先于任何大表汇聚或查询阶段，不能先加载几十万行再定位规则")
 
     if stage_ids:
         start = next(iter(stage_ids))
@@ -1042,6 +1204,7 @@ def compact_summary(result: dict[str, Any], offset: int, limit: int) -> dict[str
         "status": result.get("status"),
         "scenario": result.get("scenario"),
         "source": result.get("source"),
+        "execution_policy": result.get("execution_policy", {}),
         "stage_count": len(stages),
         "transition_count": len(result.get("transitions", [])),
         "state_count": len(result.get("states", [])),
@@ -1082,6 +1245,7 @@ def finalize(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "source": claims["source"],
         "scenario": claims["scenario"],
         "history_policy": claims["history_policy"],
+        "execution_policy": claims["execution_policy"],
         "stages": claims["stages"],
         "transitions": claims["transitions"],
         "main_flow": claims["main_flow"],
@@ -1115,10 +1279,12 @@ def brief(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     path = Path(args.brief).resolve()
     payload = load_json(path, MAX_SOURCE_BYTES)
     source_path = Path(args.relations).resolve()
-    _, upstream_errors = validate_upstream(source_path)
+    source, upstream_errors = validate_upstream(source_path)
     if upstream_errors:
         raise ContractError("；".join(upstream_errors))
     source_claim = payload.get("source", {})
+    operational_path, _, operational_fingerprint, _ = operational_context(source, source_path)
+    operational_claim = source_claim.get("operational_data_contract", {}) if isinstance(source_claim, dict) else {}
     claimed_artifact = (
         Path(str(source_claim.get("artifact", ""))).resolve()
         if isinstance(source_claim, dict)
@@ -1128,6 +1294,9 @@ def brief(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         not isinstance(source_claim, dict)
         or claimed_artifact != source_path
         or source_claim.get("fingerprint") != file_sha256(source_path)
+        or not isinstance(operational_claim, dict)
+        or Path(str(operational_claim.get("artifact", ""))).resolve() != operational_path.resolve()
+        or operational_claim.get("fingerprint") != operational_fingerprint
     ):
         raise ContractError("flow-brief.json 的上游 fingerprint 已过期；必须重新运行 prepare")
     return 0, payload
@@ -1138,10 +1307,12 @@ def summary(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     if result.get("status") != "complete":
         raise ContractError("business-flow.json 尚未 complete")
     source_path = Path(args.relations).resolve()
-    _, upstream_errors = validate_upstream(source_path)
+    source, upstream_errors = validate_upstream(source_path)
     if upstream_errors:
         raise ContractError("；".join(upstream_errors))
     source_claim = result.get("source", {})
+    operational_path, _, operational_fingerprint, _ = operational_context(source, source_path)
+    operational_claim = source_claim.get("operational_data_contract", {}) if isinstance(source_claim, dict) else {}
     claimed_artifact = (
         Path(str(source_claim.get("artifact", ""))).resolve()
         if isinstance(source_claim, dict)
@@ -1151,6 +1322,9 @@ def summary(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         not isinstance(source_claim, dict)
         or claimed_artifact != source_path
         or source_claim.get("fingerprint") != file_sha256(source_path)
+        or not isinstance(operational_claim, dict)
+        or Path(str(operational_claim.get("artifact", ""))).resolve() != operational_path.resolve()
+        or operational_claim.get("fingerprint") != operational_fingerprint
     ):
         raise ContractError("business-flow.json 的上游 fingerprint 已过期；不得交付旧流程")
     return 0, compact_summary(result, args.offset, args.limit)

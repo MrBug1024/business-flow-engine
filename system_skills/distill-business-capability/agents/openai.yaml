@@ -1,0 +1,4 @@
+interface:
+  display_name: "业务场景能力蒸馏"
+  short_description: "将已验收关系与流程蒸馏为可移植的场景级多Skill能力源码"
+  default_prompt: "使用 $distill-business-capability 将已验收的业务关系和流程蒸馏为可供第三方 Agent 使用的 Skill 能力源码。"

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -40,6 +41,14 @@ MAX_BRIEF_STATEMENTS = 8
 MAX_SCENARIO_NODES = 10
 MAX_SCENARIO_EDGES = 14
 MAX_SCENARIO_BRANCHES = 3
+LARGE_TABULAR_ROWS = 50_000
+MATERIAL_SOURCE_NODE_TYPES = {"actor", "input", "object", "rule", "state", "output"}
+EXTERNAL_CAPABILITY_MARKERS = (
+    "knowledge base", "knowledge-base", "vector kb", "vector-kb", "external knowledge",
+    "web search", "crawler", "scraper", "remote api", "external api",
+    "知识库", "外部知识", "药品知识", "政策知识", "规范知识", "网络检索", "爬虫",
+    "外部接口", "远程接口", "第三方接口",
+)
 NODE_TYPES = {
     "trigger", "actor", "input", "activity", "object", "rule", "decision",
     "state", "system", "output",
@@ -379,6 +388,9 @@ def reconstruct_table(file_info: dict[str, Any], table: dict[str, Any]) -> Table
         int(table.get("column_count", len(columns))),
         columns,
         str(table.get("engine", "openpyxl")),
+        int(table.get("header_row", 0)),
+        float(table.get("header_confidence", 1.0)),
+        str(table.get("header_detection", "default_first_row")),
     )
 
 
@@ -1023,7 +1035,19 @@ def validate_claims(claims: dict[str, Any], card_payload: dict[str, Any]) -> lis
             errors.append(f"Node {identifier} name must contain 2-80 characters")
         elif looks_record_specific(name):
             errors.append(f"Node {identifier} name looks like a record value or code: {name}")
-        validate_evidence(f"Node {identifier}", node.get("evidence_ids"))
+        selected_evidence = validate_evidence(f"Node {identifier}", node.get("evidence_ids"))
+        if is_external_capability_node(node):
+            if node_type != "system":
+                errors.append(
+                    f"Node {identifier} describes an external knowledge/API/crawler capability and must use type system"
+                )
+            local_structure_kinds = {
+                "file_structure", "table_schema", "table_process_signal", "field_relationship",
+            }
+            if any(str(card.get("kind", "")) in local_structure_kinds for card in selected_evidence):
+                errors.append(
+                    f"Node {identifier} is an external capability and must not assign local data files as its role evidence"
+                )
 
     edge_by_pair: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     adjacency: dict[str, set[str]] = defaultdict(set)
@@ -1262,6 +1286,18 @@ def write_report(result: dict[str, Any], cards_by_id: dict[str, dict[str, Any]],
     lines.extend(["## 文件覆盖", "", "已纳入：" + "、".join(f"`{item}`" for item in result["coverage"]["included_files"]), ""])
     for item in result["coverage"].get("excluded_files", []):
         lines.append(f"- 排除 `{item['file']}`：{item['reason']}")
+    operational = result.get("operational_contract", {})
+    gates = operational.get("quality_gates", {}) if isinstance(operational, dict) else {}
+    lines.extend([
+        "", "## 后续执行就绪度", "",
+        f"- 数据执行契约：`{operational.get('status', 'missing')}`",
+        f"- 证据支持的字段链路：{gates.get('evidence_backed_link_count', 0)}",
+        f"- 结果反向追踪链路：{gates.get('result_trace_link_count', 0)}",
+    ])
+    for blocker in gates.get("blockers", []):
+        lines.append(f"- 阻塞：{blocker}")
+    for warning in gates.get("warnings", []):
+        lines.append(f"- 边界：{warning}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -1312,7 +1348,520 @@ def compact_summary(result: dict[str, Any], offset: int, limit: int) -> dict[str
             "items": edges[offset:offset + limit],
         },
         "coverage": result.get("coverage", {}),
+        "operational_contract": result.get("operational_contract", {}),
         "artifacts": result.get("artifacts", {}),
+    }
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(64 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def stable_source_id(path: str) -> str:
+    return "src-" + hashlib.sha1(path.encode("utf-8")).hexdigest()[:10]
+
+
+def is_external_capability_node(node: dict[str, Any]) -> bool:
+    text = " ".join(str(node.get(key, "")) for key in ("name", "description", "type")).casefold()
+    return any(marker.casefold() in text for marker in EXTERNAL_CAPABILITY_MARKERS)
+
+
+def direct_node_files(node: dict[str, Any], cards_by_id: dict[str, dict[str, Any]]) -> set[str]:
+    preferred_kinds = {
+        "file_structure", "table_schema", "table_process_signal", "table_relation_statement",
+        "document_relation_statement",
+    }
+    preferred: set[str] = set()
+    fallback: set[str] = set()
+    for evidence_id in node.get("evidence_ids", []):
+        card = cards_by_id.get(str(evidence_id), {})
+        files = {
+            str(item.get("file", ""))
+            for item in card.get("sources", [])
+            if isinstance(item, dict) and item.get("file")
+        }
+        fallback.update(files)
+        if card.get("kind") in preferred_kinds:
+            preferred.update(files)
+    return preferred or fallback
+
+
+def source_runtime_contract(roles: list[dict[str, str]]) -> dict[str, Any]:
+    role_types = {str(item.get("node_type", "")) for item in roles}
+    runtime_roles = role_types.intersection({"actor", "input", "object", "rule", "state"})
+    if runtime_roles:
+        return {
+            "lifecycle": "runtime_input",
+            "runtime_required": True,
+            "runtime_binding": "required_when_referenced_by_stage_or_query",
+            "integrity_policy": "schema_compatible_runtime_binding",
+        }
+    if "output" in role_types:
+        return {
+            "lifecycle": "design_time_template",
+            "runtime_required": False,
+            "runtime_binding": "not_required",
+            "integrity_policy": "design_fingerprint_only",
+            "template_policy": {
+                "retained": ["format", "table_or_section", "header", "columns", "types", "locators"],
+                "example_data": "optional_deidentified_bounded_example_only",
+                "original_file_required_at_runtime": False,
+            },
+        }
+    return {
+        "lifecycle": "design_time_evidence",
+        "runtime_required": False,
+        "runtime_binding": "not_required",
+        "integrity_policy": "design_fingerprint_only",
+    }
+
+
+def header_is_usable(table: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    columns = [str(item.get("name", "")) for item in table.get("columns", []) if isinstance(item, dict)]
+    generic = [name for name in columns if re.fullmatch(r"(?:column_\d+|__unnamed__\d+)", name, re.IGNORECASE)]
+    ratio = len(generic) / len(columns) if columns else 1.0
+    confidence = float(table.get("header_confidence", 1.0))
+    usable = len(columns) >= 2 and ratio <= 0.4 and confidence >= 0.5
+    return usable, {
+        "column_count": len(columns),
+        "generic_column_ratio": round(ratio, 4),
+        "header_row": int(table.get("header_row", 0)),
+        "header_confidence": confidence,
+        "header_detection": str(table.get("header_detection", "default_first_row")),
+    }
+
+
+def join_candidate_score(candidate: dict[str, Any], stats: dict[tuple[str, str], dict[str, Any]]) -> float:
+    source_column = str(candidate.get("source_field", ""))
+    target_column = str(candidate.get("target_field", ""))
+    normalized_source = normalize_name(source_column)
+    normalized_target = normalize_name(target_column)
+    combined = (source_column + target_column).casefold()
+    score = float(candidate.get("confidence", 0.0)) * 0.45
+    if normalized_source and normalized_source == normalized_target:
+        score += 0.16
+    source_kind, source_base = header_semantic(source_column)
+    target_kind, target_base = header_semantic(target_column)
+    if source_kind in {"id", "code"} and target_kind in {"id", "code"}:
+        score += 0.14
+    if source_base and source_base == target_base:
+        score += 0.08
+    if any(term in combined for term in ("结算id", "就诊id", "医药机构结算id", "数据唯一记录号", "流水号")):
+        score += 0.18
+    elif any(term in combined for term in ("人员编号", "人员参保关系id", "证件号码")):
+        score += 0.07
+    if any(term in combined for term in ("创建人", "经办人", "创建机构", "经办机构", "统筹区", "单位编号", "病种")):
+        score -= 0.2
+    source_stats = stats.get((str(candidate.get("source_file", "")), source_column), {})
+    target_stats = stats.get((str(candidate.get("target_file", "")), target_column), {})
+    uniqueness = max(float(source_stats.get("distinct_ratio", 0.0)), float(target_stats.get("distinct_ratio", 0.0)))
+    score += min(0.12, uniqueness * 0.12)
+    return round(max(0.0, min(1.0, score)), 4)
+
+
+def build_operational_contract(
+    claims: dict[str, Any], card_payload: dict[str, Any], cards_by_id: dict[str, dict[str, Any]],
+    field_result: dict[str, Any], field_result_path: Path,
+) -> dict[str, Any]:
+    nodes = [item for item in claims.get("nodes", []) if isinstance(item, dict)]
+    roles_by_file: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for node in nodes:
+        if str(node.get("type", "")) not in MATERIAL_SOURCE_NODE_TYPES:
+            continue
+        for file_name in direct_node_files(node, cards_by_id):
+            roles_by_file[file_name].append({
+                "node_id": str(node.get("id", "")),
+                "node_name": str(node.get("name", "")),
+                "node_type": str(node.get("type", "")),
+            })
+
+    sources: list[dict[str, Any]] = []
+    source_by_path: dict[str, dict[str, Any]] = {}
+    table_by_file_column: dict[tuple[str, str], dict[str, Any]] = {}
+    blockers: list[str] = []
+    warnings: list[str] = []
+    coverage = claims.get("coverage") if isinstance(claims.get("coverage"), dict) else {}
+    included_files = {
+        str(item) for item in coverage.get("included_files", []) if str(item)
+    } if isinstance(coverage.get("included_files"), list) else set()
+    for index, file_info in enumerate(field_result.get("files", []), 1):
+        if not isinstance(file_info, dict):
+            continue
+        path = str(file_info.get("path", ""))
+        if included_files and path not in included_files:
+            continue
+        tables = []
+        for table in file_info.get("tables", []):
+            if not isinstance(table, dict):
+                continue
+            usable, header_quality = header_is_usable(table)
+            columns = [
+                {
+                    "name": str(column.get("name", "")),
+                    "query_name": str(column.get("query_name", column.get("name", ""))),
+                    "kind": str(column.get("kind", "other")),
+                }
+                for column in table.get("columns", [])
+                if isinstance(column, dict)
+            ]
+            table_entry = {
+                "table_id": str(table.get("key", "")),
+                "sheet_or_table": str(table.get("table_name", "")),
+                "row_count": table.get("row_count"),
+                "column_count": len(columns),
+                "columns": columns,
+                "header": header_quality,
+                "schema_usable": usable,
+            }
+            tables.append(table_entry)
+            for column in columns:
+                table_by_file_column.setdefault((path, column["name"]), table_entry)
+            if file_info.get("kind") == "tabular" and not usable:
+                blockers.append(f"表头无法可靠识别：{path} / {table_entry['sheet_or_table']}")
+        row_counts = [int(item["row_count"]) for item in tables if isinstance(item.get("row_count"), int)]
+        extension = str(file_info.get("extension", "")).casefold()
+        kind = str(file_info.get("kind", "binary"))
+        if kind == "tabular":
+            retrieval = {
+                "mode": "schema_bound_read_only_sql",
+                "locator_scheme": "table/sheet + row + column",
+                "required_output_provenance": ["source_id", "table_id", "column names", "query digest"],
+            }
+        elif extension in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp"}:
+            retrieval = {
+                "mode": "ocr_then_chunk_index",
+                "locator_scheme": "image + OCR block/page + chunk",
+                "ocr_policy": "required",
+                "required_output_provenance": ["source_id", "source digest", "locator", "chunk id", "text digest"],
+            }
+        else:
+            retrieval = {
+                "mode": "parse_then_chunk_index",
+                "locator_scheme": "page/paragraph/slide/line + chunk",
+                "ocr_policy": "fallback_when_text_layer_is_sparse" if extension == ".pdf" else "not_applicable",
+                "required_output_provenance": ["source_id", "source digest", "locator", "chunk id", "text digest"],
+            }
+        entry = {
+            "source_id": stable_source_id(path),
+            "view_name": f"source_{index}",
+            "path": path,
+            "extension": extension,
+            "kind": kind,
+            "size_bytes": int(file_info.get("size", 0)),
+            "content_sha256": str(file_info.get("sha256", "")),
+            "is_large": bool(
+                max(row_counts, default=0) >= LARGE_TABULAR_ROWS
+                or (kind != "tabular" and int(file_info.get("size", 0)) >= 20 * 1024 * 1024)
+            ),
+            "roles": sorted(roles_by_file.get(path, []), key=lambda item: (item["node_type"], item["node_id"])),
+            "tables": tables,
+            "access_policy": "bounded_sql_only" if file_info.get("kind") == "tabular" else "bounded_extract_or_ocr",
+            "content_retrieval": retrieval,
+            "agent_must_not_open_directly": True,
+            **source_runtime_contract(roles_by_file.get(path, [])),
+        }
+        sources.append(entry)
+        source_by_path[path] = entry
+
+    stats_index: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in field_result.get("column_statistics", []):
+        if not isinstance(item, dict):
+            continue
+        key = (str(item.get("file", "")), str(item.get("column", "")))
+        current = stats_index.get(key)
+        if current is None or int(item.get("nonempty", 0)) > int(current.get("nonempty", 0)):
+            stats_index[key] = item
+
+    macro_edges_by_evidence: dict[str, list[str]] = defaultdict(list)
+    for edge in claims.get("edges", []):
+        if not isinstance(edge, dict) or edge.get("type") != "joins_with":
+            continue
+        for evidence_id in edge.get("evidence_ids", []):
+            macro_edges_by_evidence[str(evidence_id)].append(str(edge.get("id", "")))
+
+    links: list[dict[str, Any]] = []
+    output_files = {
+        file_name
+        for node in nodes if node.get("type") == "output"
+        for file_name in direct_node_files(node, cards_by_id)
+    }
+    for card in card_payload.get("cards", []):
+        if not isinstance(card, dict) or card.get("kind") != "field_relationship":
+            continue
+        facts = card.get("facts") if isinstance(card.get("facts"), dict) else {}
+        source_file = str(facts.get("source_file", ""))
+        target_file = str(facts.get("target_file", ""))
+        if source_file not in source_by_path or target_file not in source_by_path:
+            continue
+        candidates = []
+        for raw in facts.get("correspondences", []):
+            if not isinstance(raw, dict):
+                continue
+            candidate = {
+                **raw,
+                "source_file": source_file,
+                "target_file": target_file,
+                "source_table": table_by_file_column.get((source_file, str(raw.get("source_field", ""))), {}).get("sheet_or_table", ""),
+                "target_table": table_by_file_column.get((target_file, str(raw.get("target_field", ""))), {}).get("sheet_or_table", ""),
+                "source_statistics": stats_index.get((source_file, str(raw.get("source_field", ""))), {}),
+                "target_statistics": stats_index.get((target_file, str(raw.get("target_field", ""))), {}),
+            }
+            candidate["score"] = join_candidate_score(candidate, stats_index)
+            candidates.append(candidate)
+        candidates.sort(key=lambda item: (-float(item["score"]), -int(item.get("evidence_count", 0))))
+        recommended = None
+        candidate_key_sets = []
+        eligible = [item for item in candidates[:6] if float(item.get("score", 0)) >= 0.55]
+        for key_index, candidate in enumerate(eligible):
+            candidate_key_sets.append({
+                "key_set_index": key_index,
+                "key_pairs": [{
+                    "source_field": candidate["source_field"],
+                    "target_field": candidate["target_field"],
+                }],
+                "score": candidate["score"],
+                "mode": "single_key",
+                "runtime_selection_required": key_index != 0,
+            })
+        for left, right in itertools.combinations(eligible[:4], 2):
+            if (
+                left["source_field"] == right["source_field"]
+                or left["target_field"] == right["target_field"]
+            ):
+                continue
+            candidate_key_sets.append({
+                "key_set_index": len(candidate_key_sets),
+                "key_pairs": [
+                    {"source_field": left["source_field"], "target_field": left["target_field"]},
+                    {"source_field": right["source_field"], "target_field": right["target_field"]},
+                ],
+                "score": round(min(float(left["score"]), float(right["score"])), 4),
+                "mode": "composite_key_runtime_candidate",
+                "runtime_selection_required": True,
+            })
+            if len(candidate_key_sets) >= 10:
+                break
+        if candidates and float(candidates[0]["score"]) >= 0.65:
+            recommended = {
+                **candidates[0],
+                "key_pairs": [{
+                    "source_field": candidates[0]["source_field"],
+                    "target_field": candidates[0]["target_field"],
+                }],
+            }
+        link_kind = "result_trace" if source_file in output_files or target_file in output_files else "cross_source_join"
+        runtime_eligible = bool(
+            source_by_path.get(source_file, {}).get("runtime_required")
+            and source_by_path.get(target_file, {}).get("runtime_required")
+        )
+        links.append({
+            "link_id": "link-" + hashlib.sha1(f"{source_file}\0{target_file}".encode("utf-8")).hexdigest()[:10],
+            "kind": link_kind,
+            "source_id": source_by_path.get(source_file, {}).get("source_id", stable_source_id(source_file)),
+            "target_id": source_by_path.get(target_file, {}).get("source_id", stable_source_id(target_file)),
+            "source_file": source_file,
+            "target_file": target_file,
+            "macro_edge_ids": sorted(macro_edges_by_evidence.get(str(card.get("id", "")), [])),
+            "evidence_card_id": str(card.get("id", "")),
+            "recommended_candidate": recommended,
+            "candidate_key_sets": candidate_key_sets,
+            "candidate_count": len(candidates),
+            "candidates": candidates[:12],
+            "runtime_validation": [
+                "check null rate on both keys",
+                "check unmatched rate in both directions",
+                "check join fanout and duplicate amplification",
+                "reject cartesian or unexplained many-to-many expansion",
+            ],
+            "runtime_eligible": runtime_eligible,
+        })
+
+    semantic_routes: list[dict[str, Any]] = []
+    route_keys: set[tuple[str, str, str]] = set()
+    for edge in claims.get("edges", []):
+        if not isinstance(edge, dict):
+            continue
+        source_node = next((item for item in nodes if str(item.get("id", "")) == str(edge.get("source", ""))), {})
+        target_node = next((item for item in nodes if str(item.get("id", "")) == str(edge.get("target", ""))), {})
+        source_files = direct_node_files(source_node, cards_by_id)
+        target_files = direct_node_files(target_node, cards_by_id)
+        for source_file in sorted(source_files):
+            for target_file in sorted(target_files):
+                if not source_file or not target_file or source_file == target_file:
+                    continue
+                source_entry = source_by_path.get(source_file, {})
+                target_entry = source_by_path.get(target_file, {})
+                if not source_entry or not target_entry:
+                    continue
+                if source_entry.get("kind") == target_entry.get("kind") == "tabular":
+                    continue
+                ordered = tuple(sorted((source_file, target_file)))
+                route_key = (ordered[0], ordered[1], str(edge.get("id", "")))
+                if route_key in route_keys:
+                    continue
+                route_keys.add(route_key)
+                evidence_ids = [str(item) for item in edge.get("evidence_ids", []) if str(item)]
+                evidence_locators = []
+                for evidence_id in evidence_ids:
+                    card = cards_by_id.get(evidence_id, {})
+                    evidence_locators.extend(
+                        {
+                            "evidence_id": evidence_id,
+                            "file": str(item.get("file", "")),
+                            "locator": str(item.get("locator", "")),
+                        }
+                        for item in card.get("sources", [])
+                        if isinstance(item, dict)
+                    )
+                semantic_routes.append({
+                    "route_id": "route-" + hashlib.sha1(
+                        f"{source_file}\0{target_file}\0{edge.get('id', '')}".encode("utf-8")
+                    ).hexdigest()[:10],
+                    "mode": "provenance_preserving_semantic_retrieval",
+                    "source_id": source_entry.get("source_id", stable_source_id(source_file)),
+                    "target_id": target_entry.get("source_id", stable_source_id(target_file)),
+                    "macro_edge_id": str(edge.get("id", "")),
+                    "relation_type": str(edge.get("type", "")),
+                    "evidence_ids": evidence_ids,
+                    "evidence_locators": evidence_locators[:12],
+                    "runtime_validation": [
+                        "derive search terms from the user request and the complete selected rule record",
+                        "return only bounded hits with source, locator, chunk id, and content digest",
+                        "treat OCR confidence or sparse text as uncertainty, never as an invented fact",
+                        "require an explicit business key before joining a semantic hit to a structured row",
+                    ],
+                })
+
+    input_files = {
+        path
+        for path, roles in roles_by_file.items()
+        if any(item["node_type"] in {"input", "object"} for item in roles)
+    }
+    structured_input_files = {
+        path for path in input_files if source_by_path.get(path, {}).get("kind") == "tabular"
+    }
+    unstructured_input_files = input_files - structured_input_files
+    adjacency: dict[str, set[str]] = defaultdict(set)
+    for link in links:
+        if (
+            link.get("recommended_candidate")
+            and link["source_file"] in structured_input_files
+            and link["target_file"] in structured_input_files
+        ):
+            adjacency[link["source_file"]].add(link["target_file"])
+            adjacency[link["target_file"]].add(link["source_file"])
+    if len(structured_input_files) > 1:
+        reached: set[str] = set()
+        frontier = [next(iter(structured_input_files))]
+        while frontier:
+            current = frontier.pop()
+            if current in reached:
+                continue
+            reached.add(current)
+            frontier.extend(adjacency.get(current, set()) - reached)
+        if reached != structured_input_files:
+            blockers.append("多个结构化业务输入源之间没有形成完整的字段级可执行关联网络")
+
+    rule_sources = [
+        source["source_id"]
+        for source in sources
+        if any(role["node_type"] == "rule" for role in source["roles"])
+    ]
+    if any(node.get("type") == "rule" for node in nodes) and not rule_sources:
+        blockers.append("规则节点没有映射到可查询或可提取的规则来源")
+    result_source_ids = [source["source_id"] for source in sources if source["path"] in output_files]
+    structured_result_ids = {
+        source["source_id"] for source in sources
+        if source["source_id"] in result_source_ids and source.get("kind") == "tabular"
+    }
+    unstructured_result_ids = set(result_source_ids) - structured_result_ids
+    field_result_trace = {
+        endpoint
+        for link in links
+        if link["kind"] == "result_trace" and link.get("recommended_candidate")
+        for endpoint in (link.get("source_id"), link.get("target_id"))
+    }
+    semantic_result_trace = any(
+        route.get("source_id") in unstructured_result_ids or route.get("target_id") in unstructured_result_ids
+        for route in semantic_routes
+    )
+    if structured_result_ids - field_result_trace:
+        blockers.append("结构化结果样例无法通过字段级证据链路反向追踪到业务来源")
+    if unstructured_result_ids and not semantic_result_trace:
+        blockers.append("非结构化结果样例无法通过带定位的语义证据路径反向追踪")
+    if not result_source_ids:
+        warnings.append("没有物理结果样例；结果结构只能由业务契约定义，不能执行反向对账")
+
+    runtime_source_ids = [
+        source["source_id"] for source in sources if source.get("runtime_required") is True
+    ]
+    template_source_ids = [
+        source["source_id"] for source in sources if source.get("lifecycle") == "design_time_template"
+    ]
+    external_capabilities = [
+        {
+            "node_id": str(node.get("id", "")),
+            "name": str(node.get("name", "")),
+            "description": str(node.get("description", "")),
+            "lifecycle": "optional_enrichment",
+            "runtime_required": "agent_decides_from_user_request_and_complete_rule_record",
+            "activation": "agent_determines_from_user_request_and_complete_rule_record",
+            "failure_policy": "manual_intervention_required_when_mandatory_and_unavailable",
+        }
+        for node in nodes
+        if str(node.get("type", "")) == "system" and is_external_capability_node(node)
+    ]
+    return {
+        "schema_version": 2,
+        "status": "ready" if not blockers else "blocked",
+        "generated_at": utc_now(),
+        "scenario": claims.get("scenario", {}),
+        "source": {
+            "field_evidence": str(field_result_path),
+            "field_evidence_fingerprint": file_sha256(field_result_path),
+        },
+        "sources": sources,
+        "links": links,
+        "semantic_routes": semantic_routes,
+        "rule_source_ids": rule_sources,
+        "result_source_ids": result_source_ids,
+        "runtime_source_ids": runtime_source_ids,
+        "template_source_ids": template_source_ids,
+        "external_capabilities": external_capabilities,
+        "query_policy": {
+            "rule_record_mode": "return_complete_selected_rule_record",
+            "structured_rule_record_mode": "return_complete_selected_row",
+            "unstructured_rule_record_mode": "return_complete_located_section_with_provenance",
+            "large_table_threshold_rows": LARGE_TABULAR_ROWS,
+            "large_sources_must_use_sql": True,
+            "agent_must_not_open_source_files": True,
+            "register_only_sources_referenced_by_the_current_operation": True,
+            "runtime_data_validation": "schema_compatibility_not_design_time_content_identity",
+            "design_time_templates_are_not_runtime_dependencies": True,
+            "required_sequence": [
+                "locate complete rule record with bounded query",
+                "derive structured predicates and unstructured retrieval terms from the complete rule record",
+                "index and search non-tabular sources with provenance-preserving chunks when required",
+                "validate recommended join keys and fanout",
+                "execute one bounded multi-source read-only SQL query",
+                "reconcile structured rows with document/OCR evidence locators without semantic-only joins",
+            ],
+        },
+        "quality_gates": {
+            "status": "passed" if not blockers else "failed",
+            "blockers": sorted(set(blockers)),
+            "warnings": sorted(set(warnings)),
+            "input_source_count": len(input_files),
+            "structured_input_source_count": len(structured_input_files),
+            "unstructured_input_source_count": len(unstructured_input_files),
+            "evidence_backed_link_count": sum(bool(item.get("recommended_candidate")) for item in links),
+            "semantic_retrieval_route_count": len(semantic_routes),
+            "result_trace_link_count": sum(item["kind"] == "result_trace" and bool(item.get("recommended_candidate")) for item in links),
+        },
     }
 
 
@@ -1554,9 +2103,25 @@ def finalize(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         ):
             claims_path.unlink(missing_ok=True)
     cards_by_id = {card["id"]: card for card in card_payload["cards"]}
+    field_result_path = Path(str(card_payload.get("field_evidence", ""))).resolve()
+    if not field_result_path.is_file():
+        raise ValueError("Field evidence artifact is missing; rerun analyze before finalize")
+    field_result = json.loads(field_result_path.read_text(encoding="utf-8"))
+    operational_contract = build_operational_contract(
+        claims, card_payload, cards_by_id, field_result, field_result_path
+    )
+    operational_contract_path = output_root / "operational-data-contract.json"
+    atomic_json(operational_contract_path, operational_contract)
+    operational_contract_claim = {
+        "status": operational_contract["status"],
+        "artifact": str(operational_contract_path),
+        "fingerprint": file_sha256(operational_contract_path),
+        "quality_gates": operational_contract["quality_gates"],
+    }
+    operational_ready = operational_contract.get("status") == "ready"
     result = {
         "schema_version": SCHEMA_VERSION,
-        "status": "complete",
+        "status": "complete" if operational_ready else "blocked_operational_contract",
         "generated_at": utc_now(),
         "strategy": "bounded_evidence_semantic_synthesis",
         "scenario": claims["scenario"],
@@ -1565,6 +2130,7 @@ def finalize(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "main_chain": claims["main_chain"],
         "primary_data_path": claims["main_chain"],
         "branches": claims["branches"],
+        "operational_contract": operational_contract_claim,
         "coverage": {
             **claims["coverage"],
             "guarantee": "One bounded macro data-relationship graph; every node and edge cites validated evidence; fields and record-specific values are forbidden as nodes.",
@@ -1576,6 +2142,7 @@ def finalize(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             "mermaid": str(output_root / "relations.mmd"),
             "evidence_index": str(output_root / "evidence.sqlite3"),
             "evidence_cards": str(cards_path),
+            "operational_data_contract": str(operational_contract_path),
         },
     }
     atomic_json(output_root / "scenario-relationship.json", result)
@@ -1584,8 +2151,20 @@ def finalize(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     write_mermaid(result, output_root / "relations.mmd")
     write_scenario_database(result, card_payload, output_root / "evidence.sqlite3")
     validation_path = output_root / "validation-errors.json"
-    if validation_path.exists():
-        validation_path.unlink()
+    if not operational_ready:
+        blocked = {
+            "status": "blocked_operational_contract",
+            "errors": operational_contract.get("quality_gates", {}).get("blockers", []),
+            "warnings": operational_contract.get("quality_gates", {}).get("warnings", []),
+            "operational_data_contract": str(operational_contract_path),
+            "next_action": (
+                "Repair the field-level source network, header detection, rule source, or result trace in "
+                "discover-data-relations, then finalize again. Downstream flow and Skill distillation are forbidden."
+            ),
+        }
+        atomic_json(validation_path, blocked)
+        return 2, {**compact_summary(result, 0, args.summary_limit), **blocked}
+    validation_path.unlink(missing_ok=True)
     return 0, compact_summary(result, 0, args.summary_limit)
 
 
@@ -1602,12 +2181,17 @@ def add_probe_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--seed-values-per-column", type=int, default=256)
     parser.add_argument("--max-seed-values", type=int, default=20_000)
     parser.add_argument("--max-text-seeds", type=int, default=2_000)
-    parser.add_argument("--profile-size", type=int, default=128)
-    parser.add_argument("--frontier-values-per-column", type=int, default=128)
+    parser.add_argument("--profile-size", type=int, default=64)
+    parser.add_argument("--frontier-values-per-column", type=int, default=64)
     parser.add_argument("--min-expansion-distinct-ratio", type=float, default=0.01)
     parser.add_argument("--max-matches-per-seed", type=int, default=50)
+    parser.add_argument("--max-probe-columns", type=int, default=64)
+    parser.add_argument("--fallback-probe-columns", type=int, default=16)
+    parser.add_argument("--profile-sample-rows", type=int, default=512)
+    parser.add_argument("--max-matched-rows-per-table", type=int, default=100_000)
+    parser.add_argument("--xlsx-python-fallback-cell-budget", type=int, default=250_000)
     parser.add_argument("--bootstrap-rows", type=int, default=1_000)
-    parser.add_argument("--checkpoint-rows", type=int, default=50_000)
+    parser.add_argument("--checkpoint-rows", type=int, default=100_000)
     parser.add_argument("--document-character-budget", type=int, default=2_000_000)
     parser.add_argument("--document-cards-per-file", type=int, default=40)
     parser.add_argument("--semantic-table-cell-budget", type=int, default=100_000)

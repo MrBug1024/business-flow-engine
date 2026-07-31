@@ -323,6 +323,7 @@ Agent 启动前会根据内容摘要，把“系统 Skill + 当前账户用户 S
 | --- | --- |
 | `discover-data-relations` | 基于场景文件和业务目标提取证据、形成候选关系、推导宏观业务数据关系并生成图谱与说明 |
 | `derive-business-flow` | 仅基于已验收关系图谱推导场景级宏观流程、状态、控制、分支和历史验证计划 |
+| `distill-business-capability` | 将已验收的关系与宏观流程蒸馏为可脱离 Studio 使用的场景编排、逐节点和按需基础 Skill 源码 |
 | `ocr-parser` | 调用配置的 OCR 服务解析扫描件或图片文档 |
 | `vector-kb` | 调用配置的向量知识库检索业务知识 |
 
@@ -355,7 +356,22 @@ Agent 启动前会根据内容摘要，把“系统 Skill + 当前账户用户 S
 
 历史数据在该 Skill 中只用于验证覆盖、顺序一致性、状态、分支、控制和结果对账，不能将某批数据中的偶然操作轨迹固化为规范流程。缺少支撑的流程假设只能进入待确认项，不能混入正式主流程。
 
-### 9.5 MCP
+### 9.5 业务能力蒸馏交付物
+
+`distill-business-capability` 只在数据关系、`operational-data-contract.json` 和业务流程交付物均完成、通过验收且指纹一致时运行。它为每个宏观流程节点生成且只生成一个阶段 Skill，并生成一个场景总控 Skill；基础能力则由上游文件事实按需决定，而不是固定附带：CSV、Excel、Parquet 等表格格式生成基于 DuckDB 的完整规则行检索、来源摘要预检、单键/复合键连接校验、多来源有界查询和全量结果文件导出能力；TXT、Markdown、Word、可搜索 PDF 生成流式分块索引与可追溯检索能力；扫描 PDF 或图片生成保留原 OCR 运行能力但重写了场景触发条件、用途和格式路由的 OCR Skill。
+
+典型交付物位于 `outputs/capability-distillation/`：
+
+- `skills/`：可供第三方 Agent 使用的场景编排、逐节点和按需基础 Skill 源码树。
+- `capability-manifest.json`：Skill 清单、来源指纹、文件摘要和流程节点映射。
+- `agent_prompts.md`：可直接复制到第三方 Agent 的场景系统提示词，规定规则优先、大表 SQL、连接验证和非结构化证据索引顺序。
+- `capability-map.mmd`：流程节点、基础能力和编排入口之间的确定性映射。
+- `capability-plan.json` 与 `distillation-report.md`：通过校验的蒸馏计划及其审计说明。
+- `distillation-brief.json` 与 `prepare-status.json`：有界输入简报和前置门槛检查点。
+
+生成器会拒绝平台专属路径、进度协议和内部服务耦合进入可移植源码，并要求每个生成 Skill 都携带稳定 `scripts/*.py` CLI；阶段 Skill 使用工作单/交接运行器，总控 Skill 使用流程状态机，第三方 Agent 不得临时手写文件、HTTP 或状态脚本。复用 OCR、知识库等系统 Skill 时，除场景化说明、UI 元数据和场景绑定外完整继承脚本、依赖、配置字段和值；平台 Skill 凭据存储或当前环境已有的凭据按原字段物化，manifest 只记录字段和配置状态，不回显值。Agent 不直接读取原始大文件：结构化来源先核对内容摘要，按完整规则记录推导 SQL，并确保 SQL 使用通过基数与放大校验的同一键组；有界预览进入上下文，全量结果只写 CSV/Parquet 并返回查询/文件摘要。非结构化来源只能消费带原始来源摘要和页码/段落/行号的有限命中；显式外部知识节点生成完整定制的 `vector-kb` 基础 Skill。它不会把历史样本中的偶然步骤固化为 Skill，也不负责最终压缩、签名、版本化或发布；这些仍属于后续 `package-business-skill` 的独立验收边界。
+
+### 9.6 MCP
 
 MCP 与 Tool、Skill 分开配置，并保存在当前账户的 `studio_settings.json`。当前管理接口支持配置规范化、连接测试、保存、启停和删除；敏感字段返回前会掩码，前端提交掩码值时后端会与当前账户已保存密钥合并。运行时只发现业务场景所属账户的 MCP，并通过能力网关按需调用，不把完整远端能力目录复制进系统提示词。
 
@@ -369,6 +385,7 @@ MCP 与 Tool、Skill 分开配置，并保存在当前账户的 `studio_settings
 - `/skills` 映射到“系统 Skill + 当前账户 Skill”的账户专属视图，只读。
 - `/tmp` 映射到该运行绑定的临时目录。
 - Python 命令统一使用受管 venv，避免污染系统全局 Python。
+- 执行 Skill 内部脚本前自动核对该 Skill 的 `requirements.txt` 摘要；首次运行或摘要变化时串行安装依赖，成功后把摘要写入场景外的 `requirements-state/`，后续调用直接复用。
 - 命令具有超时、输出字节数和传输大小限制；超时后终止进程树。
 - Skill 凭据只按白名单注入单次命令环境，并对可见输出执行密钥脱敏。
 - 删除场景沙箱只清理该绑定和临时文件，不删除共享 venv。

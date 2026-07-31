@@ -559,7 +559,7 @@ System Skill 要求：
 
 - Studio 首次需要执行 Skill 时自动创建系统级共享 venv，无需另外安装外部运行时。
 - 通用执行能力将当前业务场景映射为可写的 `/workspace`，将完整 Skill 根目录映射为只读的 `/skills`；切换场景只切换工作区映射，不复制运行环境。
-- 依赖通过 `python -m pip install -r /skills/<name>/requirements.txt` 安装到共享 venv。平台记录需求文件摘要，避免每次调用重复安装。
+- 执行 `/skills/<name>/...` 下的脚本前，平台自动按该 Skill 的 `requirements.txt` 向共享 venv 串行安装依赖，并记录需求文件摘要；摘要不变时直接复用。显式执行 `python -m pip install -r /skills/<name>/requirements.txt` 仍受支持，成功后同样刷新摘要。
 - 凭据按实际执行的 Skill 注入命令环境，不写入 Skill 包或业务场景文件。
 - `skill_activation`、`skill_resource`、`sandbox_command`、`tool_call`、`mcp_call` 分层记录；只有真实父子 ID 才在前端归组。
 - 安装、查看说明、调用内部资源与执行命令不需要逐脚本人工确认；真正需要用户业务决策时才进入问答中断。
@@ -759,7 +759,7 @@ Evidence Chain 和 Data Lineage 能解决 AI 业务建模中最关键的问题�
 - 根目录的 `system_prompt.md`
 - `skills` 目录下的一个或多个业务 Skill
 - 每个 Skill 自己的 `SKILL.md`
-- 每个 Skill 可选或必需的 `scripts` 脚本能力
+- 每个蒸馏生成 Skill 必需的 `scripts` 脚本能力（非蒸馏的说明型 Skill 可按职责决定）
 
 来组织。
 
@@ -1440,7 +1440,7 @@ MVP 版本应满足：
 - 根目录统一使用 `system_prompt.md` 作为业务场景总入口。
 - 所有业务能力放入 `skills/{xxx_skill}/SKILL.md`。
 - 脚本能力放入对应 Skill 的 `scripts` 目录。
-- 系统 Skill、MCP、外部依赖在 `system_prompt.md` 或 `SKILL.md` 中声明，不把密钥和私有配置写入包内。
+- 系统 Skill、MCP、外部依赖在 `system_prompt.md` 或 `SKILL.md` 中声明。普通平台 Skill 的密钥继续由服务端注入；面向脱离平台运行的业务蒸馏包若完整定制 OCR/知识库系统 Skill，则按来源 Skill 原字段继承已有配置与凭据，且不得在 manifest、报告、提示词或日志中回显值。
 
 ### 21.4 风险：前端变成普通管理后台
 
