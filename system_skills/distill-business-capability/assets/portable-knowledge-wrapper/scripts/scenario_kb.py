@@ -53,7 +53,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         code, payload = run(argv)
     except (OSError, ValueError) as exc:
         code, payload = 2, {"status": "error", "message": str(exc)}
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    print(json.dumps(payload, ensure_ascii=True, indent=2))
     return code
 
 

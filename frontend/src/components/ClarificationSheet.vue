@@ -2,19 +2,25 @@
   <section
     v-if="currentQuestion"
     class="clarification-sheet"
-    :class="{ 'has-tabs': questions.length > 1 }"
+    :class="{ 'has-tabs': questions.length > 1, 'is-approval': isApprovalQuestion }"
     role="dialog"
     aria-modal="false"
     :aria-labelledby="`clarification-title-${currentQuestion.id}`"
     :style="sheetStyle"
-    @keydown.esc="emit('close')"
+    @keydown.esc.stop.prevent="closeIfAllowed"
   >
     <header class="sheet-head">
       <div>
-        <span>{{ labels.eyebrow }}</span>
-        <strong>{{ labels.title }}</strong>
+        <span>{{ isApprovalQuestion ? labels.approvalEyebrow : labels.eyebrow }}</span>
+        <strong>{{ isApprovalQuestion ? labels.approvalTitle : labels.title }}</strong>
       </div>
-      <button type="button" :title="labels.close" :aria-label="labels.close" @click="emit('close')">
+      <button
+        v-if="!hasApprovalQuestion"
+        type="button"
+        :title="labels.close"
+        :aria-label="labels.close"
+        @click="emit('close')"
+      >
         <el-icon><Close /></el-icon>
       </button>
     </header>
@@ -48,13 +54,26 @@
       <p v-if="currentQuestion.reason" class="question-reason">{{ currentQuestion.reason }}</p>
       <h2 :id="`clarification-title-${currentQuestion.id}`">{{ currentQuestion.question }}</h2>
 
+      <div v-if="isApprovalQuestion" class="approval-review">
+        <div>
+          <span>{{ currentQuestion.approval?.authority?.display_label || currentQuestion.approval?.label || labels.approvalArtifact }}</span>
+          <small v-if="currentQuestion.approval?.authority?.artifact_id || currentQuestion.approval?.artifact_id">
+            {{ currentQuestion.approval?.authority?.artifact_id || currentQuestion.approval?.artifact_id }}
+          </small>
+        </div>
+        <el-button plain size="small" @click="emit('open-review', currentQuestion)">
+          {{ currentQuestion.approval?.authority?.review_target?.label || currentQuestion.review_target?.label || labels.openReview }}
+        </el-button>
+      </div>
+
       <div v-if="currentOptions.length" class="option-list" :aria-label="labels.quickChoices">
         <button
           v-for="(option, index) in currentOptions"
           :key="option.id || `${option.label}-${index}`"
           type="button"
           class="option-button"
-          :class="{ selected: answerForCurrent === optionAnswer(option) }"
+          :class="{ selected: isOptionSelected(option) }"
+          :aria-pressed="isOptionSelected(option)"
           @click="chooseOption(option)"
         >
           <span class="option-check" aria-hidden="true">
@@ -71,11 +90,15 @@
       </div>
 
       <label class="custom-answer">
-        <span>{{ currentOptions.length ? labels.customLabel : labels.answerLabel }}</span>
+        <span>{{ isApprovalQuestion
+          ? (selectedOption?.value === 'rejected' ? labels.rejectionNote : labels.approvalNote)
+          : (currentOptions.length ? labels.customLabel : labels.answerLabel) }}</span>
         <textarea
           v-model="answers[currentQuestion.id]"
           rows="3"
-          :placeholder="labels.placeholder"
+          :placeholder="isApprovalQuestion
+            ? (selectedOption?.value === 'rejected' ? labels.rejectionPlaceholder : labels.approvalPlaceholder)
+            : labels.placeholder"
           @keydown.ctrl.enter.prevent="submitCurrent"
           @keydown.meta.enter.prevent="submitCurrent"
         />
@@ -87,10 +110,10 @@
       <el-button
         type="primary"
         :loading="submitting"
-        :disabled="!answerForCurrent.trim()"
+        :disabled="!canSubmitCurrent"
         @click="submitCurrent"
       >
-        {{ questions.length > 1 ? labels.submitNext : labels.submit }}
+        {{ isApprovalQuestion ? labels.submitApproval : (questions.length > 1 ? labels.submitNext : labels.submit) }}
       </el-button>
     </footer>
   </section>
@@ -105,11 +128,32 @@ type Question = {
   question: string
   reason?: string
   category?: string
+  source?: string
+  approval?: {
+    phase?: string
+    label?: string
+    artifact_id?: string
+    authority?: {
+      artifact_id?: string
+      display_label?: string
+      review_target?: {
+        kind: 'data_catalog' | 'workspace_file'
+        path?: string
+        label?: string
+      }
+    }
+  }
+  review_target?: {
+    kind: 'data_catalog' | 'workspace_file'
+    path?: string
+    label?: string
+  }
   options?: Array<{
     id?: string
     label: string
     description?: string
     recommended?: boolean
+    value?: 'approved' | 'rejected' | string
   }>
 }
 
@@ -128,15 +172,27 @@ const props = withDefaults(defineProps<{
 
 const emit = defineEmits<{
   close: []
-  submit: [payload: { question: Question; answer: string }]
+  submit: [payload: {
+    question: Question
+    answer: string
+    optionId?: string
+    optionValue?: string
+  }]
+  'open-review': [question: Question]
   'update:activeId': [id: string]
 }>()
 
 const answers = reactive<Record<string, string>>({})
+const selectedOptionIds = reactive<Record<string, string>>({})
 const sheetStyle = computed(() => ({ '--sheet-bottom-offset': `${Math.max(0, props.bottomOffset)}px` }))
 const labels = computed(() => props.language === 'zh'
   ? {
       answerLabel: '你的回答',
+      approvalArtifact: '待审批产物',
+      approvalEyebrow: 'Agent 正在等待你的决定',
+      approvalNote: '审批说明（可选）',
+      approvalPlaceholder: '可补充批准说明，或填写驳回后的修改要求...',
+      approvalTitle: '审批待办',
       close: '关闭问答面板',
       customLabel: '自定义回答或补充说明',
       eyebrow: 'Agent 正在等待',
@@ -145,12 +201,21 @@ const labels = computed(() => props.language === 'zh'
       questions: '待回答问题',
       quickChoices: '快速选择',
       recommended: '推荐',
+      rejectionNote: '退回原因（必填）',
+      rejectionPlaceholder: '说明哪一处数据、关系或流程不正确，以及应如何修改...',
+      openReview: '查看待审批数据/产物',
       submit: '提交回答',
+      submitApproval: '提交审批',
       submitNext: '提交并继续',
       title: '需要你确认',
     }
   : {
       answerLabel: 'Your answer',
+      approvalArtifact: 'Artifact awaiting review',
+      approvalEyebrow: 'Agent is waiting for your decision',
+      approvalNote: 'Review note (optional)',
+      approvalPlaceholder: 'Add an approval note or explain what should change after rejection...',
+      approvalTitle: 'Approval required',
       close: 'Close questions',
       customLabel: 'Custom answer or additional context',
       eyebrow: 'Agent is waiting',
@@ -159,7 +224,11 @@ const labels = computed(() => props.language === 'zh'
       questions: 'Questions to answer',
       quickChoices: 'Quick choices',
       recommended: 'Recommended',
+      rejectionNote: 'Reason for rejection (required)',
+      rejectionPlaceholder: 'Describe what is incorrect and what should be changed...',
+      openReview: 'Review data or artifact',
       submit: 'Submit answer',
+      submitApproval: 'Submit decision',
       submitNext: 'Submit and continue',
       title: 'Input needed',
     })
@@ -170,6 +239,21 @@ const currentQuestion = computed(() => (
 const currentIndex = computed(() => Math.max(0, props.questions.findIndex((question) => question.id === currentQuestion.value?.id)))
 const currentOptions = computed(() => Array.isArray(currentQuestion.value?.options) ? currentQuestion.value.options : [])
 const answerForCurrent = computed(() => currentQuestion.value ? answers[currentQuestion.value.id] || '' : '')
+const isApprovalQuestion = computed(() => currentQuestion.value?.source === 'distillation_approval')
+const hasApprovalQuestion = computed(() => props.questions.some((question) => question.source === 'distillation_approval'))
+const selectedOption = computed(() => {
+  if (!currentQuestion.value) return null
+  const selectedId = selectedOptionIds[currentQuestion.value.id]
+  return currentOptions.value.find((option, index) => optionKey(option, index) === selectedId) || null
+})
+const canSubmitCurrent = computed(() => (
+  isApprovalQuestion.value
+    ? Boolean(
+        selectedOption.value?.value
+        && (selectedOption.value.value !== 'rejected' || answerForCurrent.value.trim()),
+      )
+    : Boolean(answerForCurrent.value.trim())
+))
 
 watch(
   () => props.questions.map((question) => question.id).join('|'),
@@ -177,6 +261,9 @@ watch(
     const questionIds = new Set(props.questions.map((question) => question.id))
     for (const id of Object.keys(answers)) {
       if (!questionIds.has(id)) delete answers[id]
+    }
+    for (const id of Object.keys(selectedOptionIds)) {
+      if (!questionIds.has(id)) delete selectedOptionIds[id]
     }
     if (!props.questions.length) return
     if (!props.questions.some((question) => question.id === props.activeId)) {
@@ -190,18 +277,44 @@ function selectQuestion(id: string) {
   emit('update:activeId', id)
 }
 
+function closeIfAllowed() {
+  if (!hasApprovalQuestion.value) emit('close')
+}
+
 function optionAnswer(option: NonNullable<Question['options']>[number]) {
   return [option.label, option.description].filter(Boolean).join('：')
 }
 
+function optionKey(option: NonNullable<Question['options']>[number], index = currentOptions.value.indexOf(option)) {
+  return option.id || `${option.label}-${index}`
+}
+
+function isOptionSelected(option: NonNullable<Question['options']>[number]) {
+  if (!currentQuestion.value) return false
+  if (isApprovalQuestion.value) {
+    return selectedOptionIds[currentQuestion.value.id] === optionKey(option)
+  }
+  return answerForCurrent.value === optionAnswer(option)
+}
+
 function chooseOption(option: NonNullable<Question['options']>[number]) {
   if (!currentQuestion.value) return
+  if (isApprovalQuestion.value) {
+    selectedOptionIds[currentQuestion.value.id] = optionKey(option)
+    return
+  }
   answers[currentQuestion.value.id] = optionAnswer(option)
 }
 
 function submitCurrent() {
-  if (!currentQuestion.value || !answerForCurrent.value.trim() || props.submitting) return
-  emit('submit', { question: currentQuestion.value, answer: answerForCurrent.value.trim() })
+  if (!currentQuestion.value || !canSubmitCurrent.value || props.submitting) return
+  const option = isApprovalQuestion.value ? selectedOption.value : null
+  emit('submit', {
+    question: currentQuestion.value,
+    answer: answerForCurrent.value.trim() || option?.label || '',
+    optionId: option?.id,
+    optionValue: option?.value,
+  })
 }
 </script>
 
@@ -224,6 +337,10 @@ function submitCurrent() {
 
 .clarification-sheet.has-tabs {
   grid-template-rows: auto auto minmax(0, 1fr) auto;
+}
+
+.clarification-sheet.is-approval {
+  border-color: color-mix(in srgb, var(--accent) 68%, var(--chat-divider));
 }
 
 .sheet-head,
@@ -350,6 +467,38 @@ function submitCurrent() {
   letter-spacing: 0;
 }
 
+.approval-review {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+  margin: 0 0 12px;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--chat-divider));
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent-soft) 48%, var(--chat-bg));
+}
+
+.approval-review > div,
+.approval-review span,
+.approval-review small {
+  display: block;
+  min-width: 0;
+}
+
+.approval-review span {
+  color: var(--text-strong);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.approval-review small {
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
 .option-list {
   display: grid;
   gap: 6px;
@@ -474,6 +623,11 @@ function submitCurrent() {
   .custom-answer textarea {
     min-height: 88px;
     font-size: 16px;
+  }
+
+  .approval-review {
+    align-items: stretch;
+    flex-direction: column;
   }
 }
 

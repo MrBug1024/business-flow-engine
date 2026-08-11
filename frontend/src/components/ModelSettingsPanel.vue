@@ -103,15 +103,37 @@
             {{ model.base_url || tr('inheritedEndpoint') }}
           </p>
 
+          <p
+            v-if="preflightById[model.id]"
+            class="connection-result"
+            :class="`connection-${preflightById[model.id].status}`"
+            :title="preflightById[model.id].message"
+            role="status"
+          >
+            {{ connectionLabel(preflightById[model.id]) }}
+          </p>
+
           <footer class="model-card-foot">
             <span>{{ model.default ? tr('managedBySystem') : model.enabled ? tr('enabled') : tr('disabled') }}</span>
-            <el-switch
-              :model-value="model.enabled"
-              :disabled="model.default"
-              :loading="togglingId === model.id"
-              :aria-label="model.enabled ? tr('enabled') : tr('disabled')"
-              @change="toggleModel(model, Boolean($event))"
-            />
+            <div class="card-actions">
+              <el-button
+                text
+                size="small"
+                :loading="checkingId === model.id"
+                :disabled="!model.enabled"
+                :aria-label="tr('checkConnection')"
+                @click="checkConnection(model)"
+              >
+                {{ checkingId === model.id ? tr('checkingConnection') : tr('checkConnection') }}
+              </el-button>
+              <el-switch
+                :model-value="model.enabled"
+                :disabled="model.default"
+                :loading="togglingId === model.id"
+                :aria-label="model.enabled ? tr('enabled') : tr('disabled')"
+                @change="toggleModel(model, Boolean($event))"
+              />
+            </div>
           </footer>
         </article>
       </div>
@@ -137,6 +159,12 @@ type ModelConfig = {
   default?: boolean
 }
 
+type ModelGatewayPreflight = {
+  status: string
+  ready: boolean
+  message: string
+}
+
 const props = withDefaults(
   defineProps<{
     models: ModelConfig[]
@@ -155,6 +183,14 @@ const copy: Record<Language, Record<string, string>> = {
     apiKey: 'API Key（可选）',
     apiKeyPlaceholder: '留空时使用服务端环境变量',
     cancel: '取消',
+    checkConnection: '检查连接',
+    checkingConnection: '正在检查…',
+    connectionConfig: '配置不完整',
+    connectionInvalid: '端点地址无效',
+    connectionPermission: '本机套接字权限被拒绝',
+    connectionReady: '端点可连接（未发送密钥或调用模型）',
+    connectionUnknown: '连接尚未验证',
+    connectionUnreachable: '提供商端点不可达',
     defaultLocked: '系统默认模型不可删除',
     delete: '删除模型',
     deleteBody: '删除后，该模型将不再出现在对话模型列表中。',
@@ -178,6 +214,14 @@ const copy: Record<Language, Record<string, string>> = {
     apiKey: 'API Key (optional)',
     apiKeyPlaceholder: 'Leave empty to use the server environment key',
     cancel: 'Cancel',
+    checkConnection: 'Check connection',
+    checkingConnection: 'Checking…',
+    connectionConfig: 'Configuration incomplete',
+    connectionInvalid: 'Invalid endpoint',
+    connectionPermission: 'Local socket permission denied',
+    connectionReady: 'Endpoint reachable (no key or model call sent)',
+    connectionUnknown: 'Connection not verified',
+    connectionUnreachable: 'Provider endpoint unreachable',
     defaultLocked: 'The system default model cannot be deleted',
     delete: 'Delete model',
     deleteBody: 'This model will no longer appear in the chat model selector.',
@@ -202,8 +246,10 @@ const formOpen = ref(false)
 const saving = ref(false)
 const deletingId = ref('')
 const togglingId = ref('')
+const checkingId = ref('')
 const operationError = ref('')
 const draft = reactive({ name: '', model: '', base_url: '', api_key: '' })
+const preflightById = ref<Record<string, ModelGatewayPreflight>>({})
 
 const enabledModels = computed(() => props.models.filter((model) => model.enabled))
 const canAddModel = computed(() => Boolean(draft.name.trim() && draft.model.trim()))
@@ -232,6 +278,26 @@ async function toggleModel(model: ModelConfig, enabled: boolean) {
     await patchSettings({ configured_models: configuredModels, active_model: selectedModel.value })
   } finally {
     togglingId.value = ''
+  }
+}
+
+async function checkConnection(model: ModelConfig) {
+  if (!model.enabled) return
+  checkingId.value = model.id
+  operationError.value = ''
+  try {
+    const response = await http.post('/model-gateway/preflight', null, { params: { model: model.id } })
+    const result = response.data as ModelGatewayPreflight
+    preflightById.value = { ...preflightById.value, [model.id]: result }
+    if (result.ready) {
+      ElMessage.success(connectionLabel(result))
+    } else {
+      ElMessage.warning(connectionLabel(result))
+    }
+  } catch (error: any) {
+    operationError.value = requestError(error)
+  } finally {
+    checkingId.value = ''
   }
 }
 
@@ -314,6 +380,18 @@ function requestError(error: any) {
   return typeof detail === 'string' ? detail : JSON.stringify(detail || error?.message || 'Request failed')
 }
 
+function connectionLabel(result?: ModelGatewayPreflight) {
+  if (!result) return tr('connectionUnknown')
+  const labels: Record<string, string> = {
+    ready: 'connectionReady',
+    configuration_incomplete: 'connectionConfig',
+    invalid_endpoint: 'connectionInvalid',
+    local_socket_permission_denied: 'connectionPermission',
+    provider_unreachable: 'connectionUnreachable',
+  }
+  return tr(labels[result.status] || 'connectionUnknown')
+}
+
 function slug(value: string) {
   return value.replace(/[^a-zA-Z0-9_]+/g, '_').replace(/^_+|_+$/g, '').toLowerCase() || `model_${Date.now()}`
 }
@@ -331,7 +409,8 @@ function slug(value: string) {
 .model-card-head,
 .model-card-foot,
 .model-meta,
-.form-actions {
+.form-actions,
+.card-actions {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -544,6 +623,34 @@ function slug(value: string) {
   padding: 6px 11px 6px 12px;
   color: var(--text-muted);
   font-size: 11px;
+}
+
+.card-actions {
+  flex: 0 0 auto;
+}
+
+.connection-result {
+  min-height: 20px;
+  margin: 0;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border-soft);
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.connection-ready {
+  color: var(--success, #37a77a);
+}
+
+.connection-configuration_incomplete,
+.connection-invalid_endpoint {
+  color: var(--warning);
+}
+
+.connection-local_socket_permission_denied,
+.connection-provider_unreachable {
+  color: var(--danger, var(--el-color-danger));
 }
 
 @media (max-width: 700px) {

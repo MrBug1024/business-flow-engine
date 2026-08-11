@@ -23,8 +23,10 @@ from app.studio.capabilities.tools import tool_registry
 CapabilityKind = Literal["tool", "mcp"]
 MAX_TOOL_OUTPUT = 32_000
 MAX_DISCOVERY_DESCRIPTION = 500
-MAX_PROMPT_INDEX_ITEMS = 10
-MAX_PROMPT_INDEX_DESCRIPTION = 160
+# Keep the always-visible catalog small. Full capability metadata remains
+# available through discover_studio_capabilities when the request needs it.
+MAX_PROMPT_INDEX_ITEMS = 6
+MAX_PROMPT_INDEX_DESCRIPTION = 120
 
 
 @dataclass(slots=True)

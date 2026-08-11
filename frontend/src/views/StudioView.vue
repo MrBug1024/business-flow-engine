@@ -64,7 +64,7 @@
       @create-business="createOpen = true"
       @refresh="refreshResourceExplorer"
       @request-tree="loadBusinessTree"
-      @open="openBusinessResource"
+      @open="handleBusinessResourceOpen"
       @action="handleBusinessResourceAction"
       @import="importBusinessResourceFiles"
     />
@@ -102,7 +102,7 @@
         <span v-for="(part, index) in breadcrumbs" :key="`${part}-${index}`">{{ part }}</span>
       </nav>
 
-      <section class="editor-body">
+      <section ref="editorBody" class="editor-body">
         <div v-if="!current && activeTab?.kind !== 'settings'" class="empty-editor">
           <el-button type="primary" :icon="Plus" @click="createOpen = true">{{ t('newBusinessScene') }}</el-button>
         </div>
@@ -157,6 +157,18 @@
                 <p v-else class="muted">{{ t('noRun') }}</p>
               </section>
             </div>
+          </section>
+
+          <section v-else-if="activeTab.kind === 'data'" class="editor-panel">
+            <DataCatalog
+              ref="dataCatalogRef"
+              :key="`${current.id}:${dataCatalogRefreshKey}`"
+              :business-id="current.id"
+              :files="current.files || []"
+              :language="uiLanguage"
+              :refresh-token="dataCatalogRefreshKey"
+              @open-artifact="openDataArtifact"
+            />
           </section>
 
           <section v-else-if="activeTab.kind === 'context'" class="editor-panel">
@@ -401,7 +413,7 @@
           <span>{{ t('chatEmptyBody') }}</span>
         </div>
         <article
-          v-for="message in activeMessages"
+          v-for="(message, messageIndex) in activeMessages"
           :key="message.id"
           v-memo="[
             message.id,
@@ -410,6 +422,8 @@
             message.activity_events?.length,
             message.progress?.revision,
             runById[message.run_id]?.status,
+            activeMessages[messageIndex - 1]?.content,
+            isBusy,
           ]"
           class="chat-message"
           :class="[message.role, message.kind]"
@@ -431,13 +445,22 @@
               class="message-copy"
               :title="t('copyReply')"
               :aria-label="t('copyReply')"
-              @click="copyMessage(message.content)"
+              @click="copyMessage(chatMessageContent(message))"
             >
               <el-icon><CopyDocument /></el-icon>
             </button>
           </header>
           <div class="message-body">
-            <MarkdownContent :content="message.content" />
+            <LineageFeedbackCard
+              v-if="lineageFeedbackForMessage(message, messageIndex)"
+              :feedback="lineageFeedbackForMessage(message, messageIndex) || ''"
+              :language="uiLanguage"
+              :busy="isBusy"
+              @choose="sendLineageReviewAnswer"
+              @open-samples="openDataCatalog"
+              @focus-composer="focusLineageFeedbackComposer"
+            />
+            <MarkdownContent v-else :content="chatMessageContent(message)" />
             <AgentActivity
               v-if="message.role === 'assistant' && runById[message.run_id]"
               :plan="messageActivityPlan(message)"
@@ -486,10 +509,22 @@
         :submitting="isSubmittingAnswer"
         :bottom-offset="chatBoxHeight + 8"
         @close="questionDockOpen = false"
+        @open-review="openApprovalReview"
         @submit="submitConfirmation"
       />
 
       <footer ref="chatBoxElement" class="chat-box">
+        <div
+          v-if="failedDistillationContinuation"
+          class="resume-retry"
+          role="alert"
+          :title="t('distillationContinuationFailed')"
+        >
+          <span><el-icon><Refresh /></el-icon>{{ t('distillationContinuationFailed') }}</span>
+          <el-button type="primary" text size="small" :disabled="isBusy" @click="retryFailedDistillationContinuation">
+            {{ t('retryDistillationContinuation') }}
+          </el-button>
+        </div>
         <div
           v-if="pendingResume && pendingResume.businessId === current?.id && pendingResume.sessionId === activeChatSessionId"
           class="resume-retry"
@@ -616,7 +651,7 @@
       </button>
       <span v-else-if="current">0 {{ t('questions') }}</span>
       <span v-if="current">{{ current.packages.length }} {{ t('packages') }}</span>
-      <span class="status-right">{{ activeTab?.id || 'ready' }}</span>
+      <span class="status-right">{{ activeTab?.title || 'ready' }}</span>
     </footer>
 
     <el-dialog v-model="createOpen" :title="t('newBusinessScene')" width="560px">
@@ -672,6 +707,7 @@ import {
 import { http } from '@/api/http'
 import AgentActivity from '@/components/AgentActivity.vue'
 import ClarificationSheet from '@/components/ClarificationSheet.vue'
+import LineageFeedbackCard from '@/components/LineageFeedbackCard.vue'
 import MarkdownContent from '@/components/MarkdownContent.vue'
 import McpSettingsWorkspace from '@/components/McpSettingsWorkspace.vue'
 import ModelSettingsPanel from '@/components/ModelSettingsPanel.vue'
@@ -680,23 +716,34 @@ import ToolSettingsPanel from '@/components/ToolSettingsPanel.vue'
 import WorkspaceMentionMenu, { type MentionFile } from '@/components/WorkspaceMentionMenu.vue'
 import BusinessResourceExplorer from '@/components/studio/BusinessResourceExplorer.vue'
 import AccountMenu from '@/components/studio/AccountMenu.vue'
+import DataCatalog from '@/components/studio/DataCatalog.vue'
 import { useBusinessResourceTrees } from '@/composables/useBusinessResourceTrees'
 import { useBusinessResourceActions } from '@/composables/useBusinessResourceActions'
 import { useResizableStudioPanes } from '@/composables/useResizableStudioPanes'
 import { useLiveWorkspaceFiles } from '@/composables/useLiveWorkspaceFiles'
 import { studioCopy } from '@/composables/studioCopy'
 import type {
+  BusinessResourceTarget,
   Language,
   WorkspaceNode,
 } from '@/types/studio'
 
 type ThemeMode = 'dark' | 'light' | 'contrast'
-type TabKind = 'description' | 'overview' | 'context' | 'file' | 'thinking' | 'outputs' | 'settings'
+type TabKind = 'description' | 'overview' | 'data' | 'context' | 'file' | 'thinking' | 'outputs' | 'settings'
 type Tab = { id: string; title: string; kind: TabKind; payload?: any }
 type StreamTarget = { businessId: string; sessionId: string }
 type PendingResume = StreamTarget & { runId?: string; error: string }
+type FailedDistillationContinuation = StreamTarget & { confirmationId: string }
 type MentionTrigger = { start: number; end: number; query: string }
+type DataCatalogHandle = { flushRoleSaves: () => Promise<void> }
+type ConfirmationPayload = {
+  question: any
+  answer: string
+  optionId?: string
+  optionValue?: string
+}
 const MENTION_RESULT_LIMIT = 30
+const DATA_CATALOG_TAB_ID = 'data'
 
 const copy = studioCopy
 
@@ -722,6 +769,9 @@ const skills = ref<any[]>([])
 const settings = ref<any>({ active_model: '', configured_models: [], installed_tools: [], installed_skills: [], mcp_configs: [] })
 const tabs = ref<Tab[]>([])
 const activeTabId = ref('')
+const dataCatalogRefreshKey = ref(0)
+const dataCatalogRef = ref<DataCatalogHandle | null>(null)
+const editorBody = ref<HTMLElement | null>(null)
 const fileInput = ref<HTMLInputElement | null>(null)
 const folderInput = ref<HTMLInputElement | null>(null)
 const messagesContainer = ref<HTMLElement | null>(null)
@@ -747,9 +797,11 @@ const executionPlan = ref<string[]>([])
 const executionTrace = ref<any[]>([])
 const questionDockOpen = ref(false)
 const activeQuestionId = ref('')
+const lastApprovalErrorKey = ref('')
 const isSubmittingAnswer = ref(false)
 const activeStreamTarget = ref<StreamTarget | null>(null)
 const pendingResume = ref<PendingResume | null>(null)
+const recoveredDistillationContinuations = new Set<string>()
 const chatBoxHeight = ref(96)
 let chatBoxObserver: ResizeObserver | null = null
 
@@ -764,7 +816,7 @@ const {
 } = useResizableStudioPanes(computed(() => activeTab.value?.kind === 'settings'))
 const {
   refreshResourceExplorer,
-  openBusinessResource,
+  openBusinessResource: openWorkspaceResource,
   handleBusinessResourceAction,
   importBusinessResourceFiles,
 } = useBusinessResourceActions({
@@ -801,9 +853,35 @@ const context = computed(() => current.value?.context || emptyContext())
 const chatSessions = computed<any[]>(() => current.value?.chat_sessions || [])
 const activeMessages = computed<any[]>(() => {
   const messages = current.value?.messages || []
-  if (!activeChatSessionId.value) return messages
-  return messages.filter((message: any) => message.session_id === activeChatSessionId.value)
+  return messages.filter((message: any, index: number) => (
+    // System entries are execution context, never a user-facing AI reply.
+    // Filtering also protects chats created before internal continuations
+    // stopped persisting their server-authored prompts.
+    message.role !== 'system'
+    // Do not present a legacy, unsourced relation draft as a valid business
+    // conclusion after the platform has replaced it with a signed retrace.
+    && !isSupersededLineageDraft(message, messages, index)
+    && (!activeChatSessionId.value || message.session_id === activeChatSessionId.value)
+  ))
 })
+
+function isSupersededLineageDraft(message: any, messages: any[], index: number) {
+  if (message?.role !== 'assistant') return false
+  const content = String(message?.content || '')
+  const isLegacyDraft = content.includes('已更新两个复合关联规则')
+    || content.includes('复合关联规则已更新完成')
+    || (
+      content.includes('数据链路追踪 - 复合关联规则更新')
+      && content.includes('复合关联规则')
+    )
+  if (!isLegacyDraft) return false
+  return messages.slice(index + 1).some((next: any) => {
+    if (next?.role !== 'assistant') return false
+    const laterContent = String(next?.content || '')
+    return laterContent.includes('受签名的纠偏记录')
+      || laterContent.includes('当前链路已存在可验证的规则证据')
+  })
+}
 const latestRun = computed(() => {
   const runs = (current.value?.runs || []).filter((run: any) => (
     !activeChatSessionId.value || run.session_id === activeChatSessionId.value
@@ -814,9 +892,35 @@ const runById = computed<Record<string, any>>(() => Object.fromEntries(
   (current.value?.runs || []).map((run: any) => [run.id, run]),
 ))
 const openQuestions = computed(() => (context.value.questions || []).filter((item: any) => (
-  item.status !== 'answered'
-  && (!item.session_id || item.session_id === activeChatSessionId.value)
+  item.status === 'open'
+  && (
+    item.source === 'distillation_approval'
+    || !item.session_id
+    || item.session_id === activeChatSessionId.value
+  )
 )))
+const failedDistillationContinuation = computed<FailedDistillationContinuation | null>(() => {
+  const record = current.value
+  const sessionId = activeChatSessionId.value
+  if (!record || !sessionId) return null
+  const confirmations = Array.isArray(record.context?.confirmations)
+    ? record.context.confirmations
+    : []
+  // Only offer recovery for the newest approval continuation in the active
+  // chat session. A later approval decision is the authoritative next step.
+  const latest = [...confirmations].reverse().find((confirmation: any) => {
+    if (confirmation?.source !== 'distillation_approval') return false
+    const confirmationSessionId = String(
+      confirmation?.continuation_session_id || confirmation?.session_id || '',
+    ).trim()
+    return confirmationSessionId === sessionId
+  })
+  if (latest?.continuation_status !== 'failed') return null
+  const confirmationId = String(latest?.id || '').trim()
+  return confirmationId
+    ? { businessId: record.id, sessionId, confirmationId }
+    : null
+})
 const isBusy = computed(() => isStreaming.value || isSubmittingAnswer.value)
 const modelOptions = computed(() => (settings.value.configured_models || []).filter((item: any) => item.enabled))
 const selectedModelLabel = computed(() => {
@@ -827,6 +931,7 @@ const breadcrumbs = computed(() => {
   const root = current.value?.name || 'AI Business Studio'
   if (!activeTab.value) return [root]
   if (activeTab.value.id === 'overview') return [root]
+  if (activeTab.value.kind === 'data') return [root, activeTab.value.title]
   return [root, ...activeTab.value.id.split('/')]
 })
 const workspaceMentionFiles = computed<MentionFile[]>(() => {
@@ -884,14 +989,20 @@ watch(themeMode, () => {
   applyDocumentTheme()
 })
 
-watch(openQuestions, (questions) => {
+watch([openQuestions, questionDockOpen], ([questions]) => {
   if (!questions.length) {
     questionDockOpen.value = false
     activeQuestionId.value = ''
+    return
+  }
+  const approvalQuestion = questions.find((question: any) => question.source === 'distillation_approval')
+  if (approvalQuestion) {
+    activeQuestionId.value = approvalQuestion.id
+    questionDockOpen.value = true
   } else if (!questions.some((question: any) => question.id === activeQuestionId.value)) {
     activeQuestionId.value = questions[0].id
   }
-})
+}, { immediate: true })
 
 watch(() => current.value?.id, resetComposerFileReferences)
 watch(activeChatSessionId, resetComposerFileReferences)
@@ -1039,6 +1150,7 @@ async function selectBusiness(id: string) {
   if (isBusy.value) return
   clearLiveFileDrafts()
   current.value = (await http.get(`/businesses/${id}`)).data
+  surfaceApprovalError(current.value)
   activeChatSessionId.value = preferredChatSessionId(current.value)
   tabs.value = []
   await refreshWorkspace()
@@ -1052,16 +1164,78 @@ async function refreshCurrent() {
   if (!current.value) return
   const previousSessionId = activeChatSessionId.value
   current.value = (await http.get(`/businesses/${current.value.id}`)).data
+  surfaceApprovalError(current.value)
   activeChatSessionId.value = chatSessionExists(current.value, previousSessionId)
     ? previousSessionId
     : preferredChatSessionId(current.value)
+  await recoverUnfinishedDistillationContinuation()
   await loadBusinesses()
+}
+
+function unfinishedLineageContinuation(record: any) {
+  const state = record?.distillation || {}
+  const currentPhase = String(state.current_phase || '')
+  if (currentPhase !== 'data_lineage') return null
+  const approvals = new Map<string, any>(
+    (state.approvals || []).map((approval: any) => [String(approval?.id || ''), approval]),
+  )
+  const confirmations = Array.isArray(record?.context?.confirmations)
+    ? [...record.context.confirmations].reverse()
+    : []
+  return confirmations.find((confirmation: any) => {
+    if (confirmation?.source !== 'distillation_approval') return false
+    if (confirmation?.decision !== 'rejected') return false
+    // A blank state exists only on approvals created before platform-owned
+    // continuations were introduced. Never replay a terminal continuation.
+    if (confirmation?.continuation_status) return false
+    const approval = approvals.get(String(confirmation?.approval_id || ''))
+    return approval?.phase === currentPhase && approval?.decision === 'rejected'
+  }) || null
+}
+
+async function recoverUnfinishedDistillationContinuation() {
+  const record = current.value
+  const confirmation = unfinishedLineageContinuation(record)
+  if (!record || !confirmation || isBusy.value) return
+  const confirmationId = String(confirmation.id || '').trim()
+  if (!confirmationId || recoveredDistillationContinuations.has(confirmationId)) return
+  const storedSessionId = String(confirmation.session_id || '').trim()
+  const sessionId = chatSessionExists(record, storedSessionId)
+    ? storedSessionId
+    : activeChatSessionId.value
+  if (!sessionId || !chatSessionExists(record, sessionId)) return
+  recoveredDistillationContinuations.add(confirmationId)
+  if (sessionId !== activeChatSessionId.value) {
+    activeChatSessionId.value = sessionId
+    localStorage.setItem(`studio.chatSession.${record.id}`, sessionId)
+  }
+  await continueDistillation(confirmationId, {
+    businessId: record.id,
+    sessionId,
+  })
+}
+
+function surfaceApprovalError(record: any) {
+  const state = record?.distillation
+  const phase = String(state?.current_phase || '')
+  const contract = state?.artifact_contracts?.[phase]
+  const code = String(contract?.approval_error_code || '')
+  const detail = String(contract?.detail || '').trim()
+  if (!code) {
+    lastApprovalErrorKey.value = ''
+    return
+  }
+  const key = `${record?.id || ''}:${state?.revision || ''}:${phase}:${code}:${detail}`
+  if (key === lastApprovalErrorKey.value) return
+  lastApprovalErrorKey.value = key
+  ElMessage.error(`${uiLanguage.value === 'zh' ? '审批弹窗未能打开' : 'Approval dialog could not open'}：${detail || code}`)
 }
 
 async function refreshWorkspace() {
   if (!current.value) return
   await refreshCurrent()
   await reloadWorkspaceTree()
+  dataCatalogRefreshKey.value += 1
 }
 
 async function reloadWorkspaceTree() {
@@ -1142,11 +1316,16 @@ async function uploadFiles(event: Event) {
     form.append('files', file, file.name)
     form.append('paths', relativePath)
   })
-  current.value = (await http.post(`/businesses/${current.value.id}/files`, form)).data
-  input.value = ''
-  await refreshWorkspace()
-  openContext()
-  ElMessage.success(t('uploadSuccess'))
+  form.append('target_path', 'data')
+  try {
+    const response = await http.post(`/businesses/${current.value.id}/workspace/import`, form)
+    current.value = response.data.business
+    await refreshWorkspace()
+    openDataCatalog()
+    ElMessage.success(t('uploadSuccess'))
+  } finally {
+    input.value = ''
+  }
 }
 
 function openDescription() {
@@ -1157,12 +1336,40 @@ function openOverview() {
   openTab({ id: 'overview', title: current.value?.name || t('workspace'), kind: 'overview' })
 }
 
+async function handleBusinessResourceOpen(target: BusinessResourceTarget) {
+  if (isBusy.value) return
+  if (!target.root && target.node.kind === 'folder' && normalizeWorkspacePath(target.node.path) === 'data') {
+    await openDataCatalog(target.businessId)
+    return
+  }
+  await openWorkspaceResource(target)
+}
+
+async function openDataCatalog(businessId?: string) {
+  if (businessId && businessId !== current.value?.id) await selectBusiness(businessId)
+  if (!current.value) return
+  openTab({
+    id: DATA_CATALOG_TAB_ID,
+    title: uiLanguage.value === 'zh' ? 'data · 文件、表格与字段' : 'data · Files, tables, and fields',
+    kind: 'data',
+  })
+  await nextTick()
+  editorBody.value?.scrollTo({ top: 0 })
+}
+
+async function openDataArtifact(path: string) {
+  const normalized = String(path || '').replace(/\\/g, '/').replace(/^\/+/, '')
+  if (!normalized) return
+  const name = normalized.split('/').filter(Boolean).pop() || normalized
+  await openWorkspaceFile({ name, path: normalized })
+}
+
 function openContext() {
   openTab({ id: 'context/business_context.json', title: 'business_context.json', kind: 'context' })
 }
 
 async function openFile(file: any) {
-  await openWorkspaceFile({ name: file.filename, path: `data/${file.filename}` })
+  await openWorkspaceFile({ name: file.filename, path: file.workspace_path || `data/${file.filename}` })
 }
 
 function openThinking() {
@@ -1247,6 +1454,10 @@ function compareMentionFiles(left: MentionFile, right: MentionFile) {
 
 function normalizeMentionQuery(value: string) {
   return value.trim().toLocaleLowerCase()
+}
+
+function normalizeWorkspacePath(value: string) {
+  return value.trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')
 }
 
 function mentionMatchScore(file: MentionFile, query: string) {
@@ -1346,17 +1557,23 @@ function composeChatMessage() {
   return `${prompt}${prompt ? '\n\n' : ''}${t('referencedFilesPrompt')}\n${references}`
 }
 
-async function sendChat() {
-  if (!current.value || !activeChatSessionId.value || !canSendChat.value || isBusy.value) return
+async function sendChat(quickAnswer = '') {
+  const directMessage = String(quickAnswer || '').trim()
+  if (!current.value || !activeChatSessionId.value || (!directMessage && !canSendChat.value) || isBusy.value) return
+  const selectedBusinessId = current.value.id
+  await dataCatalogRef.value?.flushRoleSaves()
+  if (!current.value || current.value.id !== selectedBusinessId || isBusy.value) return
   const target: StreamTarget = {
     businessId: current.value.id,
     sessionId: activeChatSessionId.value,
   }
-  const message = composeChatMessage()
-  chatDraft.value = ''
-  resetComposerFileReferences()
-  await nextTick()
-  resizeComposer()
+  const message = directMessage || composeChatMessage()
+  if (!directMessage) {
+    chatDraft.value = ''
+    resetComposerFileReferences()
+    await nextTick()
+    resizeComposer()
+  }
   current.value.messages = [
     ...(current.value.messages || []),
     {
@@ -1475,6 +1692,23 @@ async function streamResume(target: StreamTarget, runId: string | undefined, sig
   await consumeAgentStream(response)
 }
 
+async function streamDistillationContinuation(
+  confirmationId: string,
+  target: StreamTarget,
+  signal: AbortSignal,
+) {
+  const response = await fetch(
+    `/api/businesses/${target.businessId}/confirmations/${encodeURIComponent(confirmationId)}/continue/stream`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: selectedModel.value }),
+      signal,
+    },
+  )
+  await consumeAgentStream(response)
+}
+
 async function consumeAgentStream(response: Response) {
   if (!response.ok || !response.body) {
     let detail = `stream failed: ${response.status}`
@@ -1574,6 +1808,80 @@ function handleSseEvent(raw: string) {
   return event.type as string
 }
 
+async function continueDistillation(
+  confirmationId: string,
+  requestedTarget?: StreamTarget,
+) {
+  if (!current.value || !activeChatSessionId.value || isBusy.value) return
+  const target = requestedTarget || {
+    businessId: current.value.id,
+    sessionId: activeChatSessionId.value,
+  }
+  if (!isCurrentStreamTarget(target)) return
+  resetAgentActivity()
+  isStreaming.value = true
+  activeStreamTarget.value = target
+  autoFollowMessages.value = true
+  streamingAssistant.value = 'Platform is applying the review decision...'
+  streamAbortController.value = new AbortController()
+  await scrollMessages(true)
+  try {
+    await streamDistillationContinuation(
+      confirmationId,
+      target,
+      streamAbortController.value.signal,
+    )
+  } catch (error: any) {
+    if (error?.name !== 'AbortError') {
+      ElMessage.error(uiLanguage.value === 'zh'
+        ? '审批已记录，但后续处理暂未完成。当前审核结果会保留，请稍后重试。'
+        : 'The review was recorded, but the follow-up did not finish. The review remains saved; please try again shortly.')
+    }
+  } finally {
+    streamAbortController.value = null
+    isStreaming.value = false
+    if (isCurrentStreamTarget(target)) {
+      await refreshWorkspace()
+      await settleLiveFileOperations()
+    }
+    if (activeStreamTarget.value?.businessId === target.businessId
+      && activeStreamTarget.value?.sessionId === target.sessionId) {
+      activeStreamTarget.value = null
+    }
+    streamingAssistant.value = ''
+    await scrollMessages(true)
+  }
+}
+
+function isOpenDistillationApproval(question: any) {
+  return question?.source === 'distillation_approval' && question?.status === 'open'
+}
+
+function mergeStreamContext(incomingContext: any) {
+  if (!current.value || !incomingContext || typeof incomingContext !== 'object') return
+  const localContext = current.value.context && typeof current.value.context === 'object'
+    ? current.value.context
+    : emptyContext()
+  const localQuestions = Array.isArray(localContext.questions) ? localContext.questions : []
+  const hasIncomingQuestions = Array.isArray(incomingContext.questions)
+  const incomingQuestions = hasIncomingQuestions ? incomingContext.questions : localQuestions
+  const incomingQuestionIds = new Set(incomingQuestions
+    .map((question: any) => String(question?.id || '').trim())
+    .filter(Boolean))
+  const approvalsMissingFromDone = localQuestions.filter((question: any) => (
+    isOpenDistillationApproval(question)
+    && !incomingQuestionIds.has(String(question.id || '').trim())
+  ))
+
+  current.value.context = {
+    ...localContext,
+    ...incomingContext,
+    questions: approvalsMissingFromDone.length
+      ? [...incomingQuestions, ...approvalsMissingFromDone]
+      : incomingQuestions,
+  }
+}
+
 function handleRunEvent(event: any) {
   if (activeStreamTarget.value && !isCurrentStreamTarget(activeStreamTarget.value)) return
   if (event.type === 'message' && event.message && current.value) {
@@ -1630,8 +1938,17 @@ function handleRunEvent(event: any) {
   ].includes(event.type)) {
     upsertTraceEvent(event)
   } else if (event.type === 'question') {
-    if (event.question && !context.value.questions.some((question: any) => question.id === event.question.id)) {
-      current.value.context.questions.push(event.question)
+    if (event.question) {
+      const currentContext = current.value?.context || emptyContext()
+      const questions = Array.isArray(currentContext.questions) ? currentContext.questions : []
+      const questionIndex = questions.findIndex((question: any) => question.id === event.question.id)
+      if (questionIndex >= 0) {
+        questions[questionIndex] = {
+          ...questions[questionIndex],
+          ...event.question,
+        }
+      } else questions.push(event.question)
+      if (current.value) current.value.context = { ...currentContext, questions }
     }
     activeQuestionId.value = event.question?.id || activeQuestionId.value
     questionDockOpen.value = true
@@ -1641,7 +1958,7 @@ function handleRunEvent(event: any) {
   } else if (event.type === 'done') {
     streamCompleted.value = true
     streamingAssistant.value = ''
-    if (current.value && event.context) current.value.context = event.context
+    if (current.value && event.context) mergeStreamContext(event.context)
     if (current.value && event.assistant_message) {
       const index = (current.value.messages || []).findIndex((message: any) => message.id === event.assistant_message.id)
       if (index >= 0) current.value.messages[index] = event.assistant_message
@@ -1669,6 +1986,104 @@ function handleRunEvent(event: any) {
   }
 }
 
+function chatMessageContent(message: any) {
+  const content = String(message?.content || '')
+  const transportFailure = hasTransportDetail(content)
+  const internalFailure = hasInternalFailureDetail(content)
+  if (message?.role !== 'assistant' || message?.kind !== 'error' || (!transportFailure && !internalFailure)) {
+    return content
+  }
+  const safeDetail = uiLanguage.value === 'zh'
+    ? '模型服务连接暂时不可用，当前审核结果和工作检查点已保留。请稍后重试；如果持续发生，请检查模型服务配置和网络连接。'
+    : 'The model service is temporarily unavailable. Your review and current checkpoint are saved; please try again shortly.'
+  const internalSafeDetail = uiLanguage.value === 'zh'
+    ? '平台内部处理未完成，当前检查点已保留。请继续重试。'
+    : 'The platform could not complete an internal operation. Your current checkpoint is saved; please retry.'
+  const replacementDetail = internalFailure ? internalSafeDetail : safeDetail
+  // Retain any saved progress/next-step language from legacy records, but
+  // never expose the host, socket, or provider exception embedded in it.
+  const replaced = content.replace(
+    /(中断原因：)[\s\S]*?(?=\n\n(?:继续处理时|已有消息))/,
+    `$1${replacementDetail}`,
+  )
+  return replaced === content ? replacementDetail : replaced
+}
+
+function hasTransportDetail(content: string) {
+  const lowered = content.toLocaleLowerCase()
+  return [
+    'socket',
+    'getaddrinfo',
+    'connection refused',
+    'connection reset',
+    'connection aborted',
+    'connecterror',
+    'connect error',
+    'econn',
+    'errno',
+    'winerror',
+    'httpx',
+    'http://',
+    'https://',
+    'ssl',
+    'tls',
+    'certificate',
+    'timed out',
+    'timeout',
+    'remote protocol',
+    'network is unreachable',
+  ].some((marker) => lowered.includes(marker))
+}
+
+function hasInternalFailureDetail(content: string) {
+  const lowered = content.toLocaleLowerCase()
+  return [
+    ' object has no attribute ',
+    'attributeerror:',
+    'typeerror:',
+    'keyerror:',
+    'indexerror:',
+    'assertionerror:',
+    'nameerror:',
+    'traceback (most recent call last)',
+  ].some((marker) => lowered.includes(marker))
+}
+
+function lineageFeedbackForMessage(message: any, messageIndex: number) {
+  if (message?.role !== 'assistant') return ''
+  const content = String(message?.content || '')
+  const isTechnicalClarification = content.includes('源表.源字段')
+    || content.includes('我需要把纠偏唯一映射')
+    || (content.includes('当前可用') && content.includes('字段：'))
+  if (!isTechnicalClarification) return ''
+  for (let index = messageIndex - 1; index >= 0; index -= 1) {
+    const previous = activeMessages.value[index]
+    if (previous?.role === 'user' && String(previous?.content || '').trim()) {
+      return String(previous.content)
+    }
+  }
+  return ''
+}
+
+async function sendLineageReviewAnswer(answer: string) {
+  const normalized = String(answer || '').trim()
+  if (!normalized || isBusy.value) return
+  await sendChat(normalized)
+}
+
+async function focusLineageFeedbackComposer() {
+  if (isBusy.value) return
+  if (!chatDraft.value.trim()) {
+    chatDraft.value = uiLanguage.value === 'zh'
+      ? '补充：请说明该复合关联在什么情况下应匹配，或哪些情况可以忽略。'
+      : 'Additional detail: describe when this composite relationship should match, or which cases can be ignored.'
+  }
+  await nextTick()
+  composerInput.value?.focus()
+  composerInput.value?.setSelectionRange(chatDraft.value.length, chatDraft.value.length)
+  resizeComposer()
+}
+
 function messageActivityEvents(message: any) {
   if (['progress', 'final', 'error'].includes(String(message?.kind || ''))) {
     return Array.isArray(message?.activity_events) ? message.activity_events : []
@@ -1694,6 +2109,12 @@ async function retryPendingResume() {
   const retry = pendingResume.value
   if (!retry || !isCurrentStreamTarget(retry) || isBusy.value) return
   await resumeAgent(retry.runId, retry)
+}
+
+async function retryFailedDistillationContinuation() {
+  const retry = failedDistillationContinuation.value
+  if (!retry || !isCurrentStreamTarget(retry) || isBusy.value) return
+  await continueDistillation(retry.confirmationId, retry)
 }
 
 function upsertTraceEvent(event: any) {
@@ -1725,36 +2146,97 @@ function startConfirm(question: any) {
 
 function openQuestionDock() {
   if (!openQuestions.value.length) return
-  activeQuestionId.value = openQuestions.value[0].id
+  const approvalQuestion = openQuestions.value.find((question: any) => question.source === 'distillation_approval')
+  activeQuestionId.value = approvalQuestion?.id || openQuestions.value[0].id
   questionDockOpen.value = true
 }
 
-async function submitConfirmation(payload: { question: any; answer: string }) {
-  if (!current.value || !payload.answer.trim() || isSubmittingAnswer.value) return
+async function openApprovalReview(question: any) {
+  const approvalQuestionId = String(question?.id || '').trim()
+  const reviewTarget = question?.approval?.authority?.review_target
+    || question?.review_target
+    || question?.approval?.review_target
+  if (reviewTarget?.kind === 'data_catalog') {
+    try {
+      await openDataCatalog(current.value?.id)
+      // The approval is authoritative only after its persisted state has been
+      // re-read.  Force the catalog to pick up any just-created samples too.
+      await refreshCurrent()
+      dataCatalogRefreshKey.value += 1
+    } catch (error: any) {
+      ElMessage.error(error?.response?.data?.detail || error?.message || 'Unable to open the approval review')
+    } finally {
+      keepApprovalQuestionVisible(approvalQuestionId)
+    }
+    return
+  }
+  if (reviewTarget?.kind === 'workspace_file') {
+    const path = String(reviewTarget.path || question?.approval?.artifact_id || '').trim()
+    try {
+      if (path) await openDataArtifact(path)
+    } finally {
+      keepApprovalQuestionVisible(approvalQuestionId)
+    }
+  }
+}
+
+function keepApprovalQuestionVisible(questionId = '') {
+  const question = openQuestions.value.find((item: any) => (
+    item.source === 'distillation_approval'
+    && (!questionId || item.id === questionId)
+  )) || openQuestions.value.find((item: any) => item.source === 'distillation_approval')
+  if (!question) return
+  activeQuestionId.value = question.id
+  questionDockOpen.value = true
+}
+
+async function submitConfirmation(payload: ConfirmationPayload) {
+  const isApproval = payload.question?.source === 'distillation_approval'
+  if (
+    !current.value
+    || (!isApproval && !payload.answer.trim())
+    || (isApproval && !payload.optionValue)
+    || isSubmittingAnswer.value
+  ) return
+  const owningSessionId = isApproval
+    ? String(payload.question?.session_id || '').trim()
+    : ''
+  if (owningSessionId && owningSessionId !== activeChatSessionId.value) {
+    activeChatSessionId.value = owningSessionId
+    localStorage.setItem(`studio.chatSession.${current.value.id}`, owningSessionId)
+  }
   const target: StreamTarget = {
     businessId: current.value.id,
-    sessionId: activeChatSessionId.value,
+    sessionId: owningSessionId || activeChatSessionId.value,
   }
   isSubmittingAnswer.value = true
   const answeredId = payload.question.id
   let resumeRunId = payload.question.run_id as string | undefined
   let shouldResume = false
+  let continuationId = ''
   try {
     const response = await http.post(`/businesses/${target.businessId}/confirmations`, {
       question_id: answeredId,
       session_id: target.sessionId || undefined,
       answer: payload.answer.trim(),
-      accepted: true,
+      option_id: payload.optionId,
+      accepted: isApproval ? payload.optionValue !== 'rejected' : true,
     })
     if (!isCurrentStreamTarget(target)) return
     current.value.context = response.data.context
+    if (response.data.distillation) current.value.distillation = response.data.distillation
     resumeRunId = response.data.resume?.run_id || resumeRunId
     const remaining = openQuestions.value
     const resumeReady = response.data.resume?.ready === true
       || (response.data.resume == null && !remaining.length)
+    const continuationReady = response.data.continue?.ready === true
+      && typeof response.data.continue?.confirmation_id === 'string'
     if (resumeReady) {
       questionDockOpen.value = false
       shouldResume = true
+    } else if (continuationReady) {
+      questionDockOpen.value = false
+      continuationId = response.data.continue.confirmation_id
     } else {
       const sameRunQuestions = resumeRunId
         ? remaining.filter((question: any) => question.run_id === resumeRunId)
@@ -1771,6 +2253,7 @@ async function submitConfirmation(payload: { question: any; answer: string }) {
     isSubmittingAnswer.value = false
   }
   if (shouldResume) await resumeAgent(resumeRunId, target)
+  else if (continuationId) await continueDistillation(continuationId, target)
 }
 
 async function setActiveModel() {

@@ -18,6 +18,7 @@ def run_agent(
     *,
     requested_model: str | None = None,
     user_prompt: str | None = None,
+    prompt_role: str = "user",
     include_history: bool = True,
     resume_payload: dict[str, Any] | None = None,
 ) -> Iterator[dict[str, Any]]:
@@ -26,6 +27,7 @@ def run_agent(
         run,
         requested_model=requested_model,
         user_prompt=user_prompt,
+        prompt_role=prompt_role,
         include_history=include_history,
         resume_payload=resume_payload,
     )

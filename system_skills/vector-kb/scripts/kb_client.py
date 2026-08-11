@@ -237,7 +237,7 @@ if __name__ == "__main__":
     limit = int(sys.argv[2]) if len(sys.argv) > 2 else 5
 
     result = search_kb(question, limit=limit)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    print(json.dumps(result, ensure_ascii=True, indent=2))
     if result["status"] in {"success", "no_results"}:
         print(_pretty(result["data"]), file=sys.stderr)
         sys.exit(0)

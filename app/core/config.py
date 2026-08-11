@@ -44,6 +44,9 @@ class Settings(BaseSettings):
 
     # Account sessions and email verification.
     jwt_secret: str = "change-me-in-production-please"
+    # Used only to sign server-issued evidence-review receipts.  It is never
+    # persisted in a business workspace or generated capability package.
+    business_flow_platform_approval_hmac_key: str = ""
     jwt_expire_hours: int = 168
     auth_cookie_name: str = "studio_session"
     auth_cookie_secure: bool = False
@@ -63,7 +66,7 @@ class Settings(BaseSettings):
     mail_timeout_seconds: int = 20
 
     host: str = "127.0.0.1"
-    port: int = 8000
+    port: int = 8089
 
     mcp_public_base_url: str = ""
     mcp_access_token: str = ""

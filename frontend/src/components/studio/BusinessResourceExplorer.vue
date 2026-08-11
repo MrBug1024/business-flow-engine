@@ -181,6 +181,7 @@ const copy = {
 }
 
 const text = computed(() => copy[props.language])
+
 const rows = computed<ResourceRow[]>(() => props.businesses.flatMap((business) => {
   const root = targetForBusiness(business)
   const result: ResourceRow[] = [{ key: `business:${business.id}`, target: root, depth: 0 }]

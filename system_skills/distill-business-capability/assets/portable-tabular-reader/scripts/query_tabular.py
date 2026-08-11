@@ -241,15 +241,39 @@ def register_contract_source(
     header_row = max(0, int(header.get("header_row", 0)))
     if extension in {".xlsx", ".xls", ".xlsb"}:
         sheet = str(table.get("sheet_or_table", "")) or excel_sheets(path)[0]
-        column_count = max(1, int(table.get("column_count", 1)))
-        row_count = table.get("row_count")
-        end_row = header_row + 1 + int(row_count) if isinstance(row_count, int) and row_count >= 0 else 1_048_576
-        cell_range = f"A{header_row + 1}:{excel_column_name(column_count)}{end_row}"
         escaped_sheet = sheet.replace("'", "''")
         try:
+            # A design-time row_count/column_count describes the historical sample,
+            # not the current batch.  Bounding read_xlsx with those values silently
+            # drops newly arrived rows and columns.  Header-row-zero workbooks can be
+            # read without a range; for offset headers, derive the physical sheet
+            # dimensions from the workbook metadata through fastexcel instead of
+            # reusing historical dimensions.
+            range_clause = ""
+            if header_row:
+                try:
+                    import fastexcel
+
+                    reader = fastexcel.read_excel(str(path))
+                    sheet_reader = reader.load_sheet_by_name(sheet)
+                    physical_last_row = max(1, int(sheet_reader.total_height) + 1)
+                    physical_width = max(1, int(sheet_reader.width))
+                    if header_row + 1 > physical_last_row:
+                        raise ReaderError(
+                            f"Excel header row {header_row} is outside the runtime sheet: {source.get('source_id', '')}"
+                        )
+                    range_clause = (
+                        f", range='A{header_row + 1}:{excel_column_name(physical_width)}{physical_last_row}'"
+                    )
+                except ReaderError:
+                    raise
+                except Exception as exc:
+                    raise ReaderError(
+                        "Excel with a non-zero header row requires fastexcel workbook dimensions"
+                    ) from exc
             connection.execute(
                 f"CREATE VIEW {quoted_relation} AS SELECT * FROM read_xlsx('{escaped_path}', "
-                f"sheet='{escaped_sheet}', range='{cell_range}', header=true, all_varchar=true, ignore_errors=true)"
+                f"sheet='{escaped_sheet}'{range_clause}, header=true, all_varchar=true)"
             )
             connection.execute(f"SELECT * FROM {quoted_relation} LIMIT 0")
             return {
@@ -277,17 +301,17 @@ def register_contract_source(
     if extension == ".csv":
         connection.execute(
             f"CREATE VIEW {quoted_relation} AS SELECT * FROM read_csv_auto('{escaped_path}', "
-            f"skip={header_row}, header=true, sample_size=20000, ignore_errors=true)"
+            f"skip={header_row}, header=true, sample_size=20000)"
         )
     elif extension == ".tsv":
         connection.execute(
             f"CREATE VIEW {quoted_relation} AS SELECT * FROM read_csv_auto('{escaped_path}', delim='\\t', "
-            f"skip={header_row}, header=true, sample_size=20000, ignore_errors=true)"
+            f"skip={header_row}, header=true, sample_size=20000)"
         )
     elif extension == ".parquet":
         connection.execute(f"CREATE VIEW {quoted_relation} AS SELECT * FROM read_parquet('{escaped_path}')")
     elif extension in {".json", ".jsonl", ".ndjson"}:
-        connection.execute(f"CREATE VIEW {quoted_relation} AS SELECT * FROM read_json_auto('{escaped_path}', ignore_errors=true)")
+        connection.execute(f"CREATE VIEW {quoted_relation} AS SELECT * FROM read_json_auto('{escaped_path}')")
     else:
         raise ReaderError(f"Contract multi-source query does not support {extension}")
     return {
@@ -662,7 +686,12 @@ def export_contract(
         "status": "success", "mode": "complete_result_export",
         "output": str(output), "format": extension.lstrip("."),
         "row_count": exported_rows, "size_bytes": output.stat().st_size,
-        "output_sha256": digest.hexdigest(), "query_digest": query_digest(safe_sql),
+        "output_sha256": digest.hexdigest(),
+        "artifact": {
+            "kind": "exported_query_result", "path": str(output),
+            "format": extension.lstrip("."), "sha256": digest.hexdigest(),
+        },
+        "query_digest": query_digest(safe_sql),
         "registrations": registrations, "join_validations": validations,
         "agent_context_policy": "Result rows were written to a file and were not loaded into Agent context.",
     }
@@ -1030,15 +1059,15 @@ def run(argv: Sequence[str] | None = None) -> dict[str, Any]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
     try:
         payload = run(argv)
         code = 0
     except Exception as exc:
         payload = {"status": "error", "message": str(exc)}
         code = 2
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    # stdout crosses a host-platform boundary; ASCII JSON survives both UTF-8
+    # and legacy GBK decoders.  Files written by this tool remain UTF-8.
+    print(json.dumps(payload, ensure_ascii=True, indent=2))
     return code
 
 

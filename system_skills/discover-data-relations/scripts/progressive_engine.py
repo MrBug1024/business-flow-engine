@@ -31,7 +31,7 @@ from xml.etree import ElementTree
 
 
 SCHEMA_VERSION = 5
-TABULAR_EXTENSIONS = {".csv", ".tsv", ".xlsx", ".jsonl", ".ndjson", ".parquet", ".sqlite", ".sqlite3", ".db"}
+TABULAR_EXTENSIONS = {".csv", ".tsv", ".xlsx", ".xls", ".jsonl", ".ndjson", ".parquet", ".sqlite", ".sqlite3", ".db"}
 TEXT_EXTENSIONS = {".txt", ".md", ".markdown", ".log", ".sql", ".json", ".xml", ".html", ".htm", ".yaml", ".yml", ".ini", ".cfg", ".conf"}
 DOCUMENT_EXTENSIONS = TEXT_EXTENSIONS | {".pdf", ".docx", ".pptx"}
 OCR_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
@@ -543,6 +543,14 @@ def _fastexcel() -> Any | None:
     return fastexcel
 
 
+def _xlrd() -> Any | None:
+    try:
+        import xlrd
+    except ImportError:
+        return None
+    return xlrd
+
+
 HEADER_HINTS = (
     "id", "编号", "编码", "代码", "名称", "姓名", "类型", "类别", "日期", "时间",
     "金额", "数量", "单价", "比例", "状态", "标志", "规则", "政策", "清单", "分类",
@@ -831,6 +839,49 @@ def inspect_xlsx(file_id: int, relative: str, path: Path) -> list[TableMeta]:
     return tables
 
 
+def inspect_xls(file_id: int, relative: str, path: Path) -> list[TableMeta]:
+    """Inspect a legacy BIFF workbook through bounded, on-demand sheet samples."""
+    xlrd = _xlrd()
+    if xlrd is None:
+        raise RuntimeError(
+            "Legacy XLS requires xlrd; install xlrd>=2.0 or convert the workbook to XLSX/CSV"
+        )
+    workbook = xlrd.open_workbook(path, on_demand=True)
+    tables: list[TableMeta] = []
+    try:
+        for sheet_index in range(workbook.nsheets):
+            worksheet = workbook.sheet_by_index(sheet_index)
+            sampled_width = min(MAX_HEADER_SAMPLE_COLUMNS, max(0, int(worksheet.ncols)))
+            sampled_rows = [
+                worksheet.row_values(row_index, start_colx=0, end_colx=sampled_width)
+                for row_index in range(min(int(worksheet.nrows), HEADER_SAMPLE_ROWS))
+            ]
+            header_row, header_confidence = detect_header_row(sampled_rows)
+            headers = (
+                list(sampled_rows[header_row])
+                if sampled_rows and header_row < len(sampled_rows)
+                else []
+            )
+            columns = make_columns(headers)
+            data_rows = max(0, int(worksheet.nrows) - header_row - 1)
+            tables.append(TableMeta(
+                f"{file_id}:{worksheet.name}",
+                file_id,
+                relative,
+                worksheet.name,
+                data_rows,
+                int(worksheet.ncols),
+                columns,
+                "xlrd",
+                header_row,
+                header_confidence,
+                f"xlrd_sampled_first_{HEADER_SAMPLE_ROWS}_rows",
+            ))
+    finally:
+        workbook.release_resources()
+    return tables
+
+
 def inspect_csv(file_id: int, relative: str, path: Path) -> list[TableMeta]:
     encoding = detect_encoding(path)
     with path.open("r", encoding=encoding, errors="replace", newline="") as stream:
@@ -917,6 +968,8 @@ def inventory(input_root: Path, goal: set[str]) -> tuple[list[FileMeta], list[st
                 item.tables = inspect_csv(file_id, relative, path)
             elif extension == ".xlsx":
                 item.tables = inspect_xlsx(file_id, relative, path)
+            elif extension == ".xls":
+                item.tables = inspect_xls(file_id, relative, path)
             elif extension in {".jsonl", ".ndjson"}:
                 item.tables = inspect_jsonl(file_id, relative, path)
             elif extension in {".sqlite", ".sqlite3", ".db"}:
@@ -1025,6 +1078,31 @@ def iter_table_rows(
                 pass
             finally:
                 connection.close()
+    if path.suffix.casefold() == ".xls":
+        xlrd = _xlrd()
+        if xlrd is None:
+            raise RuntimeError(
+                "Legacy XLS requires xlrd; install xlrd>=2.0 or convert the workbook to XLSX/CSV"
+            )
+        workbook = xlrd.open_workbook(path, on_demand=True)
+        try:
+            worksheet = workbook.sheet_by_name(table.table_name)
+            first_row = table.header_row + 1 + max(0, int(start_offset))
+            last_row = int(worksheet.nrows)
+            if row_limit is not None:
+                last_row = min(last_row, first_row + max(0, int(row_limit)))
+            for row_index in range(first_row, last_row):
+                yield row_index + 1, {
+                    column.name: (
+                        worksheet.cell_value(row_index, column.index)
+                        if column.index < int(worksheet.ncols)
+                        else None
+                    )
+                    for column in selected
+                }
+        finally:
+            workbook.release_resources()
+        return
     if table.engine in {"duckdb-parquet"}:
         duckdb = _duckdb()
         if duckdb is None:
@@ -1229,6 +1307,7 @@ class ProgressiveAnalyzer:
         self.partial_table: dict[str, Any] | None = None
         self.scan_stats: dict[str, dict[str, Any]] = {}
         self.warnings: list[str] = []
+        self.coverage_incomplete = False
         self.phase_timings: dict[str, float] = {}
         self.signature = ""
         self.resumed = False
@@ -1242,6 +1321,10 @@ class ProgressiveAnalyzer:
         self.files, inventory_warnings = inventory(self.input_root, goal)
         self.phase_timings["inventory_seconds"] = round(time.perf_counter() - started, 3)
         self.warnings.extend(inventory_warnings)
+        self.coverage_incomplete = any(
+            item.extension == ".xls" and item.inventory_status != "ok"
+            for item in self.files
+        )
         self.file_by_id = {item.id: item for item in self.files}
         self.tables = {table.key: table for item in self.files for table in item.tables}
         signature_input = "\n".join(f"{item.path}\0{item.size}\0{item.mtime_ns}\0{item.sha256}" for item in self.files)
@@ -1713,8 +1796,11 @@ class ProgressiveAnalyzer:
             "engine": "fastexcel+pyarrow",
             "elapsed_seconds": round(time.perf_counter() - started, 3),
         }
-        self.check_deadline()
+        # Persist a completed Arrow batch before observing the wall-clock
+        # boundary.  ``DeadlineReached`` is a normal resumable condition, not
+        # evidence that the fast reader is broken.
         self.save_progress()
+        self.check_deadline()
         return True
 
     def scan_large_table(self, table: TableMeta, start_offset: int = 0) -> None:
@@ -1739,6 +1825,11 @@ class ProgressiveAnalyzer:
             try:
                 if self.scan_large_xlsx_arrow(table, path, selected, start_offset):
                     return
+            except DeadlineReached:
+                # Do not convert a cooperative time-budget exit into an
+                # acceleration failure.  ``run`` catches this and writes a
+                # partial, resumable evidence artifact.
+                raise
             except (OSError, RuntimeError, TypeError, ValueError) as exc:
                 self.warnings.append(
                     f"Arrow acceleration unavailable for {table.file_path} / {table.table_name}: "
@@ -1754,11 +1845,25 @@ class ProgressiveAnalyzer:
                     "Large XLSX probing requires both fastexcel and pyarrow; refusing the "
                     "unbounded Python fallback."
                 )
+        xls_total_rows: int | None = None
+        xls_row_limit: int | None = None
+        if path.suffix.casefold() == ".xls":
+            xls_total_rows = max(0, int(table.row_count or 0))
+            cell_budget = max(1, int(self.args.xlsx_python_fallback_cell_budget))
+            rows_per_chunk = max(1, cell_budget // max(1, int(table.column_count)))
+            if xls_total_rows - start_offset > rows_per_chunk:
+                xls_row_limit = rows_per_chunk
         rows_scanned = start_offset
         started = time.perf_counter()
         matches = int(self.scan_stats.get(table.key, {}).get("matches", 0))
         table_match_counts = self.match_counts.setdefault(table.key, {})
-        for row_number, values in iter_table_rows(table, path, selected, start_offset):
+        for row_number, values in iter_table_rows(
+            table,
+            path,
+            selected,
+            start_offset,
+            row_limit=xls_row_limit,
+        ):
             rows_scanned += 1
             row_sources: list[ValueSource] = []
             row_matched = False
@@ -1795,6 +1900,27 @@ class ProgressiveAnalyzer:
                 }
                 self.save_progress()
                 self.check_deadline()
+        if xls_total_rows is not None and rows_scanned < xls_total_rows:
+            self.partial_table = {"key": table.key, "offset": rows_scanned}
+            cell_budget = max(1, int(self.args.xlsx_python_fallback_cell_budget))
+            self.scan_stats[table.key] = {
+                "mode": "budget_limited_directed_probe",
+                "rows_scanned": rows_scanned,
+                "rows_scanned_this_run": rows_scanned - start_offset,
+                "total_rows": xls_total_rows,
+                "candidate_columns": [column.name for column in selected],
+                "matches": matches,
+                "engine": table.engine,
+                "cell_budget_per_run": cell_budget,
+                "elapsed_seconds": round(time.perf_counter() - started, 3),
+            }
+            self.warnings.append(
+                f"Legacy XLS is processed in bounded resumable chunks for "
+                f"{table.file_path} / {table.table_name}; each run is capped at "
+                f"{cell_budget} estimated worksheet cells."
+            )
+            self.save_progress()
+            return
         self.expand_completed_table(table, selected)
         self.scanned_tables.add(table.key)
         self.partial_table = None
@@ -1850,7 +1976,7 @@ class ProgressiveAnalyzer:
             goal_text = goal_path.read_text(encoding="utf-8", errors="replace")[:100_000]
         self.output_root.mkdir(parents=True, exist_ok=True)
         self.load_or_initialize(goal_tokens(goal_text))
-        status = "complete"
+        status = "partial" if self.coverage_incomplete else "complete"
         try:
             if not self.resumed:
                 seed_tables, seed_documents = self.seed_candidates()
@@ -1891,7 +2017,7 @@ class ProgressiveAnalyzer:
                 table = self.tables[self.partial_table["key"]]
                 self.scan_large_table(table, int(self.partial_table.get("offset", 0)))
                 remaining = [item for item in remaining if item.key != table.key]
-            while remaining:
+            while remaining and self.partial_table is None:
                 self.check_deadline()
                 table = max(remaining, key=self.table_score)
                 remaining.remove(table)
@@ -1902,6 +2028,8 @@ class ProgressiveAnalyzer:
             status = "partial"
             self.warnings.append("Time budget reached; rerun the same command to resume from progress.json.")
             self.save_progress()
+        if self.coverage_incomplete or self.partial_table is not None:
+            status = "partial"
         self.phase_timings["analysis_seconds"] = round(time.perf_counter() - run_started, 3)
         return self.write_result(status)
 

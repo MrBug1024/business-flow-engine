@@ -24,6 +24,14 @@ class StageRuntimeError(ValueError):
     pass
 
 
+ARTIFACT_KINDS = {"bounded_artifact_reference", "exported_query_result"}
+FORMAT_SUFFIXES = {
+    ".csv", ".tsv", ".xlsx", ".xls", ".xlsb", ".parquet", ".json", ".jsonl", ".ndjson",
+    ".sqlite", ".sqlite3", ".db", ".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff",
+    ".docx", ".pptx", ".txt", ".md",
+}
+
+
 def read_json(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise StageRuntimeError(f"Missing JSON file: {path}")
@@ -58,6 +66,14 @@ def digest_payload(payload: dict[str, Any]) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def contract_path() -> Path:
     return Path(__file__).resolve().parents[1] / "references" / "contract.json"
 
@@ -82,13 +98,34 @@ def contract_summary(contract: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def validate_artifact_reference(value: Any, owner: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("kind") not in ARTIFACT_KINDS:
+        raise StageRuntimeError(
+            f"{owner} must be a bounded_artifact_reference or exported_query_result"
+        )
+    raw_path = str(value.get("path", "")).strip()
+    expected = str(value.get("sha256", "")).strip().casefold()
+    path = Path(raw_path).expanduser()
+    if not raw_path or path.suffix.casefold() not in FORMAT_SUFFIXES:
+        raise StageRuntimeError(f"{owner} has an invalid artifact path")
+    if not path.is_file():
+        raise StageRuntimeError(f"{owner} points to a missing artifact: {raw_path}")
+    if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected):
+        raise StageRuntimeError(f"{owner} has an invalid sha256")
+    actual = file_digest(path)
+    if actual != expected:
+        raise StageRuntimeError(f"{owner} sha256 does not match the artifact on disk")
+    result = dict(value)
+    result["path"] = str(path.resolve())
+    result["sha256"] = actual
+    result.setdefault("format", path.suffix.casefold().lstrip("."))
+    return result
+
+
 def ensure_no_raw_data(value: Any, owner: str = "input") -> None:
     if isinstance(value, dict):
-        if value.get("kind") in {"bounded_artifact_reference", "exported_query_result"}:
-            path = str(value.get("path", "")).strip()
-            sha256 = str(value.get("sha256", "")).strip().casefold()
-            if not path or len(sha256) != 64 or any(char not in "0123456789abcdef" for char in sha256):
-                raise StageRuntimeError(f"{owner} has an invalid artifact reference")
+        if value.get("kind") in ARTIFACT_KINDS:
+            validate_artifact_reference(value, owner)
             return
         for key, child in value.items():
             ensure_no_raw_data(child, f"{owner}.{key}")
@@ -108,6 +145,8 @@ def ensure_no_raw_data(value: Any, owner: str = "input") -> None:
 
 
 def start_work_order(contract: dict[str, Any], request: str, input_payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not request.strip():
+        raise StageRuntimeError("Stage request cannot be empty")
     if input_payload is not None:
         ensure_no_raw_data(input_payload)
     summary = contract_summary(contract)
@@ -132,6 +171,8 @@ def start_work_order(contract: dict[str, Any], request: str, input_payload: dict
 def finish_work_order(contract: dict[str, Any], work_order: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
     if work_order.get("stage_id") != contract.get("stage_id"):
         raise StageRuntimeError("Work order belongs to another stage")
+    if work_order.get("contract_digest") != digest_payload(contract):
+        raise StageRuntimeError("Stage contract changed after the work order was created")
     expected_digest = str(work_order.get("work_order_digest", ""))
     unsigned = dict(work_order)
     unsigned.pop("work_order_digest", None)
@@ -142,7 +183,11 @@ def finish_work_order(contract: dict[str, Any], work_order: dict[str, Any], resu
     outputs = result.get("outputs")
     if not isinstance(outputs, list):
         raise StageRuntimeError("Result outputs must be an array")
-    names = {str(item.get("name", "")) for item in outputs if isinstance(item, dict)}
+    if any(not isinstance(item, dict) for item in outputs):
+        raise StageRuntimeError("Each result output must be an object")
+    names = {str(item.get("name", "")).strip() for item in outputs}
+    if "" in names:
+        raise StageRuntimeError("Each result output must have a name")
     required = {
         str(item.get("name", ""))
         for item in contract.get("output_contract", [])
@@ -151,6 +196,35 @@ def finish_work_order(contract: dict[str, Any], work_order: dict[str, Any], resu
     missing = sorted(required - names)
     if missing:
         raise StageRuntimeError(f"Missing required outputs: {missing}")
+    contract_outputs = {
+        str(item.get("name", "")): item
+        for item in contract.get("output_contract", [])
+        if isinstance(item, dict)
+    }
+    unknown = sorted(names - set(contract_outputs))
+    if unknown:
+        raise StageRuntimeError(f"Outputs are outside the stage contract: {unknown}")
+    for output in outputs:
+        spec = contract_outputs.get(str(output.get("name", "")), {})
+        value = output.get("value", output.get("artifact"))
+        formats = {
+            str(item).casefold() if str(item).startswith(".") else f".{str(item).casefold()}"
+            for item in spec.get("formats", [])
+            if str(item).strip()
+        }
+        if formats.intersection(FORMAT_SUFFIXES):
+            if not isinstance(value, dict) or value.get("kind") not in ARTIFACT_KINDS:
+                raise StageRuntimeError(
+                    f"Output {output.get('name', '')} must provide a verifiable artifact reference"
+                )
+            artifact = validate_artifact_reference(value, f"output {output.get('name', '')}")
+            suffix = Path(artifact["path"]).suffix.casefold()
+            if suffix not in formats:
+                raise StageRuntimeError(
+                    f"Output {output.get('name', '')} format {suffix} is outside the declared contract"
+                )
+        elif value is None and "value" not in output and "artifact" not in output:
+            raise StageRuntimeError(f"Output {output.get('name', '')} has no bounded value")
     ensure_no_raw_data(result, "result")
     handoff = {
         "schema_version": 1,
@@ -202,7 +276,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         code, payload = run(argv)
     except (StageRuntimeError, OSError, ValueError) as exc:
         code, payload = 2, {"status": "blocked", "error": str(exc)}
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    print(json.dumps(payload, ensure_ascii=True, indent=2))
     return code
 
 

@@ -15,6 +15,7 @@ metadata:
       - outputs/data-relations/relations.mmd
       - outputs/data-relations/relation-report.md
       - outputs/data-relations/operational-data-contract.json
+      - outputs/data-relations/trace-samples.json
     forbidden_artifacts:
       - outputs/data-relations/validation-errors.json
     status_checks:
@@ -24,6 +25,9 @@ metadata:
       - artifact: outputs/data-relations/operational-data-contract.json
         field: status
         allowed: [ready]
+      - artifact: outputs/data-relations/trace-samples.json
+        field: status
+        allowed: [complete, blocked]
   capability:
     id: discover-data-relations
     responsibility: 从业务材料中提取有界证据并生成可核验的宏观数据关系交付物。
@@ -50,6 +54,9 @@ metadata:
 - _field-evidence/ 仅是内部字段证据，绝不是用户交付物。
 - 精确字段指纹只证明可关联或可追溯，不能独立证明时序、触发或因果。
 - 不能只凭同名字段选连接键。候选必须结合字段语义、基数、唯一性和结果反向追踪排序，并在运行时再次校验空值、未匹配与连接放大。
+- 若存在结构化历史结果，必须生成同一结果锚点的 `trace-samples.json`：全量搜索来源表，只物化少量脱敏命中行，并把规则定位、键组、行号、基数和截断边界一并交给关系综合；禁止用各表独立前 N 行或随机行代替。
+- 全量搜索、候选结果表和候选锚点行只属于本地确定性算法。它可在本地比较候选链路完整度，但 `trace-samples.json` 与 `synthesis-brief.json` 最终只能暴露**一条**选中的结果锚点链路；不得把多个锚点行拼成一条链，也不得把未追踪来源的原始行交给 Agent。
+- Agent 的原始值输入只能来自该单一 `record_trace`；其它材料最多以无取值的文件/表结构和已使用连接键元数据出现。没有可执行的单一结果追踪时应返回 `blocked_trace_required`，不得退回独立表样本继续推导。
 - TXT、Markdown、Word、PDF 和图片通过带页码/段落/行号的解析或 OCR 证据参与关系推导；语义相似不能替代结构化业务主键。
 - 历史结果文件只能定义 `design_time_template`：保留格式、字段/章节、类型、定位和可选的有界脱敏示例，原文件不得成为第三方运行时依赖。CSV、Excel、PDF、图片、Word、TXT、Markdown 等所有格式都遵守同一生命周期规则。
 - 外部知识库、爬虫、Web 检索和远程 API 必须建模为 `system` 能力节点，不得把本地结果样例或其他物理文件证据分配给它们。是否调用由 Agent 根据用户请求和完整规则记录判断。
@@ -92,7 +99,7 @@ python /skills/discover-data-relations/scripts/analyze_relations.py analyze \
   --summary-limit 20
 ~~~
 
-状态为 partial 时，用完全相同的命令恢复。状态为 ready_for_synthesis 后，返回值已经包含严格限长的 synthesis_brief；直接使用它综合，向用户说明识别到的材料类型、文件覆盖和下一步，不要重新扫描，也不要另写脚本压缩材料。
+状态为 partial 时，用完全相同的命令恢复。状态为 ready_for_synthesis 后，返回值已经包含严格限长的 synthesis_brief。它的 `ai_input_policy.raw_value_scope` 必须为 `one_selected_result_anchored_trace`；只使用其中的单一追踪卡、链路表结构和已使用连接键综合，向用户说明识别到的材料类型、文件覆盖和下一步，不要重新扫描，也不要另写脚本压缩材料。
 
 若需要恢复紧凑简报，只执行一次：
 
@@ -101,7 +108,7 @@ python /skills/discover-data-relations/scripts/analyze_relations.py brief \
   --brief /workspace/outputs/data-relations/synthesis-brief.json
 ~~~
 
-只有某一条必要关系缺证据时，才按证据 ID 或文件定向查询，单次不超过 20 条：
+只有某一条**已在该结果锚点链路中出现**的必要关系缺证据时，才按证据 ID 定向查询，单次不超过 20 条；不得用 `evidence` 读取链路范围外的原始行：
 
 ~~~bash
 python /skills/discover-data-relations/scripts/analyze_relations.py evidence \
@@ -152,6 +159,21 @@ python /skills/discover-data-relations/scripts/analyze_relations.py claims-edge 
 
 兼容类型只表示结构合法，最终选择仍必须符合该边引用的业务证据。不得一条错误跑一轮模型，不得创建辅助脚本，不得在没有新增证据或结构调整时重复相同尝试。相同根因连续失败时，报告真实阻塞和缺失证据。
 
+若上下文中断时误把未完成的图写到了 `scenario-relationship.json`，而正式候选
+`scenario-claims.candidate.json` 仍是旧草稿，只可执行一次显式恢复：
+
+~~~bash
+python /skills/discover-data-relations/scripts/analyze_relations.py claims-recover \
+  --claims /workspace/outputs/data-relations/scenario-claims.candidate.json \
+  --partial /workspace/outputs/data-relations/scenario-relationship.json \
+  --output /workspace/outputs/data-relations
+~~~
+
+该命令不会直接交付或覆盖一个已通过结构校验的候选；它只会把不完整结果中的可编辑 claims
+字段恢复到候选，并逐项报告补齐或移除的内容及理由。恢复成功后仍必须先执行一次正常
+`preflight`，仅在其返回 `valid` 后执行 `finalize`。若恢复返回 `recovery_blocked`，不得反复
+尝试；根据其中列出的缺失证据或未解决结构项人工修正候选。
+
 ### 4. 整体验收
 
 ~~~bash
@@ -183,6 +205,33 @@ python /skills/discover-data-relations/scripts/analyze_relations.py summary \
 
 完成即停在 /workspace/outputs/data-relations，不执行复制、打包或“顺便生成 Skill 包”。
 
+## 业务流程前的微观复现交接（仅在后续需要推导业务流程时执行）
+
+关系图 `finalize` 完成不等于可以直接推导宏观业务流程。关系产物经平台正式批准后，Workbench 会将当前阶段切换为 `micro_process`；此时必须先生成并审阅**结果链路的微观复现契约**。它把一条已批准的结果锚点链路整理为可重放、无样本值依赖的处理原则，防止由单个历史样本直接跳到宏观流程。
+
+只有同时满足以下条件才可生成候选：当前 Workbench 阶段为 `micro_process`、数据关联关系已获平台签名批准、`trace-review.json` 也已获平台签名批准。不要把关系图完成、聊天中的“可以继续”或 Agent 的判断当作批准。
+
+使用唯一的候选生成命令和固定产物路径：
+
+~~~bash
+python /skills/discover-data-relations/scripts/analyze_relations.py micro-process-draft \
+  --review /workspace/outputs/data-relations/trace-review.json \
+  --output /workspace/outputs/data-relations/micro-process.json
+~~~
+
+命令返回 `pending_review` 后，可只读取有界摘要来说明待审内容：
+
+~~~bash
+python /skills/discover-data-relations/scripts/analyze_relations.py micro-process-summary \
+  --micro-process /workspace/outputs/data-relations/micro-process.json
+~~~
+
+不要用 `--force` 覆盖一个已有候选来“试试看”；先审阅现有候选，只有平台已经将该阶段退回修订且确有内容修改时，才按新的阶段指令处理。
+
+候选生成后必须停在正式审批交接处：由 Workbench 展示当前 `micro_process` 的签名审批对话框，供用户查看 `/workspace/outputs/data-relations/micro-process.json` 后批准或退回。平台通过 `POST /businesses/{business_id}/confirmations` 记录该决定，并由 `POST /businesses/{business_id}/confirmations/{confirmation_id}/continue/stream` 执行获准的续办；这些是平台专属操作，Agent 不得调用、构造或模拟。批准时平台会写入签名回执 `/workspace/outputs/data-relations/platform-approvals.json`，并把候选更新为 `status: approved`。
+
+严禁调用 `micro-process-approve` CLI、手工修改 `status`/`approval`/`platform-approvals.json`、要求用户在聊天中说“跳过”“继续试试”来绕开审批，或在未批准时运行 `derive-business-flow`。若候选缺失、无效或仍待审，只报告确切阻塞并等待 Workbench 的正式动作。
+
 ## 恢复与上下文压缩
 
 上下文不足时，先确保已有磁盘检查点，再报告 compact。新上下文按顺序检查：
@@ -201,6 +250,7 @@ python /skills/discover-data-relations/scripts/analyze_relations.py summary \
 - relation-report.md：逐关系说明、证据、置信度和覆盖边界。
 - scenario-relationship.json：供后续 Skill 使用的结构化关系；同时含 main_chain 和同义的 primary_data_path。
 - operational-data-contract.json：来源生命周期、运行时绑定、正确表头、列/章节、规则/结果角色、排序后的字段连接、外部增强能力、非结构化检索路径及质量门禁。
+- trace-samples.json：从少量候选结果行反向追踪到规则和业务来源的同锚点样本包；大表全量搜索、Agent 上下文有界物化。
 - relations.json：兼容副本。
 - evidence.sqlite3：仅保存最终关系引用过的证据。
 - evidence-cards.json、synthesis-brief.json：有界中间证据。

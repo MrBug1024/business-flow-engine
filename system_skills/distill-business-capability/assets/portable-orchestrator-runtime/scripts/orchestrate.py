@@ -53,6 +53,14 @@ def digest(payload: dict[str, Any]) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def verify_handoff(handoff: dict[str, Any]) -> None:
+    expected = str(handoff.get("handoff_digest", ""))
+    unsigned = dict(handoff)
+    unsigned.pop("handoff_digest", None)
+    if not expected or digest(unsigned) != expected:
+        raise OrchestratorError("Handoff digest mismatch")
+
+
 def routing_path() -> Path:
     return Path(__file__).resolve().parents[1] / "references" / "capability-routing.json"
 
@@ -99,6 +107,8 @@ def run(argv: Sequence[str] | None = None) -> tuple[int, dict[str, Any]]:
         str(item.get("stage_id", "")): item for item in routing.get("routing", []) if isinstance(item, dict)
     }
     if args.command == "start":
+        if not args.request.strip():
+            raise OrchestratorError("Scenario request cannot be empty")
         state = {
             "schema_version": 1,
             "status": "in_progress",
@@ -124,6 +134,7 @@ def run(argv: Sequence[str] | None = None) -> tuple[int, dict[str, Any]]:
     handoff = read_json(Path(args.handoff).resolve())
     if handoff.get("status") != "complete":
         raise OrchestratorError("Handoff status must be complete")
+    verify_handoff(handoff)
     expected = next_route(routing, state)
     stage_id = str(handoff.get("stage_id", ""))
     if stage_id not in route_by_stage:
@@ -152,7 +163,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         code, payload = run(argv)
     except (OrchestratorError, OSError, ValueError) as exc:
         code, payload = 2, {"status": "blocked", "error": str(exc)}
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    print(json.dumps(payload, ensure_ascii=True, indent=2))
     return code
 
 

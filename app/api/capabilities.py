@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, Header, HTTPException, Query, UploadFile
 
 from app.auth.dependencies import current_account
+from app.core.config import settings as env_settings
 from app.studio.capabilities.mcp import (
     merge_masked_mcp_configs,
     normalize_mcp_payload,
@@ -33,6 +34,7 @@ from app.studio.capabilities.readiness import (
     capability_readiness,
     refresh_platform_capabilities,
 )
+from app.studio.runtime.model_preflight import preflight_model_gateway
 
 router = APIRouter(tags=["capabilities"])
 
@@ -145,6 +147,41 @@ def delete_skill(name: str) -> dict:
 @router.get("/settings", response_model=StudioSettings)
 def get_settings() -> StudioSettings:
     return studio_settings.public(owner_id=current_account().id)
+
+
+@router.post("/model-gateway/preflight")
+def model_gateway_preflight(
+    model: str | None = Query(default=None, max_length=200),
+) -> dict:
+    """Run an explicit, credential-free TCP readiness probe for one model.
+
+    ``model`` is resolved only from the signed-in account's enabled saved
+    configurations.  The endpoint never accepts a raw URL, so it cannot be
+    used as an arbitrary network probe.
+    """
+
+    owner_id = current_account().id
+    requested = (model or "").strip()
+    configured = studio_settings.load(owner_id).configured_models
+    if requested:
+        selected = next(
+            (
+                item
+                for item in configured
+                if item.enabled and requested in {item.id, item.model}
+            ),
+            None,
+        )
+        if selected is None:
+            raise HTTPException(status_code=404, detail="Configured enabled model not found.")
+    else:
+        selected = studio_settings.active_model_config(owner_id=owner_id)
+
+    return preflight_model_gateway(
+        model=selected.model,
+        base_url=selected.base_url.strip() or env_settings.openai_base_url.strip(),
+        api_key=selected.api_key.strip() or env_settings.openai_api_key.strip(),
+    )
 
 
 @router.patch("/settings", response_model=StudioSettings)

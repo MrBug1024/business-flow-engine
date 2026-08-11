@@ -13,8 +13,11 @@ from langgraph.runtime import Runtime
 class ReloadingSkillsMiddleware(SkillsMiddleware):
     """Reload Skill metadata for every run so persisted chat threads do not go stale."""
 
-    max_visible_skills = 12
-    max_description_characters = 180
+    # This catalog shares the model system-prompt budget with MCP metadata and
+    # the evidence-gate context, so full package prose stays on-demand in SKILL.md.
+    max_visible_skills = 6
+    max_description_characters = 110
+    max_path_characters = 200
 
     def _format_skills_list(self, skills: list[Any]) -> str:
         """Expose a deterministic bounded catalog without suppressing Skill metadata."""
@@ -23,7 +26,10 @@ class ReloadingSkillsMiddleware(SkillsMiddleware):
             return "(No Skills are currently available.)"
         ordered = sorted(
             (item for item in skills if isinstance(item, dict)),
-            key=lambda item: str(item.get("name") or "").casefold(),
+            key=lambda item: (
+                0 if _is_primary_executor(item) else 1,
+                str(item.get("name") or "").casefold(),
+            ),
         )
         visible = ordered[: self.max_visible_skills]
         lines = ["<skill_catalog>"]
@@ -33,7 +39,7 @@ class ReloadingSkillsMiddleware(SkillsMiddleware):
                 skill.get("description"),
                 self.max_description_characters,
             )
-            path = _one_line(skill.get("path"), 500)
+            path = _one_line(skill.get("path"), self.max_path_characters)
             if not name or not path:
                 continue
             lines.append(f"- **{name}**: {description or 'No description provided.'}")
@@ -89,3 +95,14 @@ def _one_line(value: Any, limit: int) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _is_primary_executor(skill: dict[str, Any]) -> bool:
+    """Keep a package's one-shot entrypoint visible when the catalog is bounded."""
+
+    name = str(skill.get("name") or "").casefold()
+    description = str(skill.get("description") or "").casefold()
+    return any(
+        marker in name
+        for marker in ("-main-executor", "scenario-main", "knowledge_engine", "main_skill")
+    ) or "primary_end_to_end_executor" in description or "自包含执行器" in description

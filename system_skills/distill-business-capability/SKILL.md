@@ -77,13 +77,14 @@ metadata:
 - 按上游 evidence-cards 和 coverage 识别真实文件格式。没有 CSV/XLSX 等表格时不生成表格 Skill；没有 PDF/图片时不生成 OCR Skill。
 - 表格基础 Skill 必须使用只读 DuckDB 路径、有界预览和大文件策略；全量结果只能由 `export-contract` 写入调用方指定的 CSV/Parquet，不能塞入 Agent 上下文。
 - 表格基础 Skill 必须携带上游 `operational-data-contract.json` 的可移植副本，支持完整规则行检索、来源摘要预检、跨来源只读 SQL，以及单键/复合键的空值、未匹配、基数和放大校验；SQL 必须绑定并实际使用通过校验的键组，不得自行猜表头或连接键。
+- 可移植契约必须保留 `trace_evidence` 的来源角色、投影字段和键组蓝图，但移除设计期具体行值；第三方 Agent 以蓝图选路，并在当前批次重新验证规则、键值、基数和连接放大。
 - 可移植契约必须把来源分为 `runtime_input`、`design_time_template`、`design_time_evidence`，把外部知识声明为 `optional_enrichment`。历史结果模板只保留结构元数据和可选脱敏示例，缺失原文件不得阻塞查询；所有格式均适用这一规则。
 - 表格运行器只注册当前规则、阶段或 SQL 实际引用的 `runtime_input`，支持 `--bind <source-id>=<relative-path>` 绑定新批次文件，并校验字段兼容而不是历史大小/内容摘要。未引用的运行源或任何设计期模板缺失不得阻塞当前查询。
 - TXT、Markdown、Word、可搜索 PDF 等必须先分块建索引再有界检索；图片和扫描 PDF 先 OCR 到 JSON，再进入同一证据索引。命中必须保留来源摘要、页码/段落/行号、chunk id 和文本摘要。
 - PDF/图片基础能力必须保留 `ocr-parser` 的路径、URL、Base64、批量、配置和结构化输出能力，但重新生成业务场景专属描述、触发条件、文件角色和约束。不得复制原 `SKILL.md`。
 - 流程或关系节点明确需要外部知识库时，必须生成知识库基础 Skill；完整继承 `vector-kb` 的脚本、依赖、配置、检索、原文定位和错误状态，只重建场景描述、触发条件、系统角色与场景绑定。Agent 根据用户请求和完整规则记录决定是否调用；必需知识无法取得时返回 `manual_intervention_required` 并停止相关判断。
-- 定制已有系统 Skill 时，除 `SKILL.md`、UI 元数据和新增场景绑定/包装入口外，必须完整继承来源目录。不得挑选复制部分脚本、删除配置字段、清空地址、API Key 或改写已有默认值。
-- 若系统 Skill 的凭据来自包内配置、平台 Skill 凭据存储或当前运行环境，生成器必须按原字段写入第三方 Skill 配置；manifest 只记录字段名、来源和是否已配置，不回显凭据值。第三方仍可用同名环境变量覆盖。
+- 定制已有系统 Skill 时，除 `SKILL.md`、UI 元数据和新增场景绑定/包装入口外，必须完整继承来源目录。不得挑选复制部分脚本、删除配置字段、清空公开地址或改写公开默认值；秘密字段不得跨越打包边界导出。
+- 若系统 Skill 的凭据来自包内配置、平台 Skill 凭据存储或当前运行环境，生成器必须保留原字段但在第三方能力包中清空秘密值；manifest 只记录字段名、来源、是否已配置和 `exported=false`。第三方运行环境通过同名环境变量提供凭据并覆盖空值。
 - 生成 Skill 内不得出现原平台固定目录、Tool/MCP 网关、进展 Tool 或持久会话假设；资源路径相对于各自 Skill。
 - 本 Skill 的产物只能写入 `/workspace/outputs/capability-distillation`。不得写入 `/workspace/deliverables/skill-package`，不得生成 ZIP 或宣称完成发布；最终打包属于 `package-business-skill`。
 - 命令运行环境使用宿主原生 Shell。每次只执行文档中的一条完整命令；不得使用管道、重定向、heredoc 或临时脚本修改候选 JSON。
@@ -122,6 +123,14 @@ python /skills/distill-business-capability/scripts/distill_capabilities.py brief
 ~~~
 
 ### 2. 综合能力计划
+
+若还没有人工撰写的候选计划，可先生成一份只由已验收契约派生的基线候选（不会读取原始行、不会推断微观规则，也不会覆盖已有候选）：
+
+~~~text
+python /skills/distill-business-capability/scripts/distill_capabilities.py draft --relations /workspace/outputs/data-relations/scenario-relationship.json --flow /workspace/outputs/business-flow/business-flow.json --output /workspace/outputs/capability-distillation --claims /workspace/outputs/capability-distillation/capability-plan.candidate.json
+~~~
+
+该基线可直接进入预检；只有在有额外、已验收的业务语义时才补充相应文字，不得用历史样本补写规则。
 
 完整阅读：
 
@@ -196,7 +205,7 @@ python /skills/distill-business-capability/scripts/distill_capabilities.py summa
 - `agent_prompts.md` 存在、摘要与 manifest 一致，并清楚规定规则优先、大表 SQL、连接验证和非结构化证据索引的调用顺序；
 - `agent_prompts.md` 明确区分运行时输入、设计期结果模板和可选外部增强，禁止因模板原文件缺失而阻塞，并规定必需外部知识不可用时转人工；
 - 不存在 `validation-errors.json`；
-- 可移植性扫描无平台固定路径或平台 Tool；系统 Skill 配置按 `preserve_system_skill_configuration` 策略完整继承，凭据状态已审计且值未进入 manifest、报告或提示词。
+- 可移植性扫描无平台固定路径或平台 Tool；系统 Skill 公开配置按 `preserve_public_defaults_externalize_credentials` 策略继承，秘密值不进入能力包、manifest、报告或提示词。
 
 调用 `report_task_progress(action="complete")`，`artifacts` 必须显式列出 manifest、正式计划、能力图、蒸馏报告和 `agent_prompts.md`。最终答复说明 Skill 总数、流程节点覆盖、基础能力及格式、待确认边界、可移植性结果和主要产物路径。完成即停止，不执行最终打包或安装。
 

@@ -13,6 +13,38 @@ from pydantic import BaseModel, Field
 
 Status = Literal["created", "files_uploaded", "analyzed", "confirmed", "outputs_generated"]
 
+# These phases are deliberately platform-owned.  Skills may produce candidate
+# artifacts for a phase, but they must not be able to move the durable state or
+# manufacture a user approval.
+DistillationPhase = Literal[
+    "file_roles",
+    "data_lineage",
+    "relations",
+    "micro_process",
+    "business_flow",
+    "capability",
+    "package",
+]
+DISTILLATION_PHASES: tuple[DistillationPhase, ...] = (
+    "file_roles",
+    "data_lineage",
+    "relations",
+    "micro_process",
+    "business_flow",
+    "capability",
+    "package",
+)
+DistillationStageStatus = Literal[
+    "pending",
+    "ready_for_review",
+    "approved",
+    "rejected",
+    "invalidated",
+]
+TableRole = Literal["input", "result", "rule", "reference", "template", "ignore"]
+ApprovalDecision = Literal["approved", "rejected"]
+ApprovalStatus = Literal["active", "superseded", "invalidated"]
+
 
 class WorkspaceNode(BaseModel):
     name: str
@@ -98,6 +130,7 @@ class BusinessFile(BaseModel):
     size: int
     mime_type: str = ""
     storage_path: str
+    workspace_path: str = ""
     uploaded_at: float
     parse_status: Literal["pending", "parsed", "parsed_with_warnings", "failed"] = "pending"
     parser: str = ""
@@ -108,6 +141,98 @@ class BusinessFile(BaseModel):
     sheets: list[dict[str, Any]] = Field(default_factory=list)
     structured: dict[str, Any] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
+    # The catalog is a persisted, bounded view of the source file rather than
+    # an inference artifact.  ``source_digest`` binds the cached parser facts
+    # to exact bytes, while the stat fingerprint lets the read path avoid
+    # hashing/re-parsing unchanged large files.
+    source_digest: str = ""
+    source_stat: dict[str, int] = Field(default_factory=dict)
+
+
+class DistillationStage(BaseModel):
+    """Durable status for one human-controlled distillation checkpoint."""
+
+    phase: DistillationPhase
+    status: DistillationStageStatus = "pending"
+    revision: int = 0
+    updated_at: float | None = None
+    invalidation_reason: str = ""
+
+
+def _default_distillation_stages() -> list[DistillationStage]:
+    return [DistillationStage(phase=phase) for phase in DISTILLATION_PHASES]
+
+
+class TableRoleConfirmation(BaseModel):
+    """A user-confirmed semantic role for one uploaded file/table scope.
+
+    ``table_name`` is also used for sheet names.  ``__file__`` is a supported
+    file-level scope for formats that do not expose tables.
+    """
+
+    id: str
+    file_id: str
+    table_name: str = Field(min_length=1, max_length=240)
+    role: TableRole
+    note: str = Field(default="", max_length=4000)
+    confirmed_by: str
+    confirmed_at: float
+    source_revision: int
+    revision: int
+    status: Literal["confirmed", "superseded"] = "confirmed"
+    superseded_at: float | None = None
+
+
+class TraceAnchorSelector(BaseModel):
+    """One user-selected historical result row used to build a trace."""
+
+    file: str = Field(min_length=1, max_length=500)
+    table: str = Field(min_length=1, max_length=240)
+    row_number: int = Field(ge=1)
+    selected_by: str
+    selected_at: float
+    source_revision: int
+    revision: int
+
+
+class DistillationApproval(BaseModel):
+    """An identity-bound approval of one immutable candidate artifact."""
+
+    id: str
+    phase: DistillationPhase
+    decision: ApprovalDecision
+    artifact_id: str
+    artifact_fingerprint: str
+    note: str = Field(default="", max_length=4000)
+    actor_id: str
+    revision: int
+    source_revision: int = 0
+    created_at: float
+    status: ApprovalStatus = "active"
+    superseded_at: float | None = None
+    invalidated_at: float | None = None
+    invalidation_reason: str = ""
+    review_artifact_path: str = ""
+    review_artifact_fingerprint: str = ""
+    platform_receipt_path: str = ""
+    platform_receipt_fingerprint: str = ""
+
+
+class DistillationState(BaseModel):
+    """Revisioned source-of-truth for the staged distillation workbench."""
+
+    schema_version: int = 1
+    revision: int = 0
+    source_revision: int = 0
+    current_phase: DistillationPhase = "file_roles"
+    stages: list[DistillationStage] = Field(default_factory=_default_distillation_stages)
+    table_roles: list[TableRoleConfirmation] = Field(default_factory=list)
+    anchor_selector: TraceAnchorSelector | None = None
+    approvals: list[DistillationApproval] = Field(default_factory=list)
+    artifact_contracts: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    role_manifest_fingerprint: str = ""
+    last_invalidated_at: float | None = None
+    last_invalidation_reason: str = ""
 
 
 class ContextVersion(BaseModel):
@@ -213,6 +338,7 @@ class BusinessRecord(BaseModel):
     runs: list[AIRun] = Field(default_factory=list)
     packages: list[PackageRecord] = Field(default_factory=list)
     workspace_deleted_paths: list[str] = Field(default_factory=list)
+    distillation: DistillationState = Field(default_factory=DistillationState)
 
 
 class BusinessSummary(BaseModel):
@@ -268,5 +394,72 @@ class ResumeChatRequest(BaseModel):
 class ConfirmationRequest(BaseModel):
     question_id: str | None = None
     session_id: str | None = Field(default=None, max_length=80)
+    option_id: str | None = Field(default=None, max_length=160)
     answer: str = Field(min_length=1, max_length=4000)
     accepted: bool = True
+
+
+class TableRoleRequest(BaseModel):
+    file_id: str = Field(min_length=1, max_length=120)
+    table_name: str = Field(min_length=1, max_length=240)
+    role: TableRole
+    note: str = Field(default="", max_length=4000)
+    expected_revision: int | None = Field(default=None, ge=0)
+
+
+class TraceAnchorSelectorRequest(BaseModel):
+    file: str = Field(min_length=1, max_length=500)
+    table: str = Field(min_length=1, max_length=240)
+    row_number: int = Field(ge=1)
+    expected_revision: int | None = Field(default=None, ge=0)
+
+
+class DistillationTraceRequest(BaseModel):
+    """Request a server-owned deterministic data-lineage trace.
+
+    The client deliberately cannot submit a command, manifest path, or anchor
+    here.  The platform derives all three from the approved scenario state.
+    """
+
+    expected_revision: int | None = Field(default=None, ge=0)
+    session_id: str | None = Field(default=None, max_length=80)
+    # Set only by the server-side chat intent route. It is audit text, never
+    # an execution argument: the trace command, manifest, anchor policy, and
+    # correction review remain server owned.
+    chat_message: str | None = Field(default=None, max_length=8000)
+
+
+class TraceReviewKeyPair(BaseModel):
+    """One user-confirmed field pair for a deterministic retrace."""
+
+    source_field: str = Field(min_length=1, max_length=240)
+    target_field: str = Field(min_length=1, max_length=240)
+
+
+class TraceReviewKeyPairCorrection(BaseModel):
+    """A user-confirmed table relationship correction, without row values."""
+
+    source_file: str = Field(min_length=1, max_length=500)
+    source_table: str = Field(min_length=1, max_length=240)
+    target_file: str = Field(min_length=1, max_length=500)
+    target_table: str = Field(min_length=1, max_length=240)
+    key_pairs: list[TraceReviewKeyPair] = Field(min_length=1, max_length=16)
+    reason: str = Field(min_length=1, max_length=4000)
+
+
+class TraceReviewCorrectionRequest(BaseModel):
+    """Apply reviewer-owned key-pair corrections before a deterministic retrace."""
+
+    corrections: list[TraceReviewKeyPairCorrection] = Field(min_length=1, max_length=32)
+    replace_existing: bool = False
+    note: str = Field(default="", max_length=4000)
+    expected_revision: int | None = Field(default=None, ge=0)
+
+
+class DistillationApprovalRequest(BaseModel):
+    phase: DistillationPhase
+    decision: ApprovalDecision
+    artifact_id: str = Field(min_length=1, max_length=500)
+    artifact_fingerprint: str = Field(min_length=1, max_length=256)
+    note: str = Field(default="", max_length=4000)
+    expected_revision: int | None = Field(default=None, ge=0)

@@ -23,7 +23,7 @@
     "platform_independent": true,
     "python_requirement": ">=3.10",
     "resource_paths": "relative_to_each_skill",
-    "credentials": "preserve_system_skill_configuration"
+  "credentials": "preserve_public_defaults_externalize_credentials"
   },
   "file_inventory": [],
   "foundation_skills": [],

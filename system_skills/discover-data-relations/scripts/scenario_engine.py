@@ -10,7 +10,9 @@ that the result is one connected, evidence-backed main chain with attached branc
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import hashlib
+import hmac
 import itertools
 import json
 import os
@@ -30,9 +32,24 @@ from progressive_engine import (
     iter_document_segments,
     iter_table_rows,
 )
+from trace_engine import build_trace_samples, compact_trace_report
+from trace_review import (
+    ReviewError,
+    atomic_json as atomic_review_json,
+    load_approved_review,
+    load_json as load_review_json,
+    make_corrections,
+    micro_process_template,
+    normalized_overrides,
+    review_template,
+    validate_review,
+)
 
 
 SCHEMA_VERSION = 1
+PLATFORM_APPROVAL_ISSUER = "business-flow-platform"
+PLATFORM_APPROVAL_KEY_ENV = "BUSINESS_FLOW_PLATFORM_APPROVAL_HMAC_KEY"
+ROLE_MANIFEST_KIND = "approved_role_manifest"
 MAX_SNIPPET = 320
 MAX_CARD_STATEMENT = 480
 MAX_EVIDENCE_PAGE = 20
@@ -88,7 +105,7 @@ RELATION_MARKERS = (
     "触发", "之前", "之后", "如果", "使用", "包含", "属于", "导致", "映射",
     "发送", "接收", "更新", "返回", "校验", "验证", "转换", "流转", "进入", "输出",
     "定位", "选择", "决定", "调用", "获取",
-    "不得", "禁止", "必须", "应当", "不可", "重复收费", "同时收取", "对应", "违规",
+    "不得", "禁止", "必须", "应当", "不可", "对应",
     "异常", "判断", "筛查", "核查", "匹配", "must", "shall", "cannot", "may not",
 )
 SEQUENCE_MARKERS = (
@@ -103,7 +120,7 @@ HEADER_ROLES: dict[str, tuple[str, ...]] = {
     "actor": (
         "actor", "user", "customer", "patient", "employee", "owner", "operator", "provider",
         "person", "member", "organization", "department", "staff", "角色", "用户", "客户",
-        "患者", "人员", "职工", "操作人", "经办人", "机构", "组织", "部门", "医生", "员工",
+        "人员", "职工", "操作人", "经办人", "机构", "组织", "部门", "员工",
     ),
     "time": (
         "date", "time", "year", "month", "day", "created", "updated", "start", "end",
@@ -145,6 +162,490 @@ def atomic_json(path: Path, payload: Any) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temporary, path)
+
+
+def parse_trace_anchor_selector(raw: Any) -> dict[str, Any] | None:
+    """Decode the one explicit result-row selector accepted by tracing.
+
+    The trace engine owns endpoint and row validation because it has the table
+    inventory.  This boundary only prevents a CLI/API string from silently
+    being ignored or interpreted as an arbitrary object.
+    """
+
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return dict(raw)
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        selector = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "--trace-anchor-selector must be a JSON object such as "
+            '{"file":"results.csv","table":"Sheet1","row_number":17}'
+        ) from exc
+    if not isinstance(selector, dict):
+        raise ValueError("--trace-anchor-selector must decode to a JSON object")
+    return selector
+
+
+def trace_anchor_selector_example(selection: dict[str, Any]) -> dict[str, Any]:
+    """Return one redacted candidate selector without inventing a row."""
+
+    for candidate in selection.get("candidates", []):
+        if not isinstance(candidate, dict):
+            continue
+        file_name = str(candidate.get("file", "")).strip()
+        table_name = str(candidate.get("table", "")).strip()
+        rows = candidate.get("preview_rows") if isinstance(candidate.get("preview_rows"), list) else []
+        row = next((item for item in rows if isinstance(item, dict)), None)
+        row_number = row.get("row_number") if isinstance(row, dict) else None
+        if file_name and table_name and isinstance(row_number, int) and row_number > 0:
+            return {"file": file_name, "table": table_name, "row_number": row_number}
+    return {}
+
+
+def trace_anchor_selection_review(
+    trace_path: Path, trace_report: dict[str, Any],
+) -> dict[str, Any]:
+    """Create a review-surface handoff when a result row must be selected.
+
+    This is deliberately not a ``trace_review``: no relationship review is
+    possible before a single business instance has been designated.
+    """
+
+    selection = trace_report.get("anchor_selection")
+    if not isinstance(selection, dict) or selection.get("status") != "selection_required":
+        raise ValueError("A selection handoff can only be created for selection_required traces")
+    selector_example = trace_anchor_selector_example(selection)
+    role_resolution_required = selection.get("resolution") == "role_correction_required"
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "trace_anchor_selection",
+        "status": "selection_required",
+        "created_at": utc_now(),
+        "trace": {
+            "artifact": str(trace_path.resolve()),
+            "fingerprint": file_sha256(trace_path),
+            "field_evidence_fingerprint": str(trace_report.get("field_evidence_fingerprint", "")),
+            "strategy": str(trace_report.get("strategy", "")),
+        },
+        "role_manifest": trace_report.get("role_manifest", {}),
+        "anchor_selection": selection,
+        "review_surface": {
+            "candidates": selection.get("candidates", []),
+            "selector_schema": selection.get("selector_schema", {}),
+            "instruction": (
+                "Correct the approved roles so exactly one physical result source remains. "
+                "A document result will then be anchored only at an exact-value-backed segment."
+                if role_resolution_required else
+                "Choose one result row that represents the business outcome to explain. "
+                "Do not combine independently sampled rows from different files."
+            ),
+        },
+        "next_action": {
+            "command": "confirm_file_roles" if role_resolution_required else "analyze",
+            "cli_option": "" if role_resolution_required else "--trace-anchor-selector",
+            "selector_example": {} if role_resolution_required else selector_example,
+            "instruction": (
+                "Keep exactly one file or table assigned as result, confirm the corrected roles, and rerun tracing."
+                if role_resolution_required else
+                "Rerun analyze with exactly one JSON selector containing file, table, and row_number. "
+                "Only then can relation tracing and review continue."
+            ),
+        },
+    }
+
+
+def platform_approvals_path(review_path: Path) -> Path:
+    """Return the platform-owned approval ledger adjacent to a review."""
+
+    return review_path.resolve().parent / "platform-approvals.json"
+
+
+def platform_approval_signing_payload(envelope: dict[str, Any]) -> bytes:
+    """Canonical bytes signed by the platform, excluding the signature itself."""
+
+    payload = {name: value for name, value in envelope.items() if name != "signature"}
+    return json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def platform_approval_signature(envelope: dict[str, Any], key: str) -> str:
+    """Compute the HMAC used by the server-side platform approval worker."""
+
+    return hmac.new(
+        key.encode("utf-8"), platform_approval_signing_payload(envelope), hashlib.sha256,
+    ).hexdigest()
+
+
+def platform_approval_errors(
+    review_path: Path, review: dict[str, Any], trace_path: Path,
+) -> list[str]:
+    """Verify a server-side approval envelope; free-text reviewers never pass.
+
+    The CLI intentionally has no command that can issue this envelope.  In a
+    deployed workbench, only the platform approval worker holds the HMAC key.
+    If that verifier is absent, the local workflow remains fail-closed.
+    """
+
+    ledger_path = platform_approvals_path(review_path)
+    if not ledger_path.is_file():
+        return [
+            "Platform-signed trace approval is required; platform-approvals.json is missing. "
+            "A free-text reviewer is not a trusted approval."
+        ]
+    try:
+        ledger = load_review_json(ledger_path)
+    except ReviewError as exc:
+        return [f"Platform approval ledger is unreadable: {exc}"]
+    if (
+        ledger.get("schema_version") != SCHEMA_VERSION
+        or ledger.get("kind") != "platform_approval_envelopes"
+        or ledger.get("issuer") != PLATFORM_APPROVAL_ISSUER
+    ):
+        return ["Platform approval ledger has an unsupported issuer or schema"]
+    approvals = ledger.get("approvals")
+    if not isinstance(approvals, list):
+        return ["Platform approval ledger must contain an approvals array"]
+    key = os.environ.get(PLATFORM_APPROVAL_KEY_ENV, "")
+    if not key:
+        return [
+            f"Platform approval verifier is unavailable: {PLATFORM_APPROVAL_KEY_ENV} is not configured. "
+            "Standalone CLI is fail-closed."
+        ]
+    review_fingerprint = file_sha256(review_path)
+    trace_fingerprint = file_sha256(trace_path)
+    trace_reference = review.get("trace") if isinstance(review.get("trace"), dict) else {}
+    if str(trace_reference.get("fingerprint", "")) != trace_fingerprint:
+        return ["Trace review does not bind to the current trace artifact fingerprint"]
+    matching = []
+    for envelope in approvals:
+        if not isinstance(envelope, dict):
+            continue
+        if (
+            envelope.get("schema_version") != SCHEMA_VERSION
+            or envelope.get("issuer") != PLATFORM_APPROVAL_ISSUER
+            or envelope.get("artifact_kind") != "trace_review"
+            or envelope.get("decision") != "approved"
+            or str(envelope.get("artifact_fingerprint", "")) != review_fingerprint
+            or str(envelope.get("trace_fingerprint", "")) != trace_fingerprint
+            or not str(envelope.get("approval_id", "")).strip()
+            or not str(envelope.get("subject", "")).strip()
+            or not str(envelope.get("issued_at", "")).strip()
+        ):
+            continue
+        signature = str(envelope.get("signature", "")).strip().casefold()
+        expected = platform_approval_signature(envelope, key).casefold()
+        if hmac.compare_digest(signature, expected):
+            matching.append(envelope)
+    if not matching:
+        return [
+            "No valid platform-signed approval matches the current trace-review and trace artifacts; "
+            "free-text reviewer values are not accepted."
+        ]
+    return []
+
+
+def platform_approval_block(args: argparse.Namespace) -> dict[str, Any]:
+    """Explain why standalone commands cannot self-approve a gate."""
+
+    command = str(getattr(args, "command", ""))
+    path_value = getattr(args, "review", "") if command == "trace-review-approve" else getattr(args, "micro_process", "")
+    artifact = str(Path(path_value).resolve()) if path_value else ""
+    return {
+        "status": "blocked_platform_approval_required",
+        "artifact": artifact,
+        "message": (
+            "Standalone CLI cannot mark a trace review or micro-process as approved. "
+            "Submit the pending artifact to the platform approval service."
+        ),
+        "next_action": {
+            "approval_ledger": str(platform_approvals_path(Path(getattr(args, "review", artifact or ".")).resolve())),
+            "issuer": PLATFORM_APPROVAL_ISSUER,
+            "verification_key_environment": PLATFORM_APPROVAL_KEY_ENV,
+        },
+    }
+
+
+def _normalized_role_path(value: Any) -> str:
+    return str(value or "").replace("\\", "/").strip("/")
+
+
+def _role_manifest_source_fingerprint(manifest: dict[str, Any]) -> str:
+    payload = {
+        "source_revision": manifest.get("source_revision"),
+        "sources": manifest.get("sources", []),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _role_manifest_semantic_fingerprint(manifest: dict[str, Any]) -> str:
+    roles = manifest.get("roles") if isinstance(manifest.get("roles"), list) else []
+    normalized_roles = []
+    for role in roles:
+        if not isinstance(role, dict):
+            continue
+        normalized_roles.append({
+            "file_id": role.get("file_id"),
+            "file": role.get("file"),
+            "source_sha256": role.get("source_sha256"),
+            "table": role.get("table"),
+            "role": role.get("role"),
+            "note": role.get("note"),
+        })
+    payload = {
+        "source_revision": manifest.get("source_revision"),
+        "source_fingerprint": manifest.get("source_fingerprint"),
+        "roles": normalized_roles,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def load_authoritative_role_manifest(
+    raw_path: str | Path,
+    input_root: Path,
+    field_result: dict[str, Any],
+) -> tuple[dict[str, Any], dict[tuple[str, str], str], dict[str, Any]]:
+    """Verify the platform-signed role contract against the actual input bytes.
+
+    A table role is business truth only when its manifest is signed by the
+    platform *and* its source snapshot still matches the bytes under analysis.
+    This prevents a stale "result" designation from being reused after an
+    upload changes, and removes heuristic role guesses from anchor selection.
+    """
+
+    path = Path(raw_path).resolve()
+    if not path.is_file():
+        raise ValueError(f"Approved role manifest is missing: {path}")
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Approved role manifest is unreadable: {path}") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("Approved role manifest must be a JSON object")
+    required = (
+        manifest.get("schema_version") == SCHEMA_VERSION
+        and manifest.get("kind") == ROLE_MANIFEST_KIND
+        and manifest.get("status") == "approved"
+        and manifest.get("issuer") == PLATFORM_APPROVAL_ISSUER
+        and isinstance(manifest.get("source_revision"), int)
+        and isinstance(manifest.get("sources"), list)
+        and isinstance(manifest.get("roles"), list)
+        and bool(str(manifest.get("source_fingerprint", "")))
+        and bool(str(manifest.get("role_manifest_fingerprint", "")))
+    )
+    if not required:
+        raise ValueError("Approved role manifest has an unsupported schema or is not approved")
+    key = os.environ.get(PLATFORM_APPROVAL_KEY_ENV, "")
+    if not key:
+        raise ValueError(
+            f"Cannot verify approved role manifest: {PLATFORM_APPROVAL_KEY_ENV} is not configured."
+        )
+    signature = str(manifest.get("signature", "")).strip().casefold()
+    expected_signature = platform_approval_signature(manifest, key).casefold()
+    if not hmac.compare_digest(signature, expected_signature):
+        raise ValueError("Approved role manifest has no valid platform signature")
+    if manifest.get("source_fingerprint") != _role_manifest_source_fingerprint(manifest):
+        raise ValueError("Approved role manifest source fingerprint is invalid")
+    if manifest.get("role_manifest_fingerprint") != _role_manifest_semantic_fingerprint(manifest):
+        raise ValueError("Approved role manifest role fingerprint is invalid")
+
+    sources_by_id: dict[str, dict[str, Any]] = {}
+    source_by_alias: dict[str, set[str]] = defaultdict(set)
+    for source in manifest["sources"]:
+        if not isinstance(source, dict):
+            raise ValueError("Approved role manifest contains an invalid source entry")
+        source_id = str(source.get("file_id", "")).strip()
+        source_hash = str(source.get("sha256", "")).strip()
+        aliases = source.get("aliases") if isinstance(source.get("aliases"), list) else []
+        aliases = [source.get("file", ""), *aliases]
+        normalized_aliases = {_normalized_role_path(item) for item in aliases if _normalized_role_path(item)}
+        if not source_id or not source_hash or not normalized_aliases or source_id in sources_by_id:
+            raise ValueError("Approved role manifest source entries need unique file_id, aliases, and sha256")
+        sources_by_id[source_id] = source
+        for alias in normalized_aliases:
+            source_by_alias[alias].add(source_id)
+
+    field_path_to_source: dict[str, str] = {}
+    field_raw_paths: dict[str, str] = {}
+    seen_source_ids: set[str] = set()
+    for file_info in field_result.get("files", []):
+        if not isinstance(file_info, dict):
+            continue
+        file_path = _normalized_role_path(file_info.get("path", ""))
+        if not file_path:
+            raise ValueError("Field evidence contains a source without a relative path")
+        source_ids = source_by_alias.get(file_path, set())
+        if len(source_ids) != 1:
+            raise ValueError(
+                f"Field evidence source {file_path} is not uniquely bound by the approved role manifest"
+            )
+        source_id = next(iter(source_ids))
+        source = sources_by_id[source_id]
+        local_path = (input_root / file_path).resolve()
+        if not local_path.is_file():
+            raise ValueError(f"Field evidence source is missing under the analysis input root: {file_path}")
+        if file_sha256(local_path) != str(source.get("sha256", "")):
+            raise ValueError(f"Field evidence source content changed since role approval: {file_path}")
+        if file_path in field_raw_paths and field_raw_paths[file_path] != str(file_info.get("path", "")):
+            raise ValueError(f"Field evidence contains ambiguous source path aliases: {file_path}")
+        field_path_to_source[file_path] = source_id
+        field_raw_paths[file_path] = str(file_info.get("path", ""))
+        seen_source_ids.add(source_id)
+    if seen_source_ids != set(sources_by_id):
+        missing = sorted(set(sources_by_id) - seen_source_ids)
+        raise ValueError(
+            "Approved role manifest and analysis input differ; source ids absent from input: " + ", ".join(missing)
+        )
+
+    table_endpoints = {
+        (str(file_info.get("path", "")), str(table.get("table_name", "")))
+        for file_info in field_result.get("files", [])
+        if isinstance(file_info, dict)
+        for table in file_info.get("tables", [])
+        if isinstance(table, dict)
+        and _normalized_role_path(file_info.get("path", ""))
+        and str(table.get("table_name", ""))
+    }
+    explicit_roles: dict[tuple[str, str], str] = {}
+    file_default_roles: dict[str, str] = {}
+    for role_entry in manifest["roles"]:
+        if not isinstance(role_entry, dict):
+            raise ValueError("Approved role manifest contains an invalid role entry")
+        source_id = str(role_entry.get("file_id", "")).strip()
+        table_name = str(role_entry.get("table", "")).strip()
+        role = str(role_entry.get("role", "")).strip()
+        if source_id not in sources_by_id or not table_name or role not in {
+            "input", "result", "rule", "reference", "template", "ignore",
+        }:
+            raise ValueError("Approved role manifest contains an unsupported role assignment")
+        source = sources_by_id[source_id]
+        if str(role_entry.get("source_sha256", "")) != str(source.get("sha256", "")):
+            raise ValueError("Approved role manifest role entry is not bound to its source hash")
+        matching_paths = [
+            path for path, matched_source_id in field_path_to_source.items() if matched_source_id == source_id
+        ]
+        if len(matching_paths) != 1:
+            raise ValueError("Approved role manifest source mapping is ambiguous")
+        if table_name == "__file__":
+            if source_id in file_default_roles:
+                raise ValueError("Approved role manifest assigns more than one file-level role to a source")
+            file_default_roles[source_id] = role
+            continue
+        endpoint = (field_raw_paths[matching_paths[0]], table_name)
+        if endpoint not in table_endpoints:
+            raise ValueError(
+                f"Approved role manifest refers to a table not found in current field evidence: {endpoint[0]} / {table_name}"
+            )
+        if endpoint in explicit_roles:
+            raise ValueError(f"Approved role manifest assigns more than one role to {endpoint[0]} / {table_name}")
+        explicit_roles[endpoint] = role
+
+    # ``__file__`` is an authoritative role in its own right.  For a tabular
+    # source it is also the default for discovered tables, while for a PDF,
+    # Word document, Markdown file or image it remains a file-scoped role and
+    # must never be converted into an imaginary table endpoint.
+    resolved_file_roles: dict[str, str] = {}
+    for normalized_path, source_id in field_path_to_source.items():
+        role = file_default_roles.get(source_id)
+        if role:
+            resolved_file_roles[field_raw_paths[normalized_path]] = role
+    authoritative_roles: dict[tuple[str, str], str] = {}
+    for endpoint in table_endpoints:
+        normalized_path = _normalized_role_path(endpoint[0])
+        source_id = field_path_to_source.get(normalized_path, "")
+        role = explicit_roles.get(endpoint) or file_default_roles.get(source_id)
+        if role:
+            authoritative_roles[endpoint] = role
+    unassigned = sorted(table_endpoints - set(authoritative_roles))
+    if unassigned:
+        rendered = ", ".join(f"{path} / {table}" for path, table in unassigned[:8])
+        raise ValueError(f"Every discovered table needs a current approved role; missing: {rendered}")
+    table_files = {path for path, _table in table_endpoints}
+    non_tabular_paths = {
+        str(file_info.get("path", ""))
+        for file_info in field_result.get("files", [])
+        if isinstance(file_info, dict)
+        and str(file_info.get("path", ""))
+        and str(file_info.get("path", "")) not in table_files
+    }
+    missing_file_roles = sorted(non_tabular_paths - set(resolved_file_roles))
+    if missing_file_roles:
+        raise ValueError(
+            "Every non-tabular source needs a current approved __file__ role; missing: "
+            + ", ".join(missing_file_roles[:8])
+        )
+    non_tabular_result_files = {
+        path for path in non_tabular_paths if resolved_file_roles.get(path) == "result"
+    }
+    if "result" not in set(authoritative_roles.values()) and not non_tabular_result_files:
+        raise ValueError("Approved role manifest has no current table or non-tabular file assigned the result role")
+    reference = {
+        "artifact": str(path),
+        "artifact_fingerprint": file_sha256(path),
+        "fingerprint": str(manifest.get("role_manifest_fingerprint", "")),
+        "source_revision": manifest.get("source_revision"),
+        "source_fingerprint": str(manifest.get("source_fingerprint", "")),
+        "file_roles": dict(sorted(resolved_file_roles.items())),
+    }
+    return manifest, authoritative_roles, reference
+
+
+def reusable_trace_role_authority_errors(
+    trace_report: dict[str, Any],
+    role_manifest_reference: dict[str, Any],
+    authoritative_roles: dict[tuple[str, str], str],
+) -> list[str]:
+    """Reject a reusable trace unless it was made under this role authority.
+
+    ``--trace-file`` is a performance/resume feature, never permission to
+    replay an old heuristic trace.  The anchor inside a reusable trace must
+    still be a table that the current signed manifest calls ``result``.
+    """
+
+    bound_manifest = trace_report.get("role_manifest")
+    if not isinstance(bound_manifest, dict):
+        return ["Reusable trace does not bind to a current approved role manifest"]
+    bound_keys = (
+        "fingerprint",
+        "artifact_fingerprint",
+        "source_revision",
+        "source_fingerprint",
+    )
+    if any(
+        bound_manifest.get(key) != role_manifest_reference.get(key)
+        for key in bound_keys
+    ):
+        return ["Reusable trace role manifest does not match the current approved source snapshot"]
+    approved_file_roles = (
+        role_manifest_reference.get("file_roles")
+        if isinstance(role_manifest_reference.get("file_roles"), dict)
+        else {}
+    )
+    for bundle in trace_report.get("bundles", []):
+        if not isinstance(bundle, dict):
+            continue
+        anchor = bundle.get("anchor") if isinstance(bundle.get("anchor"), dict) else {}
+        endpoint = (str(anchor.get("path", "")), str(anchor.get("table", "")))
+        approved_role = (
+            str(approved_file_roles.get(endpoint[0], ""))
+            if anchor.get("kind") == "document_segment"
+            else authoritative_roles.get(endpoint)
+        )
+        if approved_role != "result":
+            return [
+                "Reusable trace anchor is approved as "
+                f"{approved_role or 'unassigned'}; only a current result table or document may anchor tracing"
+            ]
+    return []
 
 
 def print_agent_json(payload: Any, *, stream: Any = None) -> None:
@@ -226,7 +727,9 @@ def table_role(role_counts: Counter[str], file_name: str, sheet_name: str) -> st
     return "business_object_record"
 
 
-def table_cards(field_result: dict[str, Any]) -> list[dict[str, Any]]:
+def table_cards(
+    field_result: dict[str, Any], authoritative_roles: dict[tuple[str, str], str] | None = None,
+) -> list[dict[str, Any]]:
     cards: list[dict[str, Any]] = []
     for file_info in field_result.get("files", []):
         path = str(file_info.get("path", ""))
@@ -250,6 +753,10 @@ def table_cards(field_result: dict[str, Any]) -> list[dict[str, Any]]:
             role_counts = Counter({role: len(names) for role, names in role_columns.items()})
             locator = f"table:{table.get('table_name', '')};header"
             role = table_role(role_counts, path, str(table.get("table_name", "")))
+            approved_role = (
+                authoritative_roles.get((path, str(table.get("table_name", ""))))
+                if authoritative_roles is not None else ""
+            )
             bounded_columns: dict[str, list[str]] = {}
             remaining_column_budget = 40
             for key, values in sorted(role_columns.items()):
@@ -262,13 +769,20 @@ def table_cards(field_result: dict[str, Any]) -> list[dict[str, Any]]:
             cards.append(make_card(
                 "table_schema",
                 "structural",
-                f"{path} / {table.get('table_name', '')} structurally resembles {role}; column roles are grouped without reading data rows.",
+                (
+                    f"{path} / {table.get('table_name', '')} is approved as {approved_role}; "
+                    f"its structural profile resembles {role}."
+                    if approved_role else
+                    f"{path} / {table.get('table_name', '')} structurally resembles {role}; "
+                    "column roles are grouped without reading data rows."
+                ),
                 [{"file": path, "locator": locator}],
                 {
                     "table": table.get("table_name", ""),
                     "estimated_rows": table.get("row_count"),
                     "column_count": table.get("column_count", 0),
                     "inferred_material_role": role,
+                    "approved_role": approved_role,
                     "columns_by_role": bounded_columns,
                     "omitted_column_count": omitted,
                 },
@@ -284,6 +798,7 @@ def table_cards(field_result: dict[str, Any]) -> list[dict[str, Any]]:
                         "table": table.get("table_name", ""),
                         "co_located_roles": sorted(active_roles),
                         "inferred_material_role": role,
+                        "approved_role": approved_role,
                     },
                 ))
     return cards
@@ -479,7 +994,7 @@ def relation_tokens(text: str) -> set[str]:
     tokens = {word for word in re.findall(r"[a-z0-9]{3,}", folded) if word not in {"xlsx", "csv", "table"}}
     chinese = "".join(re.findall(r"[\u4e00-\u9fff]", folded))
     tokens.update(chinese[index:index + 2] for index in range(max(0, len(chinese) - 1)))
-    return tokens - {"重复", "复收", "收费", "同时", "收取", "费用", "规则", "结果", "明细"}
+    return tokens - {"同时", "收取", "规则", "结果"}
 
 
 def statement_score(statement: str, all_file_names: Sequence[str]) -> tuple[int, list[str]]:
@@ -637,6 +1152,97 @@ def deduplicate_and_bound(cards: Iterable[dict[str, Any]], max_cards: int) -> li
     return ordered
 
 
+def trace_evidence_cards(trace_report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expose each coherent trace bundle as one bounded, citable evidence card."""
+
+    cards: list[dict[str, Any]] = []
+    for bundle in trace_report.get("bundles", []):
+        if not isinstance(bundle, dict):
+            continue
+        sources = []
+        bounded_rows = []
+        bounded_segments = []
+        for source in bundle.get("sources", []):
+            if not isinstance(source, dict):
+                continue
+            rows = [item for item in source.get("rows", []) if isinstance(item, dict)]
+            first = rows[0] if rows else {}
+            segment = source.get("segment") if isinstance(source.get("segment"), dict) else {}
+            locator = str(segment.get("locator", "")) if segment else (
+                f"table:{source.get('table', '')};row:{first.get('row_number', '')}"
+                if first else f"table:{source.get('table', '')}"
+            )
+            sources.append({"file": str(source.get("path", "")), "locator": locator})
+            if first:
+                bounded_rows.append({
+                    "file": str(source.get("path", "")),
+                    "table": str(source.get("table", "")),
+                    "role": str(source.get("role", "")),
+                    "row_number": first.get("row_number"),
+                    "values": dict(list(first.get("values", {}).items())[:12]),
+                })
+            if segment:
+                bounded_segments.append({
+                    "file": str(source.get("path", "")),
+                    "role": str(source.get("role", "")),
+                    "locator": str(segment.get("locator", "")),
+                    "source_digest": str(segment.get("source_digest", "")),
+                    "segment_digest": str(segment.get("segment_digest", "")),
+                    "value_fingerprint": str(segment.get("value_fingerprint", "")),
+                    "value_preview": str(segment.get("value_preview", "")),
+                    "snippet": compact_text(segment.get("snippet", ""), 320),
+                })
+        links = [item for item in bundle.get("links", []) if isinstance(item, dict)]
+        anchor = bundle.get("anchor") if isinstance(bundle.get("anchor"), dict) else {}
+        cards.append(make_card(
+            "record_trace",
+            "direct",
+            (
+                f"One result-anchored business instance from {anchor.get('path', '')} was traced "
+                f"to {max(0, len(sources) - 1)} related source(s) with {len(links)} exact key link(s)."
+            ),
+            sources,
+            {
+                "bundle_id": str(bundle.get("bundle_id", "")),
+                "anchor_file": str(anchor.get("path", "")),
+                "anchor_table": str(anchor.get("table", "")),
+                "anchor_kind": str(anchor.get("kind", "table_row")),
+                "anchor_locator": str(anchor.get("locator", "")),
+                "anchor_source_digest": str(anchor.get("source_digest", "")),
+                "anchor_segment_digest": str(anchor.get("segment_digest", "")),
+                "source_files": [item["file"] for item in sources],
+                "key_paths": [
+                    {
+                        "source_file": item.get("source_file", ""),
+                        "target_file": item.get("target_file", ""),
+                        "key_pairs": item.get("key_pairs", []),
+                        "relation_ids": item.get("relation_ids", []),
+                        "confidence": item.get("confidence", 0),
+                        "matched_row_count": item.get("matched_row_count", 0),
+                    }
+                    for item in links
+                ],
+                "bounded_rows": bounded_rows,
+                "bounded_segments": bounded_segments,
+                "semantic_context": [
+                    {
+                        "path": str(item.get("path", "")),
+                        "locator": str(item.get("locator", "")),
+                        "approved_role": str(item.get("approved_role", "")),
+                        "evidence_kind": str(item.get("evidence_kind", "")),
+                        "source_digest": str(item.get("source_digest", "")),
+                        "segment_digest": str(item.get("segment_digest", "")),
+                        "snippet": compact_text(item.get("snippet", ""), 240),
+                    }
+                    for item in bundle.get("semantic_evidence", [])[:8]
+                    if isinstance(item, dict)
+                ],
+                "coverage": bundle.get("coverage", {}),
+            },
+        ))
+    return cards
+
+
 def claims_template(cards_path: Path, files: Sequence[str]) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -691,9 +1297,16 @@ def prepare_evidence(args: argparse.Namespace) -> dict[str, Any]:
         atomic_json(output_root / "prepare-status.json", result)
         return result
 
+    role_manifest_arg = str(getattr(args, "role_manifest", "")).strip()
+    if not role_manifest_arg:
+        raise ValueError("--role-manifest is required; tracing cannot infer an authoritative result table")
+    role_manifest, authoritative_roles, role_manifest_reference = load_authoritative_role_manifest(
+        role_manifest_arg, input_root, field_result,
+    )
+    trace_role_manifest = {**role_manifest, **role_manifest_reference}
     cards: list[dict[str, Any]] = []
     cards.extend(goal_card(Path(args.goal_file) if args.goal_file else None))
-    cards.extend(table_cards(field_result))
+    cards.extend(table_cards(field_result, authoritative_roles))
     cards.extend(field_relationship_cards(field_result))
     table_statements, table_warnings = table_relation_statement_cards(
         input_root,
@@ -711,7 +1324,95 @@ def prepare_evidence(args: argparse.Namespace) -> dict[str, Any]:
         args.document_cards_per_file,
     )
     cards.extend(extracted)
-    warnings = table_warnings + warnings
+    anchor_selector = parse_trace_anchor_selector(getattr(args, "trace_anchor_selector", ""))
+    if args.trace_file and anchor_selector is not None:
+        raise ValueError(
+            "--trace-anchor-selector cannot be combined with --trace-file; omit --trace-file so tracing can "
+            "generate the explicitly selected result anchor"
+        )
+    expected_trace_fingerprint = hashlib.sha256(
+        json.dumps(field_result, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    trace_path = Path(args.trace_file).resolve() if args.trace_file else output_root / "trace-samples.json"
+    review_path = output_root / "trace-review.json"
+    reviewed_overrides: list[dict[str, Any]] = []
+    if args.trace_review:
+        correction_review_path = Path(args.trace_review).resolve()
+        correction_review = load_review_json(correction_review_path)
+        correction_errors = validate_review(correction_review)
+        if correction_errors:
+            raise ValueError("链路纠偏审阅无效：" + "；".join(correction_errors))
+        if correction_review.get("status") != "revision_required":
+            raise ValueError("只有标记为 revision_required 的审阅可以驱动重新追踪")
+        reviewed_overrides = normalized_overrides(correction_review)
+        if not reviewed_overrides:
+            raise ValueError("重新追踪需要至少一条经说明的字段/复合键纠偏")
+    if args.trace_file:
+        trace_report = json.loads(trace_path.read_text(encoding="utf-8"))
+        if trace_report.get("field_evidence_fingerprint") != expected_trace_fingerprint:
+            raise ValueError("Reusable trace does not match the current field evidence; rerun result-anchored tracing")
+        role_authority_errors = reusable_trace_role_authority_errors(
+            trace_report,
+            role_manifest_reference,
+            authoritative_roles,
+        )
+        if role_authority_errors:
+            raise ValueError("; ".join(role_authority_errors))
+    else:
+        trace_report = build_trace_samples(
+            input_root,
+            field_result,
+            cards,
+            result_candidate_limit=args.trace_result_candidates,
+            anchor_candidates=args.trace_anchor_candidates,
+            max_rows_per_source=args.trace_rows_per_source,
+            max_columns_per_source=args.trace_columns_per_source,
+            max_hops=args.trace_max_hops,
+            relation_overrides=reviewed_overrides,
+            anchor_selector=anchor_selector,
+            auto_first_valid_result_row=bool(
+                getattr(args, "auto_first_valid_result_row", False)
+            ),
+            authoritative_roles=authoritative_roles,
+            role_manifest=trace_role_manifest,
+            document_ocr_mode=args.ocr_mode,
+        )
+        atomic_json(trace_path, trace_report)
+    # A trace is never silently accepted.  Keep a review file next to it so
+    # the workbench can show exactly which sources, fields and warnings need
+    # human/AI confirmation before relationship synthesis is finalized.
+    existing_review: dict[str, Any] | None = None
+    if review_path.is_file():
+        try:
+            existing_review = load_review_json(review_path)
+        except ReviewError:
+            existing_review = None
+    current_fingerprint = file_sha256(trace_path)
+    selection_handoff: dict[str, Any] | None = None
+    if trace_report.get("status") == "selection_required":
+        selection_handoff = trace_anchor_selection_review(trace_path, trace_report)
+        atomic_json(review_path, selection_handoff)
+        existing_review = None
+    elif trace_report.get("status") == "complete" and len(trace_report.get("bundles", [])) == 1:
+        if not (
+            existing_review
+            and existing_review.get("kind") == "trace_review"
+            and isinstance(existing_review.get("trace"), dict)
+            and existing_review["trace"].get("fingerprint") == current_fingerprint
+        ):
+            generated_review = review_template(trace_path, trace_report)
+            generated_review["role_manifest"] = trace_report.get("role_manifest", {})
+            atomic_review_json(review_path, generated_review)
+            existing_review = load_review_json(review_path)
+    else:
+        existing_review = None
+    cards.extend(trace_evidence_cards(trace_report))
+    warnings = (
+        table_warnings
+        + warnings
+        + list(trace_report.get("quality_gates", {}).get("warnings", []))
+        + list(trace_report.get("quality_gates", {}).get("blockers", []))
+    )
     cards = deduplicate_and_bound(cards, args.max_evidence_cards)
     files = [str(item.get("path", "")) for item in field_result.get("files", [])]
     cards_path = output_root / "evidence-cards.json"
@@ -720,6 +1421,28 @@ def prepare_evidence(args: argparse.Namespace) -> dict[str, Any]:
         "generated_at": utc_now(),
         "input_root": str(input_root),
         "field_evidence": str(field_result_path),
+        "role_manifest": role_manifest_reference,
+        "trace_samples": {
+            "status": trace_report.get("status", "blocked"),
+            "artifact": str(trace_path),
+            "fingerprint": file_sha256(trace_path),
+            "compact": compact_trace_report(trace_report),
+            "anchor_selection": trace_report.get("anchor_selection", {}),
+        },
+        "trace_review": {
+            "status": (
+                "selection_required" if selection_handoff else
+                existing_review.get("status", "not_reviewable") if existing_review else "not_reviewable"
+            ),
+            "artifact": str(review_path) if (selection_handoff or existing_review) else "",
+            "fingerprint": file_sha256(review_path) if (selection_handoff or existing_review) else "",
+            "trace_fingerprint": current_fingerprint,
+        },
+        "platform_approval": {
+            "artifact": str(platform_approvals_path(review_path)),
+            "issuer": PLATFORM_APPROVAL_ISSUER,
+            "status": "required_after_trace_review" if trace_report.get("status") == "complete" else "not_applicable",
+        },
         "card_count": len(cards),
         "cards": cards,
         "warnings": warnings,
@@ -727,7 +1450,10 @@ def prepare_evidence(args: argparse.Namespace) -> dict[str, Any]:
             "files": files,
             "file_count": len(files),
             "card_kinds": dict(sorted(Counter(card["kind"] for card in cards).items())),
-            "guarantee": "Cards contain bounded schema, localized document statements, and aggregated fingerprints; no complete data rows or full documents are exposed.",
+            "guarantee": (
+                "Cards contain bounded schema, localized statements, aggregated fingerprints, and only "
+                "redacted rows from coherent result-anchored traces; complete tables and documents are never exposed."
+            ),
         },
     }
     atomic_json(cards_path, card_payload)
@@ -736,6 +1462,69 @@ def prepare_evidence(args: argparse.Namespace) -> dict[str, Any]:
     brief = synthesis_brief(card_payload)
     brief_path = output_root / "synthesis-brief.json"
     atomic_json(brief_path, brief)
+    if trace_report.get("status") == "selection_required":
+        selection = trace_report.get("anchor_selection", {})
+        role_resolution_required = (
+            isinstance(selection, dict)
+            and selection.get("resolution") == "role_correction_required"
+        )
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "status": "selection_required",
+            "ready_for_synthesis": False,
+            "generated_at": utc_now(),
+            "card_count": len(cards),
+            "warnings": warnings,
+            "anchor_selection": selection,
+            "artifacts": {
+                "evidence_cards": str(cards_path),
+                "synthesis_brief": str(brief_path),
+                "claims_template": str(template_path),
+                "field_evidence": str(field_result_path),
+                "trace_samples": str(trace_path),
+                "trace_review": str(review_path),
+            },
+            "synthesis_brief": brief,
+            "next_action": selection_handoff.get("next_action", {}) if role_resolution_required and selection_handoff else {
+                "cli_option": "--trace-anchor-selector",
+                "selector_schema": selection.get("selector_schema", {}) if isinstance(selection, dict) else {},
+                "selector_example": trace_anchor_selector_example(selection) if isinstance(selection, dict) else {},
+                "instruction": (
+                    "Choose one candidate result row in trace-review.json, then rerun analyze with an explicit "
+                    "file/table/row_number selector. Preflight and finalize are blocked until then."
+                ),
+            },
+            "message": (
+                "More than one physical result source is approved. Correct and reconfirm file roles so exactly "
+                "one result remains; document results will then use only exact-value-backed segment anchors."
+                if role_resolution_required else
+                "A historical result table has multiple rows. No random leading-row trace was generated; "
+                "one result anchor must be selected before downstream synthesis."
+            ),
+        }
+        atomic_json(output_root / "prepare-status.json", result)
+        return result
+    if brief.get("status") != "ready_for_synthesis":
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "status": "blocked_trace_required",
+            "ready_for_synthesis": False,
+            "generated_at": utc_now(),
+            "card_count": len(cards),
+            "warnings": warnings,
+            "artifacts": {
+                "evidence_cards": str(cards_path),
+                "synthesis_brief": str(brief_path),
+                "claims_template": str(template_path),
+                "field_evidence": str(field_result_path),
+                "trace_samples": str(trace_path),
+                "trace_review": str(review_path),
+            },
+            "synthesis_brief": brief,
+            "message": "No single result-anchored trace is available. Downstream model synthesis is forbidden until one coherent trace is established.",
+        }
+        atomic_json(output_root / "prepare-status.json", result)
+        return result
     result = {
         "schema_version": SCHEMA_VERSION,
         "status": "ready_for_synthesis",
@@ -748,8 +1537,11 @@ def prepare_evidence(args: argparse.Namespace) -> dict[str, Any]:
             "synthesis_brief": str(brief_path),
             "claims_template": str(template_path),
             "field_evidence": str(field_result_path),
+            "trace_samples": str(trace_path),
+            "trace_review": str(review_path),
         },
         "synthesis_brief": brief,
+        "next_gate": "请审阅 trace-review.json；确认样本、复合键和警示后再生成关系 claims。",
     }
     atomic_json(output_root / "prepare-status.json", result)
     return result
@@ -768,6 +1560,7 @@ def compact_evidence_card(card: dict[str, Any]) -> dict[str, Any]:
             "estimated_rows": facts.get("estimated_rows"),
             "column_count": facts.get("column_count"),
             "inferred_material_role": facts.get("inferred_material_role", ""),
+            "approved_role": facts.get("approved_role", ""),
             "columns_by_role": {
                 str(role): [compact_text(value, 48) for value in values[:3]]
                 for role, values in columns.items()
@@ -794,6 +1587,48 @@ def compact_evidence_card(card: dict[str, Any]) -> dict[str, Any]:
             + max(0, len(correspondences) - 4),
             "confidence": facts.get("confidence", 0),
             "evidence_count": facts.get("evidence_count", 0),
+        }
+    elif kind == "record_trace":
+        compact_facts = {
+            "bundle_id": facts.get("bundle_id", ""),
+            "anchor_file": facts.get("anchor_file", ""),
+            "anchor_kind": facts.get("anchor_kind", "table_row"),
+            "anchor_locator": facts.get("anchor_locator", ""),
+            "anchor_source_digest": facts.get("anchor_source_digest", ""),
+            "anchor_segment_digest": facts.get("anchor_segment_digest", ""),
+            "source_files": list(facts.get("source_files", []))[:12],
+            "key_paths": list(facts.get("key_paths", []))[:8],
+            "bounded_rows": [
+                {
+                    **{key: row.get(key) for key in ("file", "table", "role", "row_number")},
+                    "values": dict(list(row.get("values", {}).items())[:10]),
+                }
+                for row in facts.get("bounded_rows", [])[:8]
+                if isinstance(row, dict)
+            ],
+            "bounded_segments": [
+                {
+                    key: segment.get(key)
+                    for key in (
+                        "file", "role", "locator", "source_digest", "segment_digest",
+                        "value_fingerprint", "value_preview", "snippet",
+                    )
+                }
+                for segment in facts.get("bounded_segments", [])[:8]
+                if isinstance(segment, dict)
+            ],
+            "semantic_context": [
+                {
+                    key: context.get(key)
+                    for key in (
+                        "path", "locator", "approved_role", "evidence_kind",
+                        "source_digest", "segment_digest", "snippet",
+                    )
+                }
+                for context in facts.get("semantic_context", [])[:8]
+                if isinstance(context, dict)
+            ],
+            "coverage": facts.get("coverage", {}),
         }
     elif kind == "file_structure":
         compact_facts = {
@@ -826,28 +1661,63 @@ def compact_evidence_card(card: dict[str, Any]) -> dict[str, Any]:
 
 
 def synthesis_brief(payload: dict[str, Any]) -> dict[str, Any]:
+    """Build the only evidence payload intended for model reasoning.
+
+    Full data is searched locally to prove a path, but raw values from only
+    one selected result-anchored trace may cross the model boundary.  Its
+    anchor may be a table row or one digest-bound document segment.  Other
+    source material is represented by bounded schema or role-scoped context.
+    """
     cards = [card for card in payload.get("cards", []) if isinstance(card, dict)]
-    statement_kinds = {
-        "goal_relation_statement", "document_relation_statement", "table_relation_statement",
-        "material_topic_alignment",
-    }
-    context_text = " ".join(
-        str(card.get("snippet") or card.get("facts", {}).get("description") or "")
-        for card in cards
-        if card.get("kind") in {"scenario_goal", "goal_relation_statement"}
-    )
-    context_text += " " + " ".join(str(item) for item in payload.get("coverage", {}).get("files", []))
-    context_tokens = relation_tokens(context_text)
+
     def source_key(card: dict[str, Any]) -> tuple[str, str]:
         sources = card.get("sources") if isinstance(card.get("sources"), list) else []
         first = sources[0] if sources and isinstance(sources[0], dict) else {}
         return (str(first.get("file", "")), str(card.get("id", "")))
 
-    def first_per_file(kind: str, limit: int) -> list[dict[str, Any]]:
+    trace_cards = sorted(
+        (card for card in cards if card.get("kind") == "record_trace"),
+        key=source_key,
+    )
+    if len(trace_cards) != 1:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "status": "blocked_trace_required",
+            "card_count": len(cards),
+            "selected_card_count": 0,
+            "omitted_card_count": len(cards),
+            "reason": "Exactly one executable result-anchored record trace is required before model synthesis.",
+            "next_action": "Repair or explicitly designate a result anchor, then rerun relationship tracing. Do not provide independent source rows to the model.",
+        }
+
+    trace_card = trace_cards[0]
+    trace_facts = trace_card.get("facts") if isinstance(trace_card.get("facts"), dict) else {}
+    trace_files = {
+        str(item) for item in trace_facts.get("source_files", []) if str(item)
+    }
+    trace_relation_ids = {
+        str(relation_id)
+        for path in trace_facts.get("key_paths", []) if isinstance(path, dict)
+        for relation_id in path.get("relation_ids", []) if str(relation_id)
+    }
+    if not trace_files:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "status": "blocked_trace_required",
+            "card_count": len(cards),
+            "selected_card_count": 0,
+            "omitted_card_count": len(cards),
+            "reason": "The selected result trace does not identify its source scope.",
+            "next_action": "Regenerate the result-anchored trace; do not fall back to independent table samples.",
+        }
+
+    def first_per_file(kind: str, source_files: set[str], limit: int) -> list[dict[str, Any]]:
         selected: list[dict[str, Any]] = []
         seen_files: set[str] = set()
         for card in sorted((item for item in cards if item.get("kind") == kind), key=source_key):
             file_name = source_key(card)[0]
+            if file_name not in source_files:
+                continue
             if file_name in seen_files:
                 continue
             selected.append(card)
@@ -856,24 +1726,32 @@ def synthesis_brief(payload: dict[str, Any]) -> dict[str, Any]:
                 break
         return selected
 
-    def statement_rank(card: dict[str, Any]) -> tuple[int, str]:
-        text = f"{card.get('snippet', '')} {card.get('statement', '')}"
-        overlap = len(relation_tokens(text) & context_tokens)
-        direct = 3 if card.get("strength") == "direct" else 1
-        document = 2 if card.get("kind") == "document_relation_statement" else 0
-        return (-(overlap * 4 + direct + document), str(card.get("id", "")))
-
-    statements = sorted(
-        (card for card in cards if card.get("kind") in statement_kinds),
-        key=statement_rank,
-    )[:MAX_BRIEF_STATEMENTS]
+    trace_relationships = [
+        card for card in cards
+        if card.get("kind") == "field_relationship"
+        and trace_relation_ids.intersection(
+            str(item)
+            for item in (card.get("facts", {}) if isinstance(card.get("facts"), dict) else {}).get("field_relation_ids", [])
+        )
+    ]
+    rule_schema_cards = [
+        card for card in cards
+        if card.get("kind") == "table_schema"
+        and str((card.get("facts", {}) if isinstance(card.get("facts"), dict) else {}).get("inferred_material_role", ""))
+        == "rule_or_policy_material"
+    ]
+    rule_files = {source_key(card)[0] for card in rule_schema_cards if source_key(card)[0]}
     candidates = (
         sorted((card for card in cards if card.get("kind") == "scenario_goal"), key=source_key)[:1]
-        + first_per_file("file_structure", MAX_BRIEF_CARDS)
-        + first_per_file("table_schema", 16)
-        + sorted((card for card in cards if card.get("kind") == "field_relationship"), key=source_key)[:6]
-        + first_per_file("table_process_signal", 6)
-        + statements
+        + [trace_card]
+        + first_per_file("file_structure", trace_files, MAX_BRIEF_CARDS)
+        + first_per_file("table_schema", trace_files, len(trace_files))
+        + sorted(trace_relationships, key=source_key)
+        # Rule sources are a side dependency, not a historical data trace.
+        # Keep schema-only facts so the downstream package can resolve a live
+        # governing record without exposing any rule rows to the model here.
+        + first_per_file("file_structure", rule_files, len(rule_files))
+        + first_per_file("table_schema", rule_files, len(rule_files))
     )
     selected: list[dict[str, Any]] = []
     selected_ids: set[str] = set()
@@ -889,6 +1767,25 @@ def synthesis_brief(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "ready_for_synthesis",
+        "ai_input_policy": {
+            "raw_value_scope": "one_selected_result_anchored_trace",
+            "selected_trace_card_id": trace_card.get("id", ""),
+            "selected_trace_files": sorted(trace_files),
+            "permitted_non_trace_content": [
+                "scenario_goal",
+                "schema_metadata",
+                "rule_source_schema_metadata",
+                "trace_key_relationship_metadata",
+                "digest_bound_rule_template_reference_context",
+            ],
+            "forbidden": [
+                "independent_table_samples",
+                "random_samples",
+                "rows_from_untraced_sources",
+                "raw_values_from_alternate_result_candidates",
+                "semantic_similarity_as_an_exact_data_link",
+            ],
+        },
         "card_count": len(cards),
         "selected_card_count": len(selected),
         "omitted_card_count": max(0, len(cards) - len(selected)),
@@ -899,9 +1796,11 @@ def synthesis_brief(payload: dict[str, Any]) -> dict[str, Any]:
             "card_kinds": payload.get("coverage", {}).get("card_kinds", {}),
         },
         "cards": [compact_evidence_card(card) for card in selected],
+        "trace_evidence": payload.get("trace_samples", {}).get("compact", {}),
         "next_action": (
-            "Write one bounded scenario-claims.candidate.json from these evidence IDs, run preflight, "
-            "apply any returned repair hints to that same candidate, then finalize only after preflight is valid."
+            "Write one bounded scenario-claims.candidate.json from the selected result trace and its linked "
+            "schema/key metadata only. Do not query evidence cards outside the trace scope or load independent "
+            "source rows; run preflight and finalize only after it is valid."
         ),
     }
 
@@ -1293,6 +2192,7 @@ def write_report(result: dict[str, Any], cards_by_id: dict[str, dict[str, Any]],
         f"- 数据执行契约：`{operational.get('status', 'missing')}`",
         f"- 证据支持的字段链路：{gates.get('evidence_backed_link_count', 0)}",
         f"- 结果反向追踪链路：{gates.get('result_trace_link_count', 0)}",
+        f"- 同锚点全量追踪样本包：{gates.get('validated_trace_bundle_count', 0)}",
     ])
     for blocker in gates.get("blockers", []):
         lines.append(f"- 阻塞：{blocker}")
@@ -1379,6 +2279,15 @@ def direct_node_files(node: dict[str, Any], cards_by_id: dict[str, dict[str, Any
     fallback: set[str] = set()
     for evidence_id in node.get("evidence_ids", []):
         card = cards_by_id.get(str(evidence_id), {})
+        if card.get("kind") == "record_trace":
+            facts = card.get("facts") if isinstance(card.get("facts"), dict) else {}
+            anchor_file = str(facts.get("anchor_file", ""))
+            trace_files = {str(item) for item in facts.get("source_files", []) if str(item)}
+            if node.get("type") == "output" and anchor_file:
+                fallback.add(anchor_file)
+            else:
+                fallback.update(trace_files - {anchor_file})
+            continue
         files = {
             str(item.get("file", ""))
             for item in card.get("sources", [])
@@ -1418,6 +2327,43 @@ def source_runtime_contract(roles: list[dict[str, str]]) -> dict[str, Any]:
         "runtime_binding": "not_required",
         "integrity_policy": "design_fingerprint_only",
     }
+
+
+def inferred_rule_role(path: str, file_info: dict[str, Any]) -> dict[str, str] | None:
+    """Recover an omitted rule role from structural evidence.
+
+    A user may upload a rule table without creating a dedicated relation node.
+    That omission must not silently turn a searchable policy source into
+    design-time evidence.  This fallback is deliberately conservative and
+    domain neutral: it relies on the same material-role classifier used by
+    evidence cards, rather than on a business-specific field name.
+    """
+    for table in file_info.get("tables", []):
+        if not isinstance(table, dict):
+            continue
+        role_columns: dict[str, list[str]] = defaultdict(list)
+        for column in table.get("columns", []):
+            if not isinstance(column, dict):
+                continue
+            name = str(column.get("name") or column.get("query_name") or "")
+            if name:
+                role_columns[classify_header(name)].append(name)
+        role_counts = Counter({role: len(names) for role, names in role_columns.items()})
+        inferred_material_role = table_role(
+            role_counts, str(file_info.get("path", path)), str(table.get("table_name", ""))
+        )
+        if inferred_material_role != "rule_or_policy_material":
+            continue
+        table_name = str(table.get("table_name", "")) or Path(path).stem
+        digest = hashlib.sha1(f"inferred-rule\0{path}".encode("utf-8")).hexdigest()[:12]
+        return {
+            "node_id": f"inferred_rule_{digest}",
+            "node_name": table_name,
+            "node_type": "rule",
+            "inference": "structural_material_role_profile",
+            "material_role": inferred_material_role,
+        }
+    return None
 
 
 def header_is_usable(table: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
@@ -1463,6 +2409,139 @@ def join_candidate_score(candidate: dict[str, Any], stats: dict[tuple[str, str],
     return round(max(0.0, min(1.0, score)), 4)
 
 
+def load_trace_evidence(card_payload: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Load the trace artifact only when its prepare-time fingerprint still matches."""
+
+    claim = card_payload.get("trace_samples") if isinstance(card_payload.get("trace_samples"), dict) else {}
+    if not claim:
+        return {}, ["当前证据包由旧版本生成，缺少结果锚定追踪；建议重新运行 analyze"]
+    try:
+        path = Path(str(claim.get("artifact", ""))).resolve()
+    except OSError:
+        return {}, ["结果锚定追踪产物路径无效"]
+    if not path.is_file():
+        return {}, ["结果锚定追踪产物缺失；请重新运行 analyze"]
+    if file_sha256(path) != claim.get("fingerprint"):
+        return {}, ["结果锚定追踪产物 fingerprint 已变化；请重新运行 analyze"]
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}, ["结果锚定追踪产物无法读取"]
+    if payload.get("status") not in {"complete", "blocked"}:
+        return {}, ["结果锚定追踪产物状态无效"]
+    return payload, []
+
+
+def trace_review_context(
+    card_payload: dict[str, Any], trace_report: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Require an explicit review that is bound to this exact trace artifact."""
+
+    claim = card_payload.get("trace_review") if isinstance(card_payload.get("trace_review"), dict) else {}
+    if not claim:
+        return {}, ["缺少链路样本审阅；请先在表格与字段中确认或修正 trace-review.json"]
+    try:
+        review_path = Path(str(claim.get("artifact", ""))).resolve()
+        trace_path = Path(str(card_payload.get("trace_samples", {}).get("artifact", ""))).resolve()
+    except OSError:
+        return {}, ["链路样本审阅产物路径无效"]
+    if not review_path.is_file():
+        return {}, ["链路样本审阅产物缺失；请重新审阅当前追踪样本"]
+    actual_trace_fingerprint = file_sha256(trace_path) if trace_path.is_file() else ""
+    if claim.get("trace_fingerprint") and claim.get("trace_fingerprint") != actual_trace_fingerprint:
+        return {}, ["链路样本审阅声明绑定的 trace fingerprint 已变化；请重新运行 analyze"]
+    try:
+        review = load_approved_review(review_path, trace_path)
+    except ReviewError as exc:
+        return {}, [str(exc)]
+    approval_errors = platform_approval_errors(review_path, review, trace_path)
+    if approval_errors:
+        return {}, approval_errors
+    bundle_id = str(review.get("trace", {}).get("bundle_id", ""))
+    if not any(str(item.get("bundle_id", "")) == bundle_id for item in trace_report.get("bundles", []) if isinstance(item, dict)):
+        return {}, ["已审阅的链路样本不属于当前 trace-samples.json"]
+    trace_roles = trace_report.get("role_manifest") if isinstance(trace_report.get("role_manifest"), dict) else {}
+    if trace_roles:
+        review_roles = review.get("role_manifest") if isinstance(review.get("role_manifest"), dict) else {}
+        card_roles = card_payload.get("role_manifest") if isinstance(card_payload.get("role_manifest"), dict) else {}
+        role_keys = ("fingerprint", "artifact_fingerprint", "source_revision", "source_fingerprint")
+        if any(review_roles.get(key) != trace_roles.get(key) for key in role_keys):
+            return {}, ["Trace review does not bind to the current approved role manifest"]
+        if card_roles and any(card_roles.get(key) != trace_roles.get(key) for key in role_keys):
+            return {}, ["Evidence cards do not bind to the current approved role manifest"]
+    return {
+        "status": "approved",
+        "artifact": str(review_path),
+        "fingerprint": file_sha256(review_path),
+        "trace_bundle_id": bundle_id,
+        "role_manifest": trace_roles,
+        "accepted_warnings": review.get("approval", {}).get("accepted_warnings", []),
+    }, []
+
+
+def operational_trace_evidence(
+    trace_report: dict[str, Any], source_by_path: dict[str, dict[str, Any]],
+    output_files: set[str], links: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    link_by_pair = {
+        frozenset((str(item.get("source_file", "")), str(item.get("target_file", "")))): str(item.get("link_id", ""))
+        for item in links if isinstance(item, dict)
+    }
+    bundles = []
+    for bundle in trace_report.get("bundles", []):
+        if not isinstance(bundle, dict):
+            continue
+        anchor = bundle.get("anchor") if isinstance(bundle.get("anchor"), dict) else {}
+        if str(anchor.get("path", "")) not in output_files:
+            continue
+        normalized_sources = []
+        for source in bundle.get("sources", []):
+            if not isinstance(source, dict):
+                continue
+            path = str(source.get("path", ""))
+            normalized_sources.append({
+                **source,
+                "source_id": source_by_path.get(path, {}).get("source_id", stable_source_id(path)),
+            })
+        normalized_links = []
+        for item in bundle.get("links", []):
+            if not isinstance(item, dict):
+                continue
+            source_file = str(item.get("source_file", ""))
+            target_file = str(item.get("target_file", ""))
+            relation_ids = "\0".join(str(value) for value in item.get("relation_ids", []) if str(value))
+            link_id = link_by_pair.get(frozenset((source_file, target_file)), "") or (
+                "trace-link-" + hashlib.sha1(
+                    f"{source_file}\0{target_file}\0{relation_ids}".encode("utf-8")
+                ).hexdigest()[:10]
+            )
+            normalized_links.append({
+                **item,
+                "link_id": link_id,
+                "source_id": source_by_path.get(source_file, {}).get("source_id", stable_source_id(source_file)),
+                "target_id": source_by_path.get(target_file, {}).get("source_id", stable_source_id(target_file)),
+            })
+        bundles.append({
+            **bundle,
+            "anchor": {
+                **anchor,
+                "source_id": source_by_path.get(str(anchor.get("path", "")), {}).get(
+                    "source_id", stable_source_id(str(anchor.get("path", "")))
+                ),
+            },
+            "sources": normalized_sources,
+            "links": normalized_links,
+        })
+    return {
+        "schema_version": trace_report.get("schema_version", 1),
+        "status": "validated" if bundles else "no_validated_result_bundle",
+        "strategy": trace_report.get("strategy", ""),
+        "role_manifest": trace_report.get("role_manifest", {}),
+        "bundles": bundles,
+        "quality_gates": trace_report.get("quality_gates", {}),
+    }
+
+
 def build_operational_contract(
     claims: dict[str, Any], card_payload: dict[str, Any], cards_by_id: dict[str, dict[str, Any]],
     field_result: dict[str, Any], field_result_path: Path,
@@ -1484,6 +2563,32 @@ def build_operational_contract(
     table_by_file_column: dict[tuple[str, str], dict[str, Any]] = {}
     blockers: list[str] = []
     warnings: list[str] = []
+    trace_report, trace_warnings = load_trace_evidence(card_payload)
+    warnings.extend(trace_warnings)
+    warnings.extend(
+        str(item)
+        for item in trace_report.get("quality_gates", {}).get("warnings", [])
+        if str(item)
+    )
+    inferred_rule_paths: list[str] = []
+    for file_info in field_result.get("files", []):
+        if not isinstance(file_info, dict):
+            continue
+        path = str(file_info.get("path", ""))
+        if not path or any(
+            str(item.get("node_type", "")) in {"rule", "output"}
+            for item in roles_by_file.get(path, [])
+        ):
+            continue
+        inferred = inferred_rule_role(path, file_info)
+        if inferred:
+            roles_by_file[path].append(inferred)
+            inferred_rule_paths.append(path)
+    if inferred_rule_paths:
+        warnings.append(
+            "规则来源未显式挂接关系节点，已依据文件/表头结构恢复为可运行规则源："
+            + "、".join(sorted(inferred_rule_paths))
+        )
     coverage = claims.get("coverage") if isinstance(claims.get("coverage"), dict) else {}
     included_files = {
         str(item) for item in coverage.get("included_files", []) if str(item)
@@ -1504,6 +2609,7 @@ def build_operational_contract(
                     "name": str(column.get("name", "")),
                     "query_name": str(column.get("query_name", column.get("name", ""))),
                     "kind": str(column.get("kind", "other")),
+                    "base": str(column.get("base", "")),
                 }
                 for column in table.get("columns", [])
                 if isinstance(column, dict)
@@ -1516,6 +2622,16 @@ def build_operational_contract(
                 "columns": columns,
                 "header": header_quality,
                 "schema_usable": usable,
+            }
+            role_columns: dict[str, list[str]] = defaultdict(list)
+            for column in columns:
+                role_columns[classify_header(column["name"])].append(column["name"])
+            role_counts = Counter({role: len(names) for role, names in role_columns.items()})
+            table_entry["inferred_material_role"] = table_role(
+                role_counts, path, table_entry["sheet_or_table"]
+            )
+            table_entry["semantic_profile"] = {
+                role: names[:40] for role, names in sorted(role_columns.items()) if names
             }
             tables.append(table_entry)
             for column in columns:
@@ -1559,6 +2675,11 @@ def build_operational_contract(
             ),
             "roles": sorted(roles_by_file.get(path, []), key=lambda item: (item["node_type"], item["node_id"])),
             "tables": tables,
+            "material_roles": sorted({
+                str(table.get("inferred_material_role", ""))
+                for table in tables
+                if str(table.get("inferred_material_role", ""))
+            }),
             "access_policy": "bounded_sql_only" if file_info.get("kind") == "tabular" else "bounded_extract_or_ocr",
             "content_retrieval": retrieval,
             "agent_must_not_open_directly": True,
@@ -1596,6 +2717,14 @@ def build_operational_contract(
         source_file = str(facts.get("source_file", ""))
         target_file = str(facts.get("target_file", ""))
         if source_file not in source_by_path or target_file not in source_by_path:
+            continue
+        if (
+            source_by_path[source_file].get("kind") != "tabular"
+            or source_by_path[target_file].get("kind") != "tabular"
+        ):
+            # Exact document links live in the validated trace bundle with
+            # segment provenance.  They are not SQL join candidates and must
+            # not acquire empty synthetic table names here.
             continue
         candidates = []
         for raw in facts.get("correspondences", []):
@@ -1736,6 +2865,18 @@ def build_operational_contract(
                     ],
                 })
 
+    trace_evidence = operational_trace_evidence(
+        trace_report, source_by_path, output_files, links
+    ) if trace_report else {
+        "schema_version": 1,
+        "status": "missing",
+        "strategy": "",
+        "bundles": [],
+        "quality_gates": {},
+    }
+    trace_review, trace_review_errors = trace_review_context(card_payload, trace_report)
+    blockers.extend(trace_review_errors)
+
     input_files = {
         path
         for path, roles in roles_by_file.items()
@@ -1785,14 +2926,25 @@ def build_operational_contract(
         if link["kind"] == "result_trace" and link.get("recommended_candidate")
         for endpoint in (link.get("source_id"), link.get("target_id"))
     }
-    semantic_result_trace = any(
-        route.get("source_id") in unstructured_result_ids or route.get("target_id") in unstructured_result_ids
-        for route in semantic_routes
-    )
-    if structured_result_ids - field_result_trace:
+    traced_result_ids = {
+        str(item.get("anchor", {}).get("source_id", ""))
+        for item in trace_evidence.get("bundles", [])
+        if isinstance(item, dict)
+        and int(item.get("coverage", {}).get("exact_link_count", 0)) > 0
+    }
+    # A structured result may link to either another table or an exact-value
+    # located input document. A non-tabular result must itself be the
+    # digest-bound document anchor of the validated trace. Semantic routes
+    # remain useful context, but never satisfy either exact lineage gate.
+    if structured_result_ids - (field_result_trace | traced_result_ids):
         blockers.append("结构化结果样例无法通过字段级证据链路反向追踪到业务来源")
-    if unstructured_result_ids and not semantic_result_trace:
-        blockers.append("非结构化结果样例无法通过带定位的语义证据路径反向追踪")
+    if card_payload.get("trace_samples") and structured_result_ids - traced_result_ids:
+        blockers.append("结构化结果样例没有通过同一锚点的全量数据反向追踪验证")
+    if unstructured_result_ids - traced_result_ids:
+        blockers.append(
+            "非结构化结果样例必须具有摘要绑定的文档片段锚点和可重放的精确值链路；"
+            "仅靠语义相似度不能通过验收"
+        )
     if not result_source_ids:
         warnings.append("没有物理结果样例；结果结构只能由业务契约定义，不能执行反向对账")
 
@@ -1816,10 +2968,11 @@ def build_operational_contract(
         if str(node.get("type", "")) == "system" and is_external_capability_node(node)
     ]
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "status": "ready" if not blockers else "blocked",
         "generated_at": utc_now(),
         "scenario": claims.get("scenario", {}),
+        "trace_review": trace_review,
         "source": {
             "field_evidence": str(field_result_path),
             "field_evidence_fingerprint": file_sha256(field_result_path),
@@ -1827,6 +2980,7 @@ def build_operational_contract(
         "sources": sources,
         "links": links,
         "semantic_routes": semantic_routes,
+        "trace_evidence": trace_evidence,
         "rule_source_ids": rule_sources,
         "result_source_ids": result_source_ids,
         "runtime_source_ids": runtime_source_ids,
@@ -1845,9 +2999,11 @@ def build_operational_contract(
             "required_sequence": [
                 "locate complete rule record with bounded query",
                 "derive structured predicates and unstructured retrieval terms from the complete rule record",
+                "use the validated result trace blueprint to select source roles, projected fields, and join keys",
                 "index and search non-tabular sources with provenance-preserving chunks when required",
                 "validate recommended join keys and fanout",
-                "execute one bounded multi-source read-only SQL query",
+                "execute bounded read-only SQL only for structured sources that participate in the operation",
+                "resolve non-tabular inputs and outputs through digest-bound document/OCR locators",
                 "reconcile structured rows with document/OCR evidence locators without semantic-only joins",
             ],
         },
@@ -1861,6 +3017,7 @@ def build_operational_contract(
             "evidence_backed_link_count": sum(bool(item.get("recommended_candidate")) for item in links),
             "semantic_retrieval_route_count": len(semantic_routes),
             "result_trace_link_count": sum(item["kind"] == "result_trace" and bool(item.get("recommended_candidate")) for item in links),
+            "validated_trace_bundle_count": len(trace_evidence.get("bundles", [])),
         },
     }
 
@@ -1888,9 +3045,364 @@ def _upsert_claim(items: list[dict[str, Any]], item_id: str, patch: dict[str, An
     return action
 
 
+def _claim_projection(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return only the editable claim fields from a relationship artifact.
+
+    A failed ``finalize`` can leave a partially assembled
+    ``scenario-relationship.json`` behind.  It is not a final artifact and it
+    must not be edited in place: copying only the claims surface gives recovery
+    a canonical candidate to preflight without preserving accidental result
+    metadata such as ``status`` or stale artifact paths.
+    """
+
+    schema_version = payload.get("schema_version")
+    if not isinstance(schema_version, int) or schema_version <= 0:
+        schema_version = SCHEMA_VERSION
+    scenario = payload.get("scenario") if isinstance(payload.get("scenario"), dict) else {}
+    coverage = payload.get("coverage") if isinstance(payload.get("coverage"), dict) else {}
+    return {
+        "schema_version": schema_version,
+        "scenario": deepcopy(scenario),
+        "nodes": deepcopy(payload.get("nodes") if isinstance(payload.get("nodes"), list) else []),
+        "edges": deepcopy(payload.get("edges") if isinstance(payload.get("edges"), list) else []),
+        "main_chain": deepcopy(payload.get("main_chain") if isinstance(payload.get("main_chain"), list) else []),
+        "branches": deepcopy(payload.get("branches") if isinstance(payload.get("branches"), list) else []),
+        "coverage": {
+            "included_files": deepcopy(
+                coverage.get("included_files") if isinstance(coverage.get("included_files"), list) else []
+            ),
+            "excluded_files": deepcopy(
+                coverage.get("excluded_files") if isinstance(coverage.get("excluded_files"), list) else []
+            ),
+        },
+    }
+
+
+def _claim_evidence_score(claims: dict[str, Any], cards_by_id: dict[str, dict[str, Any]]) -> tuple[int, int]:
+    """Rank invalid drafts only; valid candidates are always preserved.
+
+    The score never decides which *valid* graph is better.  It merely prevents
+    replacing an invalid candidate with an equally sparse partial artifact when
+    an interrupted Agent accidentally wrote to the final result path.
+    """
+
+    evidence_count = 0
+    claim_count = 0
+    for collection in ("nodes", "edges", "branches"):
+        for item in claims.get(collection, []):
+            if not isinstance(item, dict):
+                continue
+            claim_count += 1
+            evidence_ids = item.get("evidence_ids")
+            if not isinstance(evidence_ids, list):
+                continue
+            evidence_count += sum(
+                1
+                for evidence_id in evidence_ids
+                if str(evidence_id) in cards_by_id
+            )
+    return evidence_count, claim_count
+
+
+def _card_facts(card: dict[str, Any]) -> dict[str, Any]:
+    facts = card.get("facts")
+    return facts if isinstance(facts, dict) else {}
+
+
+def _result_recovery_evidence(cards: Sequence[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    """Select the uniquely anchored output evidence, or fail closed.
+
+    This is intentionally narrow.  Recovery may fill an omitted output citation
+    only when the evidence package has exactly one selected result trace and a
+    schema card for that trace's approved result source.  It never guesses an
+    output from file names or broad semantic similarity.
+    """
+
+    trace_cards = sorted(
+        (card for card in cards if card.get("kind") == "record_trace" and str(card.get("id", ""))),
+        key=lambda card: str(card["id"]),
+    )
+    if len(trace_cards) != 1:
+        return [], []
+    trace_card = trace_cards[0]
+    anchor_file = str(_card_facts(trace_card).get("anchor_file", "")).strip()
+    if not anchor_file:
+        return [], []
+    result_schema_cards = sorted(
+        (
+            card
+            for card in cards
+            if card.get("kind") == "table_schema"
+            and str(card.get("id", ""))
+            and str(_card_facts(card).get("approved_role", "")) == "result"
+            and any(
+                str(source.get("file", "")) == anchor_file
+                for source in card.get("sources", [])
+                if isinstance(source, dict)
+            )
+        ),
+        key=lambda card: str(card["id"]),
+    )
+    if len(result_schema_cards) != 1:
+        return [], []
+    return [str(trace_card["id"]), str(result_schema_cards[0]["id"])], [str(trace_card["id"])]
+
+
+def _output_statement_evidence(cards: Sequence[dict[str, Any]]) -> list[str]:
+    """Find one direct statement that actually declares an output relationship."""
+
+    output_markers = {
+        "output", "outputs", "produce", "produces", "generate", "generates", "result",
+        "输出", "产生", "生成", "结果",
+    }
+    matches: list[str] = []
+    for card in cards:
+        if card.get("kind") not in {
+            "goal_relation_statement", "table_relation_statement", "document_relation_statement",
+        }:
+            continue
+        identifier = str(card.get("id", "")).strip()
+        if not identifier:
+            continue
+        facts = _card_facts(card)
+        markers = {
+            str(value).casefold()
+            for value in facts.get("relation_markers", [])
+            if str(value).strip()
+        }
+        text = " ".join(
+            str(card.get(key, "")) for key in ("statement", "snippet")
+        ).casefold()
+        if markers.intersection(output_markers) or any(marker in text for marker in output_markers):
+            matches.append(identifier)
+    return sorted(set(matches))[:1]
+
+
+def _unproven_self_branch(branch: dict[str, Any], edges: Sequence[dict[str, Any]]) -> bool:
+    """Recognize the one branch shape which carries no independent claim.
+
+    A branch that starts and ends on its source, has no citation, and has no
+    ``branches_to`` edge is a failed intermediate edit, not an evidence-backed
+    business branch.  Other branches are deliberately retained for preflight to
+    report rather than being silently discarded.
+    """
+
+    evidence_ids = branch.get("evidence_ids")
+    if isinstance(evidence_ids, list) and evidence_ids:
+        return False
+    origin = str(branch.get("from", ""))
+    path = branch.get("path")
+    if not origin or not isinstance(path, list) or len(path) != 1 or str(path[0]) != origin:
+        return False
+    return not any(
+        str(edge.get("source", "")) == origin
+        and str(edge.get("target", "")) == origin
+        and str(edge.get("type", "")) == "branches_to"
+        for edge in edges
+        if isinstance(edge, dict)
+    )
+
+
+def reconcile_partial_relationship_claims(
+    partial: dict[str, Any], card_payload: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Repair omitted schema fields in an interrupted partial relationship graph.
+
+    The operation is a deliberately small, evidence-constrained reconciliation:
+    it does not redesign the graph, reverse edges, or replace existing citations.
+    It can only add citations for a uniquely traced output, add a conservative
+    confidence when an otherwise supported output edge omitted it, and remove a
+    citation-free self-branch that cannot represent a real branch.
+    """
+
+    claims = _claim_projection(partial)
+    cards = [card for card in card_payload.get("cards", []) if isinstance(card, dict)]
+    cards_by_id = {str(card.get("id", "")): card for card in cards if str(card.get("id", ""))}
+    actions: list[dict[str, Any]] = [{
+        "action": "canonicalized_partial_relationship",
+        "reason": "Copied only editable claim fields; status and generated artifact metadata were not promoted.",
+    }]
+
+    original_coverage = partial.get("coverage") if isinstance(partial.get("coverage"), dict) else {}
+    if any(key not in {"included_files", "excluded_files"} for key in original_coverage):
+        actions.append({
+            "action": "removed_non_claim_coverage_metadata",
+            "reason": "Final-result coverage metadata is not part of a candidate claim.",
+        })
+
+    retained_branches: list[dict[str, Any]] = []
+    for branch in claims["branches"]:
+        if isinstance(branch, dict) and _unproven_self_branch(branch, claims["edges"]):
+            actions.append({
+                "action": "removed_unproven_self_branch",
+                "id": str(branch.get("id", "")),
+                "reason": "The branch cited no evidence, had no branches_to edge, and returned to its own origin.",
+            })
+            continue
+        retained_branches.append(branch)
+    claims["branches"] = retained_branches
+
+    output_evidence, trace_evidence = _result_recovery_evidence(cards)
+    for node in claims["nodes"]:
+        if not isinstance(node, dict) or str(node.get("type", "")) != "output":
+            continue
+        evidence_ids = node.get("evidence_ids")
+        if isinstance(evidence_ids, list) and evidence_ids:
+            continue
+        if output_evidence:
+            node["evidence_ids"] = output_evidence
+            actions.append({
+                "action": "filled_output_evidence",
+                "id": str(node.get("id", "")),
+                "evidence_ids": output_evidence,
+                "reason": "A single selected result trace and its approved result schema identify this output.",
+            })
+
+    node_by_id = {
+        str(node.get("id", "")): node
+        for node in claims["nodes"]
+        if isinstance(node, dict)
+    }
+    statement_evidence = _output_statement_evidence(cards)
+    for edge in claims["edges"]:
+        if not isinstance(edge, dict) or str(edge.get("type", "")) != "produces":
+            continue
+        source = node_by_id.get(str(edge.get("source", "")), {})
+        target = node_by_id.get(str(edge.get("target", "")), {})
+        if source.get("type") != "decision" or target.get("type") != "output":
+            continue
+        evidence_ids = edge.get("evidence_ids")
+        if (not isinstance(evidence_ids, list) or not evidence_ids) and statement_evidence and trace_evidence:
+            chosen = [*statement_evidence, *trace_evidence]
+            edge["evidence_ids"] = chosen
+            actions.append({
+                "action": "filled_output_edge_evidence",
+                "id": str(edge.get("id", "")),
+                "evidence_ids": chosen,
+                "reason": "A direct output statement plus the selected result trace support the decision-to-output edge.",
+            })
+        if not isinstance(edge.get("confidence"), (int, float)):
+            if isinstance(edge.get("evidence_ids"), list) and edge["evidence_ids"]:
+                edge["confidence"] = 0.8
+                actions.append({
+                    "action": "filled_output_edge_confidence",
+                    "id": str(edge.get("id", "")),
+                    "confidence": 0.8,
+                    "reason": "The interrupted claim omitted a required confidence; recovery uses a conservative fixed value rather than inventing precision.",
+                })
+
+    # ``cards_by_id`` is intentionally materialized above so callers can see
+    # that recovery is tied to a validated evidence package, even though the
+    # actual validation remains the ordinary preflight below.
+    if not cards_by_id:
+        actions.append({
+            "action": "evidence_unavailable",
+            "reason": "No evidence cards were available, so omitted citations could not be reconstructed.",
+        })
+    return claims, actions
+
+
+def recover_claims(args: argparse.Namespace) -> dict[str, Any]:
+    """Reconcile a stale candidate with an incomplete final-path graph.
+
+    This command is intentionally explicit.  It never finalizes artifacts and
+    never overwrites a structurally valid candidate; callers must still execute
+    the normal ``preflight`` and ``finalize`` steps after recovery.
+    """
+
+    claims_path = Path(args.claims).resolve()
+    output_root = Path(args.output).resolve()
+    cards_path = Path(args.cards).resolve() if args.cards else output_root / "evidence-cards.json"
+    partial_path = Path(args.partial).resolve() if args.partial else output_root / "scenario-relationship.json"
+    card_payload = json.loads(cards_path.read_text(encoding="utf-8"))
+    if not isinstance(card_payload, dict):
+        raise ValueError("Evidence cards must contain one JSON object")
+    cards_by_id = {
+        str(card.get("id", "")): card
+        for card in card_payload.get("cards", [])
+        if isinstance(card, dict) and str(card.get("id", ""))
+    }
+
+    if claims_path.is_file():
+        existing = _load_claims(claims_path)
+        existing_errors = validate_claims(existing, card_payload)
+        if not existing_errors:
+            return {
+                "status": "candidate_preserved",
+                "claims": str(claims_path),
+                "recovery": [],
+                "next_action": "Run ordinary preflight on this unchanged evidence-backed candidate.",
+            }
+    else:
+        existing = None
+        existing_errors = ["Candidate does not exist"]
+
+    if not partial_path.is_file():
+        return {
+            "status": "recovery_blocked",
+            "claims": str(claims_path),
+            "partial": str(partial_path),
+            "errors": ["Incomplete scenario-relationship.json is missing; no recovery source is available."],
+            "recovery": [],
+        }
+    partial = _load_claims(partial_path)
+    if str(partial.get("status", "")) == "complete":
+        return {
+            "status": "recovery_blocked",
+            "claims": str(claims_path),
+            "partial": str(partial_path),
+            "errors": ["The supplied scenario-relationship.json is complete and must not be converted back into a candidate."],
+            "recovery": [],
+        }
+
+    projected = _claim_projection(partial)
+    if existing is not None:
+        existing_score = _claim_evidence_score(existing, cards_by_id)
+        partial_score = _claim_evidence_score(projected, cards_by_id)
+        if partial_score <= existing_score:
+            return {
+                "status": "recovery_blocked",
+                "claims": str(claims_path),
+                "partial": str(partial_path),
+                "errors": [
+                    "The incomplete relationship graph is not more evidence-backed than the current invalid candidate; "
+                    "preserving the candidate avoids discarding unresolved claims."
+                ],
+                "candidate_errors": existing_errors,
+                "recovery": [{
+                    "action": "candidate_preserved",
+                    "reason": "Partial score %s is not greater than candidate score %s." % (partial_score, existing_score),
+                }],
+            }
+
+    recovered, actions = reconcile_partial_relationship_claims(partial, card_payload)
+    errors = validate_claims(recovered, card_payload)
+    if errors:
+        return {
+            "status": "recovery_blocked",
+            "claims": str(claims_path),
+            "partial": str(partial_path),
+            "errors": errors,
+            "candidate_errors": existing_errors,
+            "recovery": actions,
+            "next_action": "Resolve the listed evidence or graph errors manually; recovery did not overwrite the candidate.",
+        }
+
+    atomic_json(claims_path, recovered)
+    return {
+        "status": "recovered",
+        "claims": str(claims_path),
+        "partial": str(partial_path),
+        "recovery": actions,
+        "next_action": "Run ordinary preflight on this recovered candidate before finalize.",
+    }
+
+
 def mutate_claims(args: argparse.Namespace) -> dict[str, Any]:
     claims_path = Path(args.claims).resolve()
     command = args.command
+    if command == "claims-recover":
+        return recover_claims(args)
     if command == "claims-copy":
         if claims_path.exists() and not args.force:
             raise FileExistsError(
@@ -2003,12 +3515,44 @@ def compatible_edge_types(source_type: str, target_type: str) -> list[str]:
     )
 
 
+def trace_preflight_gate_errors(card_payload: dict[str, Any]) -> list[str]:
+    """Keep claims operations behind result selection and trusted trace review."""
+
+    claim = card_payload.get("trace_samples")
+    if not isinstance(claim, dict) or not claim:
+        # Compatibility for evidence packages created before trace artifacts
+        # existed. Newly prepared evidence always carries this claim.
+        return []
+    status = str(claim.get("status", ""))
+    if status == "selection_required":
+        selection = claim.get("anchor_selection") if isinstance(claim.get("anchor_selection"), dict) else {}
+        if selection.get("resolution") == "role_correction_required":
+            return [
+                "Result role correction is required. Keep exactly one physical file or table assigned as "
+                "result, confirm the corrected roles, and rerun tracing before preflight or finalize."
+            ]
+        return [
+            "Result anchor selection is required. Rerun analyze with --trace-anchor-selector "
+            "containing file, table, and row_number before preflight or finalize."
+        ]
+    if status != "complete":
+        return [
+            f"Result-anchored trace is not executable (status={status or 'missing'}); "
+            "preflight and finalize are blocked."
+        ]
+    trace_report, trace_errors = load_trace_evidence(card_payload)
+    if trace_errors:
+        return trace_errors
+    _review, review_errors = trace_review_context(card_payload, trace_report)
+    return review_errors
+
+
 def validation_payload(
     claims: dict[str, Any],
     card_payload: dict[str, Any],
     claims_path: Path,
 ) -> dict[str, Any]:
-    errors = validate_claims(claims, card_payload)
+    errors = trace_preflight_gate_errors(card_payload) + validate_claims(claims, card_payload)
     if not errors:
         return {
             "status": "valid",
@@ -2143,6 +3687,7 @@ def finalize(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             "evidence_index": str(output_root / "evidence.sqlite3"),
             "evidence_cards": str(cards_path),
             "operational_data_contract": str(operational_contract_path),
+            "trace_samples": str(card_payload.get("trace_samples", {}).get("artifact", "")),
         },
     }
     atomic_json(output_root / "scenario-relationship.json", result)
@@ -2168,11 +3713,106 @@ def finalize(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     return 0, compact_summary(result, 0, args.summary_limit)
 
 
+def trace_review_command(args: argparse.Namespace) -> dict[str, Any]:
+    """Mutate explicit review gates, never relationship claims or source data."""
+
+    command = args.command
+    if command in {"trace-review-approve", "micro-process-approve"}:
+        # Approval is an authority boundary, not a free-form CLI field.  The
+        # platform service must atomically update the review and emit a signed
+        # envelope into platform-approvals.json.
+        return platform_approval_block(args)
+    if command == "trace-review-init":
+        trace_path = Path(args.trace).resolve()
+        review_path = Path(args.review).resolve()
+        if review_path.exists() and not args.force:
+            raise FileExistsError("审阅文件已存在；请继续审阅、修正或显式使用 --force")
+        trace_report = load_review_json(trace_path)
+        review = review_template(trace_path, trace_report)
+        review["role_manifest"] = trace_report.get("role_manifest", {})
+        atomic_review_json(review_path, review)
+        return {
+            "status": review["status"], "review": str(review_path),
+            "next_action": "核对表、字段、复合键和警示；确认后批准，发现问题则登记纠偏并重新追踪。",
+        }
+
+    review_path = Path(args.review).resolve()
+    review = load_review_json(review_path)
+    trace_ref = review.get("trace") if isinstance(review.get("trace"), dict) else {}
+    trace_path = Path(str(trace_ref.get("artifact", ""))).resolve()
+    if command == "trace-review-status":
+        return {
+            "status": review.get("status", "invalid"),
+            "review": str(review_path),
+            "errors": validate_review(review, trace_path),
+            "review_surface": review.get("review_surface", {}),
+            "next_action": "先纠正或批准链路样本；不得直接推导关联关系。",
+        }
+    if command == "trace-review-correct":
+        corrections = make_corrections(load_review_json(Path(args.corrections).resolve()))
+        existing = review.get("corrections", []) if isinstance(review.get("corrections"), list) else []
+        combined = corrections if args.replace else [*existing, *corrections]
+        errors = validate_review({**review, "corrections": combined})
+        if errors:
+            raise ReviewError("；".join(errors))
+        review["corrections"] = combined
+        review["status"] = "revision_required"
+        review["approval"] = {
+            "decision": "revision_required",
+            "reviewer": str(args.reviewer or "AI/user"),
+            "note": str(args.note or "链路样本需要按已确认关联重新追踪"),
+            "accepted_warnings": [],
+            "reviewed_at": utc_now(),
+        }
+        atomic_review_json(review_path, review)
+        return {
+            "status": "revision_required", "review": str(review_path),
+            "correction_count": len(combined),
+            "next_action": "使用 analyze --trace-review 指向此审阅文件重新追踪；新链路必须重新审阅。",
+        }
+    if command == "micro-process-draft":
+        approved = load_approved_review(review_path, trace_path)
+        approval_errors = platform_approval_errors(review_path, approved, trace_path)
+        if approval_errors:
+            return {
+                "status": "blocked_platform_approval_required",
+                "review": str(review_path),
+                "errors": approval_errors,
+                "next_action": "Obtain a platform-signed trace approval before drafting the micro-process candidate.",
+            }
+        output_path = Path(args.output).resolve()
+        if output_path.exists() and not args.force:
+            raise FileExistsError("微观复现候选已存在；请审阅现有候选或显式使用 --force")
+        atomic_review_json(output_path, micro_process_template(review_path, approved, trace_path))
+        return {
+            "status": "pending_review", "micro_process": str(output_path),
+            "next_action": "确认该复现契约描述的是参数化处理原理、而非样本值后，再批准微观复现。",
+        }
+    if command == "micro-process-summary":
+        micro = load_review_json(Path(args.micro_process).resolve())
+        return {
+            "status": micro.get("status", "invalid"),
+            "micro_process": str(Path(args.micro_process).resolve()),
+            "reconstruction": micro.get("sample_reconstruction", {}),
+            "generalization_contract": micro.get("generalization_contract", {}),
+            "open_questions": micro.get("open_questions", []),
+        }
+    raise ValueError(f"Unsupported trace review command: {command}")
+
+
 def add_probe_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--input", default="/workspace/data")
     parser.add_argument("--output", default="/workspace/outputs/data-relations")
     parser.add_argument("--goal-file", default="/workspace/description.md")
     parser.add_argument("--field-result", default="")
+    parser.add_argument(
+        "--role-manifest",
+        required=True,
+        help=(
+            "Platform-signed approved_role_manifest.json for the current source snapshot. "
+            "Its file/table roles are authoritative for result-anchor selection."
+        ),
+    )
     parser.add_argument("--ocr-mode", choices=["auto", "always", "never"], default="auto")
     parser.add_argument("--deadline-seconds", type=int, default=780)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
@@ -2198,6 +3838,30 @@ def add_probe_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--table-character-budget", type=int, default=500_000)
     parser.add_argument("--table-cards-per-file", type=int, default=40)
     parser.add_argument("--max-evidence-cards", type=int, default=1_000)
+    parser.add_argument("--trace-result-candidates", type=int, default=1)
+    parser.add_argument("--trace-anchor-candidates", type=int, default=1)
+    parser.add_argument("--trace-rows-per-source", type=int, default=8)
+    parser.add_argument("--trace-columns-per-source", type=int, default=48)
+    parser.add_argument("--trace-max-hops", type=int, default=4)
+    parser.add_argument("--trace-file", default="")
+    parser.add_argument("--trace-review", default="")
+    parser.add_argument(
+        "--auto-first-valid-result-row",
+        action="store_true",
+        help=(
+            "Use the first non-empty row of one approved result table as a reproducible "
+            "inspection anchor. Reserved for the server-owned chat trace action; generic "
+            "tracing still requires an explicit selector for multi-row results."
+        ),
+    )
+    parser.add_argument(
+        "--trace-anchor-selector",
+        default="",
+        help=(
+            "JSON result-row selector: {\"file\":\"results.csv\",\"table\":\"Sheet1\",\"row_number\":17}. "
+            "Required when a candidate result table has multiple rows."
+        ),
+    )
     parser.add_argument("--summary-limit", type=int, default=20)
 
 
@@ -2206,6 +3870,30 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     analyze = commands.add_parser("analyze")
     add_probe_arguments(analyze)
+    review_init = commands.add_parser("trace-review-init")
+    review_init.add_argument("--trace", default="/workspace/outputs/data-relations/trace-samples.json")
+    review_init.add_argument("--review", default="/workspace/outputs/data-relations/trace-review.json")
+    review_init.add_argument("--force", action="store_true")
+    review_status = commands.add_parser("trace-review-status")
+    review_status.add_argument("--review", default="/workspace/outputs/data-relations/trace-review.json")
+    review_correct = commands.add_parser("trace-review-correct")
+    review_correct.add_argument("--review", default="/workspace/outputs/data-relations/trace-review.json")
+    review_correct.add_argument("--corrections", required=True)
+    review_correct.add_argument("--reviewer", default="")
+    review_correct.add_argument("--note", default="")
+    review_correct.add_argument("--replace", action="store_true")
+    review_approve = commands.add_parser("trace-review-approve")
+    review_approve.add_argument("--review", default="/workspace/outputs/data-relations/trace-review.json")
+    micro_draft = commands.add_parser("micro-process-draft")
+    micro_draft.add_argument("--review", default="/workspace/outputs/data-relations/trace-review.json")
+    micro_draft.add_argument("--output", default="/workspace/outputs/data-relations/micro-process.json")
+    micro_draft.add_argument("--force", action="store_true")
+    micro_approve = commands.add_parser("micro-process-approve")
+    micro_approve.add_argument("--review", default="/workspace/outputs/data-relations/trace-review.json")
+    micro_approve.add_argument("--micro-process", default="/workspace/outputs/data-relations/micro-process.json")
+    micro_summary = commands.add_parser("micro-process-summary")
+    micro_summary.add_argument("--review", default="/workspace/outputs/data-relations/trace-review.json")
+    micro_summary.add_argument("--micro-process", default="/workspace/outputs/data-relations/micro-process.json")
     evidence = commands.add_parser("evidence")
     evidence.add_argument("--cards", default="/workspace/outputs/data-relations/evidence-cards.json")
     evidence.add_argument("--offset", type=int, default=0)
@@ -2264,6 +3952,11 @@ def build_parser() -> argparse.ArgumentParser:
     claims_remove.add_argument("--claims", required=True)
     claims_remove.add_argument("--kind", choices=["node", "edge", "branch"], required=True)
     claims_remove.add_argument("--id", required=True)
+    claims_recover = commands.add_parser("claims-recover")
+    claims_recover.add_argument("--claims", required=True)
+    claims_recover.add_argument("--partial", default="")
+    claims_recover.add_argument("--cards", default="")
+    claims_recover.add_argument("--output", default="/workspace/outputs/data-relations")
     check = commands.add_parser("preflight")
     check.add_argument("--claims", required=True)
     check.add_argument("--cards", default="")
@@ -2294,8 +3987,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "analyze":
             payload = prepare_evidence(args)
-            print_agent_json(payload)
-            return 0
+            code = 2 if payload.get("status") in {"selection_required", "blocked_trace_required"} else 0
+            print_agent_json(payload, stream=sys.stderr if code else sys.stdout)
+            return code
+        if args.command.startswith("trace-review-") or args.command.startswith("micro-process-"):
+            payload = trace_review_command(args)
+            code = 2 if payload.get("status") == "blocked_platform_approval_required" else 0
+            print_agent_json(payload, stream=sys.stderr if code else sys.stdout)
+            return code
         if args.command == "evidence":
             payload = json.loads(Path(args.cards).read_text(encoding="utf-8"))
             identifiers = {item.strip() for item in args.ids.split(",") if item.strip()}
@@ -2311,8 +4010,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             print_agent_json(payload)
             return 0
         if args.command.startswith("claims-"):
-            print_agent_json(mutate_claims(args))
-            return 0
+            payload = mutate_claims(args)
+            code = 2 if payload.get("status") == "recovery_blocked" else 0
+            print_agent_json(payload, stream=sys.stderr if code else sys.stdout)
+            return code
         if args.command == "preflight":
             code, payload = preflight(args)
             print_agent_json(payload, stream=sys.stderr if code else sys.stdout)

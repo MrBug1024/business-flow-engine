@@ -206,7 +206,21 @@ def _spreadsheet_payload(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
         workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
         try:
             total_sheets = len(workbook.sheetnames)
-            for sheet_name in workbook.sheetnames[:PREVIEW_SHEET_LIMIT]:
+            for sheet_index, sheet_name in enumerate(workbook.sheetnames):
+                if sheet_index >= PREVIEW_SHEET_LIMIT:
+                    # Sheet identity is a role-coverage fact, not a row
+                    # preview. Keep every worksheet name in the durable
+                    # catalog so an unlabeled eleventh sheet cannot slip past
+                    # role approval, while avoiding full schema parsing for
+                    # large workbooks.
+                    sheets.append({
+                        "name": sheet_name,
+                        "columns": [],
+                        "sample_rows": [],
+                        "row_count": None,
+                        "column_count": None,
+                    })
+                    continue
                 worksheet = workbook[sheet_name]
                 iterator = worksheet.iter_rows(values_only=True)
                 buffered = [list(row) for row in islice(iterator, PREVIEW_ROW_LIMIT + 10)]
@@ -228,8 +242,18 @@ def _spreadsheet_payload(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError("XLS preview requires xlrd") from exc
         workbook = xlrd.open_workbook(path, on_demand=True)
         try:
-            total_sheets = workbook.nsheets
-            for sheet_index in range(min(workbook.nsheets, PREVIEW_SHEET_LIMIT)):
+            sheet_names = workbook.sheet_names()
+            total_sheets = len(sheet_names)
+            for sheet_index, sheet_name in enumerate(sheet_names):
+                if sheet_index >= PREVIEW_SHEET_LIMIT:
+                    sheets.append({
+                        "name": sheet_name,
+                        "columns": [],
+                        "sample_rows": [],
+                        "row_count": None,
+                        "column_count": None,
+                    })
+                    continue
                 worksheet = workbook.sheet_by_index(sheet_index)
                 buffered = [
                     worksheet.row_values(index)
@@ -252,10 +276,19 @@ def _spreadsheet_payload(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
         columns=first["columns"],
         sample_rows=first["sample_rows"],
         sheets=sheets,
-        truncated=any(int(sheet.get("row_count", 0)) > PREVIEW_ROW_LIMIT + 1 for sheet in sheets),
+        truncated=(
+            total_sheets > PREVIEW_SHEET_LIMIT
+            or any(
+                int(sheet.get("row_count", 0) or 0) > PREVIEW_ROW_LIMIT + 1
+                for sheet in sheets
+            )
+        ),
     )
     if total_sheets > PREVIEW_SHEET_LIMIT:
-        payload["warnings"].append(f"Workbook preview shows the first {PREVIEW_SHEET_LIMIT} worksheets.")
+        payload["warnings"].append(
+            f"Workbook catalog includes all {total_sheets} worksheet names; "
+            f"field previews show the first {PREVIEW_SHEET_LIMIT} worksheets."
+        )
     if payload["truncated"]:
         payload["warnings"].append(f"Each worksheet preview shows at most {PREVIEW_ROW_LIMIT} rows.")
     return payload

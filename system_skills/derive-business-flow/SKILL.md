@@ -1,7 +1,7 @@
 ---
 name: derive-business-flow
 description: >
-  仅在 discover-data-relations 已生成并验收 complete 的 scenario-relationship.json、relations.mmd 和 relation-report.md 后，消费这些产出推导整个业务场景的宏观业务流程、阶段流转、状态、控制和分支，并生成可核验的业务流程图、报告与结构化 JSON。用于“根据关系图谱推导业务流程”“梳理端到端业务阶段”“识别宏观状态、决策、交接和例外”等请求。主数据路径只作依赖骨架，不直接视为流程；历史记录只用于验证、参照和对账，不能固化为逐记录、逐字段或偶然操作顺序。缺少或未验收上游关系产物时必须阻塞，不得直接从原始数据猜流程。
+  仅在 discover-data-relations 已生成并验收 complete 的 scenario-relationship.json、relations.mmd 和 relation-report.md，且结果链路的 micro-process.json 已获平台签名批准后，消费这些产出推导整个业务场景的宏观业务流程、阶段流转、状态、控制和分支，并生成可核验的业务流程图、报告与结构化 JSON。用于“根据关系图谱推导业务流程”“梳理端到端业务阶段”“识别宏观状态、决策、交接和例外”等请求。主数据路径只作依赖骨架，不直接视为流程；历史记录只用于验证、参照和对账，不能固化为逐记录、逐字段或偶然操作顺序。缺少或未验收上游关系产物或微观复现契约时必须阻塞，不得直接从原始数据猜流程。
 metadata:
   completion:
     triggers:
@@ -43,14 +43,16 @@ metadata:
 
 ## 不可违反的边界
 
-- 标准输入是 `/workspace/outputs/data-relations/scenario-relationship.json` 及同目录 `operational-data-contract.json`；前者必须 `complete`，后者必须 `ready` 且 fingerprint 匹配。
+- 标准输入是 `/workspace/outputs/data-relations/scenario-relationship.json` 及同目录 `operational-data-contract.json`；前者必须 `complete`，后者必须 `ready` 且 fingerprint 匹配。存在历史结果时，契约内还必须包含已验证的同锚点 `trace_evidence`。
 - 同目录必须存在 `relations.mmd` 和 `relation-report.md`，且不得存在 `validation-errors.json`。
+- 同目录的 `/workspace/outputs/data-relations/micro-process.json` 必须是 `trace_micro_process`、`status: approved`，绑定当前已批准的 `trace-review.json`，且在 `/workspace/outputs/data-relations/platform-approvals.json` 中有平台签名回执。它只允许描述 `sample_value_free` 的重放操作，明确禁止依赖样本行号或样本单元格值。
 - 缺少上游验收产物时只生成阻塞状态并停止。不得读取 `/workspace/data`，不得代替 `discover-data-relations` 扫描材料。
 - 上游 `main_chain`/`primary_data_path` 是主数据依赖路径，不是现成的业务步骤或时序证据。
 - 流程阶段必须是跨业务实例稳定成立的宏观责任或业务结果。文件、工作表、表、字段、记录、ID、金额、日期和具体值不得成为阶段或状态。
 - 允许把已验收的方向性依赖综合为 `structural` 流程推断，但必须写明理由和置信度。没有支撑的顺序、参与方或分支只能进入 `open_questions`。
 - `explicit` 时序只可由上游 `triggers`、`precedes`、`branches_to` 或 `returns_to` 关系支撑。
 - 历史数据只验证覆盖、顺序一致性、可追溯性、分支合理性、控制符合性和结果对账；不得通过“多数记录恰好如此”定义标准流程。
+- 同锚点追踪样本用于验证哪些来源、字段、键组和规则记录确实共同形成过一个业务结果；流程 Agent 应消费这份有界证据，但不得把样本中的具体取值或偶然顺序固化为通用规则。
 - 规则是约束 `control`，数据域是阶段输入/输出或验证对象；不要机械地把每个关系节点变成一个流程阶段。
 - 存在规则源和大数据源时，主流程必须先用独立宏观阶段定位并交付完整规则记录，再进入大表查询或业务上下文汇聚。不得先加载几十万行再寻找规则。
 - 流程必须保留固定执行策略：Agent 不直接读文件；大表走有界只读 SQL；连接键有证据且运行时验证扇出；非结构化材料走解析/OCR后的可追溯分块检索。
@@ -72,6 +74,20 @@ metadata:
 
 Skill 目录为 `/skills/derive-business-flow`，可写工作区为 `/workspace`。
 
+### 0. `micro_process` 阶段的唯一交接
+
+如果 Workbench 当前阶段仍是 `micro_process`，业务流程推导被阻塞是正确的门禁，而不是可通过重试或改写提示词消除的异常。此 Skill 不得自己跳过它，也不得要求用户选择“绕过”“先继续”或进行试验性下游运行。
+
+在该阶段，必须回到 `discover-data-relations` 生成候选；唯一的命令和路径是：
+
+~~~text
+python /skills/discover-data-relations/scripts/analyze_relations.py micro-process-draft --review /workspace/outputs/data-relations/trace-review.json --output /workspace/outputs/data-relations/micro-process.json
+~~~
+
+该命令仅在关系产物和 trace review 已被平台批准时可运行，输出 `pending_review` 的 `/workspace/outputs/data-relations/micro-process.json`。随后停止候选生成工作，等待 Workbench 的签名审批对话框。正式交接由平台的 `POST /businesses/{business_id}/confirmations` 记录，随后通过 `POST /businesses/{business_id}/confirmations/{confirmation_id}/continue/stream` 续办；Agent 不得调用、伪造或替代这些平台操作，也不得调用 `micro-process-approve` CLI、篡改 `approval`/`status`/`platform-approvals.json`。
+
+只有平台批准使 `micro-process.json` 成为 `approved` 并写入 `/workspace/outputs/data-relations/platform-approvals.json` 后，Workbench 才会推进到 `business_flow`，本 Skill 才可以执行下一节的 `prepare`。若门禁仍在，报告缺少的当前产物或正式批准并停止；不要从历史样本、关系图或用户一句文字直接猜测宏观流程。
+
 ### 1. 强制前置验收
 
 先执行且只能先执行：
@@ -80,7 +96,7 @@ Skill 目录为 `/skills/derive-business-flow`，可写工作区为 `/workspace`
 python /skills/derive-business-flow/scripts/derive_business_flow.py prepare --relations /workspace/outputs/data-relations/scenario-relationship.json --output /workspace/outputs/business-flow --summary-limit 20
 ~~~
 
-结果为 `blocked_missing_or_invalid_relations` 时，报告缺少或无效的上游项并停止。建议用户先完成 `discover-data-relations`，但本 Skill 不自行读取原始数据代办上游。
+结果为 `blocked_missing_or_invalid_relations` 时，报告缺少或无效的上游项并停止。建议用户先完成 `discover-data-relations`，但本 Skill 不自行读取原始数据代办上游。结果为 `blocked_missing_or_invalid_micro_process` 时，同样停止：按上一节的固定候选命令和平台审批交接补齐微观复现契约，不得重试下游推导或要求用户绕过审批。
 
 结果为 `ready_for_synthesis` 时，返回值已包含严格有界的 `flow_brief`。直接使用它，不要重新读取原始材料，也不要把 `relation-report.md` 全文塞入上下文。
 

@@ -6,6 +6,7 @@ import re
 from collections.abc import Iterator
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from time import time
 from typing import Any
 
@@ -15,7 +16,7 @@ from app.studio.completion import (
     has_positive_completion_claim,
     validate_task_completion,
 )
-from app.studio.models import AIRun, BusinessRecord
+from app.studio.models import AIRun, BusinessFile, BusinessRecord
 from app.studio.prompt_loader import render_prompt
 from app.studio.runtime import run_agent
 from app.studio.settings import studio_settings
@@ -72,20 +73,40 @@ class BusinessOrchestrator:
         message: str,
         model: str | None = None,
         session_id: str | None = None,
+        *,
+        message_role: str = "user",
+        persist_input_message: bool | None = None,
     ) -> Iterator[dict[str, Any]]:
+        if message_role not in {"user", "system"}:
+            raise ValueError("Chat message role must be user or system.")
+        # Server-authored system prompts provide execution context; they are
+        # not conversational turns.  Persisting them makes internal approval
+        # contracts visible in the user chat and later re-injects them as
+        # history.  Callers may opt in explicitly, but the safe default is to
+        # persist only user-authored input.
+        if persist_input_message is None:
+            persist_input_message = message_role == "user"
         _sync_workspace_metadata(record)
         session = store.require_chat_session(record, session_id)
         selected_model = studio_settings.active_model_name(
             model,
             owner_id=record.owner_id,
         )
-        continuation_source = _manual_continuation_source(record, session.id, message)
+        continuation_source = (
+            _manual_continuation_source(record, session.id, message)
+            if message_role == "user"
+            else None
+        )
         original_goal = (
             _task_original_prompt(record, continuation_source, message)
             if continuation_source is not None
             else message
         )
-        user_message = store.append_message(record, "user", message, session_id=session.id)
+        input_message = (
+            store.append_message(record, message_role, message, session_id=session.id)
+            if persist_input_message
+            else None
+        )
         task_id = continuation_source.task_id if continuation_source is not None else new_id("task")
         segment_index = (
             _next_task_segment_index(record, task_id) if continuation_source is not None else 1
@@ -101,15 +122,26 @@ class BusinessOrchestrator:
             ),
         )
         if continuation_source is not None:
+            retrying_waiting_checkpoint = _is_waiting_for_manual_retry(continuation_source)
             run.plan = list(continuation_source.plan)
             run.task_progress = deepcopy(continuation_source.task_progress)
             _ensure_platform_task_checkpoint(record, continuation_source, original_goal)
             run.task_progress = deepcopy(continuation_source.task_progress)
             if run.task_progress:
                 run.task_progress["status"] = "running"
+            if retrying_waiting_checkpoint:
+                _mark_manual_retry_started(continuation_source, run.id)
+                recovery = run.task_progress.get("recovery")
+                if isinstance(recovery, dict):
+                    run.task_progress["recovery"] = {
+                        **recovery,
+                        "state": "retrying",
+                        "retry_run_id": run.id,
+                    }
         store.save(record)
 
-        yield _event(run, "message", {"message": user_message.model_dump(mode="json")})
+        if input_message is not None:
+            yield _event(run, "message", {"message": input_message.model_dump(mode="json")})
         segment_prompt = (
             _auto_continuation_prompt(
                 record,
@@ -126,21 +158,30 @@ class BusinessOrchestrator:
         while True:
             yield _event(run, "run_start", {"run": run.model_dump(mode="json")})
             continuation_error = ""
+            recovery_error_event: dict[str, Any] | None = None
             for event in self._stream_run(
                 record,
                 run,
                 selected_model,
                 user_prompt=segment_prompt,
+                prompt_role=message_role,
                 include_history=include_history,
             ):
-                if (
-                    event.get("type") == "error"
-                    and segments_used < segment_limit
-                    and _is_recoverable_segment_error(str(event.get("message") or ""), run)
+                if event.get("type") == "error" and _is_recoverable_segment_error(
+                    str(event.get("message") or ""), run
                 ):
-                    continuation_error = str(event.get("message") or "")
-                    _ensure_platform_task_checkpoint(record, run, original_goal)
-                    continue
+                    if segments_used < segment_limit:
+                        continuation_error = str(event.get("message") or "")
+                        _ensure_platform_task_checkpoint(record, run, original_goal)
+                        continue
+                    if _is_model_call_limit_error(str(event.get("message") or "")):
+                        # Let the inner generator finish naturally after its error event.
+                        # Returning from this loop would inject GeneratorExit into it and
+                        # make its cancellation cleanup overwrite our waiting state.
+                        recovery_error_event = event
+                        continue
+                if event.get("type") == "error":
+                    _redact_transport_error_event(run, event)
                 if event.get("type") == "error" and not event.get("assistant_message"):
                     failure_message = _append_failure_message(
                         record,
@@ -149,6 +190,18 @@ class BusinessOrchestrator:
                     )
                     event["assistant_message"] = failure_message.model_dump(mode="json")
                 yield event
+            if recovery_error_event is not None:
+                handoff, done = _wait_for_manual_retry_after_segment_limit(
+                    record,
+                    run,
+                    original_goal,
+                    segments_used=segments_used,
+                    segment_limit=segment_limit,
+                    error_event=recovery_error_event,
+                )
+                yield handoff
+                yield done
+                return
             if not continuation_error and _progress_requests_continuation(run):
                 if segments_used >= segment_limit:
                     error = (
@@ -235,9 +288,13 @@ class BusinessOrchestrator:
         linked_questions = [
             item
             for item in record.context.questions
-            if source_run is not None and item.get("run_id") == source_run.id
+            if source_run is not None
+            and (
+                item.get("run_id") == source_run.id
+                or item.get("checkpoint_run_id") == source_run.id
+            )
         ]
-        pending = [item for item in linked_questions if item.get("status", "open") != "answered"]
+        pending = [item for item in linked_questions if item.get("status", "open") == "open"]
         if pending:
             raise ResumeBlockedError("Please answer all questions from the waiting run before resuming.")
 
@@ -306,6 +363,8 @@ class BusinessOrchestrator:
                     "answers": list(preparation.answers),
                 },
             ):
+                if event.get("type") == "error":
+                    _redact_transport_error_event(run, event)
                 if event.get("type") == "error" and not event.get("assistant_message"):
                     failure_message = _append_failure_message(
                         record,
@@ -325,6 +384,15 @@ class BusinessOrchestrator:
                             continue
                         question["continued_at"] = consumed_at
                         question["continuation_run_id"] = run.id
+                        display_run_id = str(question.get("run_id") or "")
+                        display_run = next(
+                            (item for item in record.runs if item.id == display_run_id),
+                            None,
+                        )
+                        if display_run is not None and display_run.status == "waiting_for_user":
+                            display_run.status = "succeeded"
+                            display_run.finished_at = consumed_at
+                            display_run.summary = "User decision received; continuation run created."
                     store.save(record)
                     event["context"] = record.context.model_dump(mode="json")
                 yield event
@@ -357,6 +425,7 @@ class BusinessOrchestrator:
         selected_model: str,
         *,
         user_prompt: str | None = None,
+        prompt_role: str = "user",
         include_history: bool = True,
         resume_payload: dict[str, Any] | None = None,
     ) -> Iterator[dict[str, Any]]:
@@ -370,6 +439,7 @@ class BusinessOrchestrator:
                 run,
                 requested_model=selected_model,
                 user_prompt=user_prompt,
+                prompt_role=prompt_role,
                 include_history=include_history,
                 resume_payload=resume_payload,
             ):
@@ -687,10 +757,11 @@ def _append_failure_message(record: BusinessRecord, run: AIRun, error: str):
                 or ""
             ).strip()
     next_step = str(progress.get("next_step") or "").strip()
+    public_error = _public_failure_detail(error)
     content = "当前任务在这一阶段中断，未达到最终验收标准。"
     if checkpoint:
         content += f"\n\n已经保存的最近进展：{checkpoint}"
-    content += f"\n\n中断原因：{error[:1200]}"
+    content += f"\n\n中断原因：{public_error}"
     if next_step:
         content += f"\n\n继续处理时将从这里恢复：{next_step}"
     else:
@@ -721,6 +792,96 @@ def _append_failure_message(record: BusinessRecord, run: AIRun, error: str):
     )
     store.save(record)
     return message
+
+
+def _public_failure_detail(error: str) -> str:
+    """Return a chat-safe failure detail without exposing transport internals.
+
+    ``AIRun.error`` deliberately retains the provider failure for operational
+    diagnosis.  Chat messages and SSE events are a user-facing surface,
+    however, so socket names, host URLs, errno values, and TLS details must
+    not be displayed there.  Keep domain errors intact when they are already
+    meaningful to a business user.
+    """
+
+    raw = str(error or "").strip()
+    if not raw:
+        return "模型服务暂时没有返回结果，当前进度已保留。"
+    lowered = raw.casefold()
+    transport_markers = (
+        "socket",
+        "getaddrinfo",
+        "connection refused",
+        "connection reset",
+        "connection aborted",
+        "connecterror",
+        "connect error",
+        "econn",
+        "errno",
+        "winerror",
+        "httpx",
+        "http://",
+        "https://",
+        "ssl",
+        "tls",
+        "certificate",
+        "timed out",
+        "timeout",
+        "remote protocol",
+        "network is unreachable",
+    )
+    if any(marker in lowered for marker in transport_markers):
+        return (
+            "模型服务连接暂时不可用，当前审核结果和工作检查点已保留。"
+            "请稍后重试；如果持续发生，请检查模型服务配置和网络连接。"
+        )
+    # Python implementation failures are useful in AIRun.error, but not in the
+    # user-facing chat. They do not tell the user what action to take and can
+    # expose internal library details such as method names.
+    if (
+        " object has no attribute " in lowered
+        or lowered.startswith(
+            (
+                "attributeerror:",
+                "typeerror:",
+                "keyerror:",
+                "indexerror:",
+                "assertionerror:",
+                "nameerror:",
+                "traceback ",
+            )
+        )
+    ):
+        return "平台内部处理未完成，当前检查点已保留。请继续重试。"
+    return raw[:1200]
+
+
+def _redact_transport_error_event(
+    run: AIRun,
+    event: dict[str, Any],
+) -> None:
+    """Replace raw provider errors in the client event and persisted activity.
+
+    The run retains its original ``error`` for operators.  The event payload
+    and activity entry are client-readable, so they must match the safe error
+    text used by ``_append_failure_message``.
+    """
+
+    raw = str(event.get("message") or "")
+    public = _public_failure_detail(raw)
+    if public == raw:
+        return
+    event["message"] = public
+    run_payload = event.get("run")
+    if isinstance(run_payload, dict):
+        event["run"] = {**run_payload, "error": public}
+    for persisted in reversed(run.events):
+        if persisted.get("type") == "error":
+            persisted["message"] = public
+            nested_run = persisted.get("run")
+            if isinstance(nested_run, dict):
+                persisted["run"] = {**nested_run, "error": public}
+            break
 
 
 def _reconcile_activity_events(run: AIRun) -> None:
@@ -816,10 +977,19 @@ def _sync_workspace_metadata(record: BusinessRecord) -> None:
                 {"id": new_id("req"), "text": cleaned, "source": source, "created_at": time()}
             )
             known_requirements.add(cleaned)
+    workspace = store.workspace_dir(record.id).resolve()
+
+    def workspace_path(file: BusinessFile) -> str:
+        try:
+            return Path(file.storage_path).resolve().relative_to(workspace).as_posix()
+        except (OSError, ValueError):
+            return file.workspace_path
+
     record.context.source_files = [
         {
             "id": file.id,
             "filename": file.filename,
+            "workspace_path": workspace_path(file),
             "suffix": file.suffix,
             "size": file.size,
             "parse_status": file.parse_status,
@@ -918,8 +1088,124 @@ def _is_recoverable_segment_error(message: str, run: AIRun) -> bool:
     )
     if context_boundary:
         return True
-    call_boundary = "model call limit" in lowered or "model call limits exceeded" in lowered
-    return call_boundary and _has_durable_task_checkpoint(run)
+    return _is_model_call_limit_error(message) and _has_durable_task_checkpoint(run)
+
+
+def _is_model_call_limit_error(message: str) -> bool:
+    lowered = str(message or "").casefold()
+    return "model call limit" in lowered or "model call limits exceeded" in lowered
+
+
+def _wait_for_manual_retry_after_segment_limit(
+    record: BusinessRecord,
+    run: AIRun,
+    original_goal: str,
+    *,
+    segments_used: int,
+    segment_limit: int,
+    error_event: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Persist an exhausted model-call run as a retryable checkpoint pause.
+
+    The underlying runtime has already recorded an ``error`` event when this
+    helper runs.  This boundary is not a terminal task failure: the run has a
+    durable checkpoint and the only exhausted budget is this request's bounded
+    auto-continuation allowance.  Remove the transient provider error from the
+    replayable activity stream, retain the checkpoint, and finish the SSE stream
+    normally so the existing client can render the handoff instead of throwing.
+    """
+
+    _remove_persisted_event(run, error_event)
+    _ensure_platform_task_checkpoint(record, run, original_goal)
+
+    retry_instruction = "已达到本次自动续跑上限；检查点已保存。发送“继续”即可从此处恢复同一任务。"
+    progress = deepcopy(run.task_progress or {})
+    current_next_step = str(progress.get("next_step") or "").strip()
+    if retry_instruction not in current_next_step:
+        progress["next_step"] = (
+            f"{current_next_step}\n\n{retry_instruction}" if current_next_step else retry_instruction
+        )[:1200]
+    progress.update(
+        {
+            "task_id": run.task_id,
+            "status": "waiting_for_retry",
+            "recovery": {
+                "kind": "agent_auto_continuation_limit",
+                "state": "waiting_for_retry",
+                "retryable": True,
+                "retry_prompt": "continue",
+                "checkpoint_run_id": run.id,
+                "segments_used": segments_used,
+                "segment_limit": segment_limit,
+            },
+            "revision": int(progress.get("revision") or 0) + 1,
+            "updated_at": time(),
+        }
+    )
+    run.task_progress = progress
+    run.status = "waiting_for_user"
+    run.finished_at = None
+    run.error = ""
+    run.summary = "Automatic continuation limit reached; waiting for a manual retry."
+
+    handoff = _event(
+        run,
+        "task_handoff",
+        {
+            "call_id": f"recovery_handoff_{run.id}_{segments_used}",
+            "name": "Saved checkpoint",
+            "title": "Checkpoint saved; retry ready",
+            "status": "blocked",
+            "summary": retry_instruction,
+            "reason": "Automatic continuation limit reached; manual retry required.",
+            "reason_code": "agent_auto_continuation_limit",
+            "recovery_state": "waiting_for_retry",
+            "retryable": True,
+            "retry_prompt": "continue",
+            "task_id": run.task_id,
+            "from_run_id": run.id,
+            "to_run_id": "",
+            "segment_index": run.segment_index,
+            "segments_used": segments_used,
+            "segment_limit": segment_limit,
+        },
+    )
+    assistant_message = store.append_message(
+        record,
+        "assistant",
+        retry_instruction,
+        run.id,
+        session_id=run.session_id,
+        task_id=run.task_id,
+        kind="progress",
+        progress_action="block",
+        progress=deepcopy(run.task_progress),
+        activity_events=_activity_events(run),
+    )
+    done = _event(
+        run,
+        "done",
+        {
+            "assistant_message": assistant_message.model_dump(mode="json"),
+            "run": run.model_dump(mode="json"),
+            "context": record.context.model_dump(mode="json"),
+        },
+    )
+    store.save(record)
+    return handoff, done
+
+
+def _remove_persisted_event(run: AIRun, event: dict[str, Any]) -> None:
+    """Drop an internal error that is replaced by a structured recovery handoff."""
+
+    event_id = str(event.get("id") or "")
+    if not event_id:
+        return
+    for index in range(len(run.events) - 1, -1, -1):
+        persisted = run.events[index]
+        if persisted.get("id") == event_id and persisted.get("type") == "error":
+            del run.events[index]
+            return
 
 
 def _has_durable_task_checkpoint(run: AIRun) -> bool:
@@ -1010,10 +1296,42 @@ def _manual_continuation_source(
 
 def _run_accepts_manual_continuation(run: AIRun) -> bool:
     progress_status = str((run.task_progress or {}).get("status") or "").casefold()
+    if _is_waiting_for_manual_retry(run):
+        return True
     return (
         run.status == "failed"
         or progress_status in {"continuing", "running", "blocked"}
     ) and run.status != "waiting_for_user"
+
+
+def _is_waiting_for_manual_retry(run: AIRun) -> bool:
+    progress = run.task_progress or {}
+    recovery = progress.get("recovery")
+    return (
+        run.status == "waiting_for_user"
+        and str(progress.get("status") or "").casefold() == "waiting_for_retry"
+        and isinstance(recovery, dict)
+        and recovery.get("kind") == "agent_auto_continuation_limit"
+        and recovery.get("state") == "waiting_for_retry"
+        and recovery.get("retryable") is True
+    )
+
+
+def _mark_manual_retry_started(run: AIRun, retry_run_id: str) -> None:
+    """Close a retryable pause once a child segment has been created."""
+
+    progress = deepcopy(run.task_progress or {})
+    recovery = progress.get("recovery")
+    if isinstance(recovery, dict):
+        recovery = {**recovery, "state": "retry_started", "retry_run_id": retry_run_id}
+        progress["recovery"] = recovery
+    progress["status"] = "continued"
+    progress["updated_at"] = time()
+    run.task_progress = progress
+    run.status = "succeeded"
+    run.finished_at = time()
+    run.error = ""
+    run.summary = "Manual retry started from the saved checkpoint."
 
 
 def _next_task_segment_index(record: BusinessRecord, task_id: str) -> int:

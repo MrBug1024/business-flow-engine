@@ -79,7 +79,7 @@
 - JSON 结构化输出和错误状态；
 - 环境变量配置。
 
-必须完整复制 `ocr-parser` 除通用 `SKILL.md`/UI 说明以外的脚本、依赖、配置和其他运行资源，重建场景专属 `SKILL.md` 和 `scenario_binding.json`。配置字段和值原样保留；平台凭据存储或当前环境已有的 Key 按原字段物化，不得清空或改写。
+必须完整复制 `ocr-parser` 除通用 `SKILL.md`/UI 说明以外的脚本、依赖、配置和其他运行资源，重建场景专属 `SKILL.md` 和 `scenario_binding.json`。公开配置字段和值原样保留；API Key 等秘密字段只保留字段名并清空，平台凭据存储或当前环境已有的 Key 只能通过同名环境变量在第三方运行时注入。
 
 ### knowledge
 

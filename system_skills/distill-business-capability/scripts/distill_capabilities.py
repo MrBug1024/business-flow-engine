@@ -6,11 +6,13 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import hmac
 import json
 import os
 import re
 import shutil
 import sys
+import zipfile
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,11 +21,15 @@ from typing import Any, Iterable, Sequence
 
 SCHEMA_VERSION = 1
 GENERATOR_CONTRACT_VERSION = 2
+RELEASE_CONTRACT_VERSION = 1
 RELATION_CAPABILITY = "discover-data-relations"
 FLOW_CAPABILITY = "derive-business-flow"
+PLATFORM_APPROVAL_ISSUER = "business-flow-platform"
+PLATFORM_APPROVAL_KEY_ENV = "BUSINESS_FLOW_PLATFORM_APPROVAL_HMAC_KEY"
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 MAX_EVIDENCE_BYTES = 8 * 1024 * 1024
 MAX_OPERATIONAL_BYTES = 8 * 1024 * 1024
+MAX_PLATFORM_APPROVAL_BYTES = 2 * 1024 * 1024
 MAX_CANDIDATE_BYTES = 512 * 1024
 MAX_FILES = 500
 MAX_STAGE_SKILLS = 12
@@ -81,6 +87,14 @@ FORBIDDEN_PORTABLE_TEXT = {
     "outputs/data-relations": "internal upstream output path",
     "outputs/business-flow": "internal upstream output path",
 }
+RESOLVED_QUESTION_STATUSES = {"resolved", "closed", "answered", "已解决", "已关闭", "已回答"}
+RUNTIME_EXCEPTION_STATUSES = {"runtime_exception", "exception", "waived", "运行时例外", "例外"}
+APPROVED_EXCEPTION_STATUSES = {"approved", "accepted", "允许", "批准", "同意"}
+USER_APPROVAL_ACTORS = {"user", "business_user", "customer", "用户", "业务用户"}
+USER_APPROVAL_DECISIONS = {"approved", "accepted", "允许", "批准", "同意"}
+CRITICAL_QUESTION_MARKERS = {
+    "critical", "blocker", "p0", "p1", "high", "关键", "严重", "重大", "高风险", "高影响",
+}
 
 
 class ContractError(ValueError):
@@ -125,6 +139,289 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def platform_approval_signing_payload(envelope: dict[str, Any]) -> bytes:
+    """Use the same UTF-8 canonical HMAC payload as the platform workbench."""
+
+    unsigned = {name: value for name, value in envelope.items() if name != "signature"}
+    return json.dumps(
+        unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def platform_approval_signature(envelope: dict[str, Any], key: str) -> str:
+    return hmac.new(
+        key.encode("utf-8"), platform_approval_signing_payload(envelope), hashlib.sha256,
+    ).hexdigest()
+
+
+def platform_approvals_path(relation_root: Path) -> Path:
+    return relation_root.resolve() / "platform-approvals.json"
+
+
+def _same_resolved_path(value: Any, expected: Path) -> bool:
+    try:
+        return Path(str(value)).resolve() == expected.resolve()
+    except OSError:
+        return False
+
+
+def platform_evidence_receipt_errors(relation_root: Path) -> list[str]:
+    """Verify the signed trace-review and micro-process evidence chain.
+
+    Capability distillation must not turn a free-text review or an old flow
+    into a portable package.  It rechecks the canonical data-relations
+    evidence at consumption time, rather than trusting a prior process's
+    success status.
+    """
+
+    key = os.environ.get(PLATFORM_APPROVAL_KEY_ENV, "")
+    if not key:
+        return [
+            f"Platform approval verifier is unavailable: {PLATFORM_APPROVAL_KEY_ENV} is not configured. "
+            "Capability distillation is fail-closed."
+        ]
+
+    root = relation_root.resolve()
+    trace_path = root / "trace-samples.json"
+    review_path = root / "trace-review.json"
+    micro_path = root / "micro-process.json"
+    ledger_path = platform_approvals_path(root)
+    for label, path in (
+        ("trace-samples", trace_path),
+        ("trace-review", review_path),
+        ("micro-process", micro_path),
+        ("platform approval ledger", ledger_path),
+    ):
+        if not path.is_file():
+            return [f"Canonical {label} artifact is missing: {path}"]
+
+    try:
+        trace = load_json(trace_path, MAX_OPERATIONAL_BYTES)
+        review = load_json(review_path, MAX_OPERATIONAL_BYTES)
+        micro = load_json(micro_path, MAX_OPERATIONAL_BYTES)
+        ledger = load_json(ledger_path, MAX_PLATFORM_APPROVAL_BYTES)
+    except ContractError as exc:
+        return [f"Platform approval evidence cannot be read: {exc}"]
+
+    errors: list[str] = []
+    trace_fingerprint = sha256_file(trace_path)
+    review_fingerprint = sha256_file(review_path)
+    micro_fingerprint = sha256_file(micro_path)
+    if trace.get("status") != "complete":
+        errors.append("Canonical trace-samples.json is not complete")
+
+    trace_reference = review.get("trace") if isinstance(review.get("trace"), dict) else {}
+    if review.get("schema_version") != SCHEMA_VERSION or review.get("kind") != "trace_review":
+        errors.append("Canonical trace-review.json is not a supported trace_review contract")
+    if review.get("status") != "approved":
+        errors.append("Canonical trace-review.json is not approved")
+    if not _same_resolved_path(trace_reference.get("artifact"), trace_path):
+        errors.append("Trace review does not reference canonical trace-samples.json")
+    if str(trace_reference.get("fingerprint", "")) != trace_fingerprint:
+        errors.append("Trace review does not bind the current trace-samples fingerprint")
+    if not str(trace_reference.get("bundle_id", "")).strip():
+        errors.append("Trace review does not bind a trace bundle")
+    review_approval = review.get("approval") if isinstance(review.get("approval"), dict) else {}
+    if review_approval.get("decision") != "approved":
+        errors.append("Trace review approval decision is not approved")
+
+    micro_source = micro.get("source") if isinstance(micro.get("source"), dict) else {}
+    if micro.get("schema_version") != SCHEMA_VERSION or micro.get("kind") != "trace_micro_process":
+        errors.append("Canonical micro-process.json is not a supported trace_micro_process contract")
+    if micro.get("status") != "approved":
+        errors.append("Canonical micro-process.json is not approved")
+    if not _same_resolved_path(micro_source.get("trace_review"), review_path):
+        errors.append("Micro-process does not reference canonical trace-review.json")
+    if str(micro_source.get("trace_review_fingerprint", "")) != review_fingerprint:
+        errors.append("Micro-process does not bind the current trace-review fingerprint")
+    micro_approval = micro.get("approval") if isinstance(micro.get("approval"), dict) else {}
+    if micro_approval.get("decision") != "approved":
+        errors.append("Micro-process approval decision is not approved")
+
+    if (
+        ledger.get("schema_version") != SCHEMA_VERSION
+        or ledger.get("kind") != "platform_approval_envelopes"
+        or ledger.get("issuer") != PLATFORM_APPROVAL_ISSUER
+    ):
+        errors.append("Platform approval ledger has an unsupported issuer or schema")
+        return errors
+    approvals = ledger.get("approvals")
+    if not isinstance(approvals, list):
+        return errors + ["Platform approval ledger must contain an approvals array"]
+
+    def has_receipt(kind: str, artifact_fingerprint: str) -> bool:
+        for envelope in approvals:
+            if not isinstance(envelope, dict):
+                continue
+            if (
+                envelope.get("schema_version") != SCHEMA_VERSION
+                or envelope.get("issuer") != PLATFORM_APPROVAL_ISSUER
+                or envelope.get("artifact_kind") != kind
+                or envelope.get("decision") != "approved"
+                or str(envelope.get("artifact_fingerprint", "")) != artifact_fingerprint
+                or str(envelope.get("trace_fingerprint", "")) != trace_fingerprint
+                or not str(envelope.get("approval_id", "")).strip()
+                or not str(envelope.get("subject", "")).strip()
+                or not str(envelope.get("issued_at", "")).strip()
+            ):
+                continue
+            signature = str(envelope.get("signature", "")).strip().casefold()
+            expected = platform_approval_signature(envelope, key).casefold()
+            if hmac.compare_digest(signature, expected):
+                return True
+        return False
+
+    if not has_receipt("trace_review", review_fingerprint):
+        errors.append(
+            "No valid platform-signed trace_review receipt matches the current trace-review and trace-samples artifacts"
+        )
+    if not has_receipt("micro_process", micro_fingerprint):
+        errors.append(
+            "No valid platform-signed micro_process receipt matches the current micro-process and trace-samples artifacts"
+        )
+    return errors
+
+
+def platform_package_receipt_errors(
+    relation_root: Path,
+    manifest_path: Path,
+    manifest: dict[str, Any],
+) -> list[str]:
+    """Verify the platform's independent approval of the release archive.
+
+    ``capability-manifest.json`` is generated by the distillation process and
+    therefore cannot, by itself, be the authority that releases the package.
+    The platform appends a separately HMAC-signed approval envelope to the
+    data-relations ledger after a human reviews the concrete ``skill.zip``.
+    Bind that receipt to every release-critical artifact plus the exact
+    upstream relation/flow fingerprints so an old approval cannot publish a
+    regenerated or partially modified package.
+    """
+
+    key = os.environ.get(PLATFORM_APPROVAL_KEY_ENV, "")
+    if not key:
+        return [
+            f"Platform approval verifier is unavailable: {PLATFORM_APPROVAL_KEY_ENV} is not configured. "
+            "Capability package publication is fail-closed."
+        ]
+
+    source = manifest.get("source") if isinstance(manifest.get("source"), dict) else {}
+    relation_fingerprint = str(source.get("relation_fingerprint", "")).strip()
+    flow_fingerprint = str(source.get("flow_fingerprint", "")).strip()
+    if not relation_fingerprint or not flow_fingerprint:
+        return [
+            "Capability manifest is missing its relation_fingerprint or flow_fingerprint; "
+            "a package approval receipt cannot be bound safely."
+        ]
+
+    release_root = manifest_path.resolve().parent
+    expected_artifact_paths = {
+        "capability_manifest": manifest_path.resolve(),
+        "release_manifest": release_root / "release" / "release.json",
+        "skill_archive": release_root / "release" / "artifacts" / "skill.zip",
+        "mcp_stdio_archive": release_root / "release" / "artifacts" / "mcp-stdio.zip",
+    }
+    missing_artifacts = [
+        f"{name} ({path})" for name, path in expected_artifact_paths.items() if not path.is_file()
+    ]
+    if missing_artifacts:
+        return [
+            "Capability release artifacts are missing; a platform package receipt cannot be verified: "
+            + ", ".join(missing_artifacts)
+        ]
+    package_artifacts = {
+        name: sha256_file(path) for name, path in expected_artifact_paths.items()
+    }
+    artifact_fingerprint = package_artifacts["skill_archive"]
+
+    ledger_path = platform_approvals_path(relation_root)
+    if not ledger_path.is_file():
+        return [
+            "Platform-signed capability_package approval is required; platform-approvals.json is missing."
+        ]
+    try:
+        ledger = load_json(ledger_path, MAX_PLATFORM_APPROVAL_BYTES)
+    except ContractError as exc:
+        return [f"Platform package approval ledger cannot be read: {exc}"]
+
+    if (
+        ledger.get("schema_version") != SCHEMA_VERSION
+        or ledger.get("kind") != "platform_approval_envelopes"
+        or ledger.get("issuer") != PLATFORM_APPROVAL_ISSUER
+    ):
+        return ["Platform package approval ledger has an unsupported issuer or schema"]
+    approvals = ledger.get("approvals")
+    if not isinstance(approvals, list):
+        return ["Platform package approval ledger must contain an approvals array"]
+
+    package_receipts = 0
+    invalid_matching_receipts: list[str] = []
+    mismatch_reasons: set[str] = set()
+    for index, envelope in enumerate(approvals):
+        if not isinstance(envelope, dict) or envelope.get("artifact_kind") != "capability_package":
+            continue
+        package_receipts += 1
+
+        receipt_artifact = str(envelope.get("artifact_fingerprint", "")).strip()
+        receipt_relation = str(envelope.get("relation_fingerprint", "")).strip()
+        receipt_flow = str(envelope.get("flow_fingerprint", "")).strip()
+        receipt_artifacts = envelope.get("package_artifacts")
+        receipt_mismatches: list[str] = []
+        if receipt_artifact != artifact_fingerprint:
+            receipt_mismatches.append("skill.zip fingerprint")
+        if receipt_relation != relation_fingerprint:
+            receipt_mismatches.append("relation fingerprint")
+        if receipt_flow != flow_fingerprint:
+            receipt_mismatches.append("flow fingerprint")
+        if not isinstance(receipt_artifacts, dict):
+            receipt_mismatches.append("package_artifacts")
+        else:
+            for name, expected_fingerprint in package_artifacts.items():
+                if str(receipt_artifacts.get(name, "")).strip() != expected_fingerprint:
+                    receipt_mismatches.append(f"package_artifacts.{name}")
+        if receipt_mismatches:
+            mismatch_reasons.update(receipt_mismatches)
+            continue
+
+        missing_fields = [
+            field for field in ("approval_id", "subject", "issued_at", "signature")
+            if not str(envelope.get(field, "")).strip()
+        ]
+        if (
+            envelope.get("schema_version") != SCHEMA_VERSION
+            or envelope.get("issuer") != PLATFORM_APPROVAL_ISSUER
+            or envelope.get("decision") != "approved"
+            or missing_fields
+        ):
+            invalid_matching_receipts.append(
+                f"receipt #{index} has an invalid contract"
+                + (f" (missing {', '.join(missing_fields)})" if missing_fields else "")
+            )
+            continue
+
+        signature = str(envelope.get("signature", "")).strip().casefold()
+        expected = platform_approval_signature(envelope, key).casefold()
+        if not hmac.compare_digest(signature, expected):
+            invalid_matching_receipts.append(f"receipt #{index} has an invalid platform signature")
+            continue
+        return []
+
+    if invalid_matching_receipts:
+        return [
+            "Capability package approval receipt is malformed or tampered: "
+            + "; ".join(invalid_matching_receipts)
+        ]
+    if package_receipts:
+        detail = ", ".join(sorted(mismatch_reasons)) or "required receipt fields"
+        return [
+            "No valid platform-signed capability_package receipt matches the current "
+            f"release and upstream fingerprints ({detail} differs)."
+        ]
+    return [
+        "No platform-signed capability_package receipt is present for the current release archive."
+    ]
+
+
 def compact(value: Any, limit: int = 360) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     return text if len(text) <= limit else text[: limit - 1] + "…"
@@ -136,11 +433,222 @@ def unique_strings(value: Any) -> list[str]:
     return list(dict.fromkeys(str(item) for item in value if str(item)))
 
 
+def normalized_question_value(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "").casefold())
+
+
+def question_is_critical(question: dict[str, Any]) -> bool:
+    if question.get("critical") is True:
+        return True
+    for key in ("severity", "priority", "impact", "risk"):
+        value = normalized_question_value(question.get(key))
+        if value in CRITICAL_QUESTION_MARKERS or any(marker in value for marker in CRITICAL_QUESTION_MARKERS):
+            return True
+    return False
+
+
+def runtime_exception_errors(question: dict[str, Any], identifier: str) -> list[str]:
+    """Require an explicit, user-backed waiver before packaging an uncertainty."""
+
+    exception = question.get("runtime_exception")
+    if not isinstance(exception, dict):
+        return [
+            f"open_question {identifier} 需要显式 runtime_exception，且必须附带用户批准证据"
+        ]
+    errors: list[str] = []
+    if normalized_question_value(exception.get("status")) not in APPROVED_EXCEPTION_STATUSES:
+        errors.append(f"open_question {identifier}.runtime_exception.status 必须为 approved")
+    if len(str(exception.get("reason", "")).strip()) < 8:
+        errors.append(f"open_question {identifier}.runtime_exception.reason 必须说明运行时例外原因")
+    if len(str(exception.get("scope", "")).strip()) < 4:
+        errors.append(f"open_question {identifier}.runtime_exception.scope 必须说明例外适用范围")
+    approval = exception.get("user_approval")
+    if not isinstance(approval, dict):
+        errors.append(f"open_question {identifier}.runtime_exception 必须包含 user_approval 用户批准证据")
+        return errors
+    if normalized_question_value(approval.get("actor")) not in USER_APPROVAL_ACTORS:
+        errors.append(f"open_question {identifier}.runtime_exception.user_approval.actor 必须标识为用户")
+    if normalized_question_value(approval.get("decision")) not in USER_APPROVAL_DECISIONS:
+        errors.append(f"open_question {identifier}.runtime_exception.user_approval.decision 必须为 approved")
+    if not (
+        str(approval.get("user_id", "")).strip()
+        or str(approval.get("actor_id", "")).strip()
+    ):
+        errors.append(f"open_question {identifier}.runtime_exception.user_approval 缺少 user_id")
+    if not (
+        str(approval.get("evidence_ref", "")).strip()
+        or str(approval.get("evidence_id", "")).strip()
+    ):
+        errors.append(f"open_question {identifier}.runtime_exception.user_approval 缺少 evidence_ref")
+    if len(str(approval.get("approved_at", "")).strip()) < 8:
+        errors.append(f"open_question {identifier}.runtime_exception.user_approval 缺少 approved_at")
+    return errors
+
+
+def open_question_gate_errors(open_questions: Any) -> list[str]:
+    """Return release blockers for unresolved or critical business questions."""
+
+    if not isinstance(open_questions, list):
+        return []
+    errors: list[str] = []
+    for index, question in enumerate(open_questions):
+        if not isinstance(question, dict):
+            continue
+        identifier = str(question.get("id") or f"index-{index}")
+        exception = question.get("runtime_exception")
+        if exception is not None:
+            exception_errors = runtime_exception_errors(question, identifier)
+            if not exception_errors:
+                continue
+            errors.extend(exception_errors)
+            continue
+        status = normalized_question_value(question.get("status") or "open")
+        if status in RUNTIME_EXCEPTION_STATUSES:
+            errors.extend(runtime_exception_errors(question, identifier))
+            continue
+        if question_is_critical(question):
+            errors.append(
+                f"critical open_question {identifier} 阻断 finalize；解决后应移出 open_questions，"
+                "或提供已批准的 runtime_exception"
+            )
+            continue
+        if status in RESOLVED_QUESTION_STATUSES:
+            if len(str(question.get("resolution", "")).strip()) < 4:
+                errors.append(f"resolved open_question {identifier} 缺少可审计的 resolution")
+            continue
+        errors.append(
+            f"unresolved open_question {identifier} 阻断 finalize；先记录 resolution，"
+            "或提供带用户批准证据的 runtime_exception"
+        )
+    return errors
+
+
+GENERIC_COLUMN_ROLE_MARKERS: dict[str, tuple[str, ...]] = {
+    "identifier": (
+        "id", "uuid", "key", "code", "编号", "编码", "序号", "标识", "唯一",
+    ),
+    "subject": (
+        "name", "title", "entity", "item", "object", "名称", "标题", "对象", "项目",
+    ),
+    "selector": (
+        "type", "category", "class", "group", "kind", "tag", "类别", "类型", "分类", "分组", "标签",
+    ),
+    "narrative": (
+        "description", "detail", "text", "reason", "basis", "reference", "condition", "criteria",
+        "说明", "描述", "内容", "原因", "依据", "条件", "标准", "备注", "用途", "示例", "问题",
+    ),
+    "decision": (
+        "decision", "result", "outcome", "status", "state", "flag", "结论", "结果", "状态", "标志", "是否",
+    ),
+    "measure": (
+        "amount", "price", "quantity", "count", "total", "rate", "score", "value", "金额", "价格", "数量", "次数", "总额", "比例", "分值", "值",
+    ),
+    "temporal": (
+        "date", "time", "year", "month", "day", "start", "end", "duration", "日期", "时间", "年份", "月份", "开始", "结束", "周期", "天数",
+    ),
+}
+
+
+def normalized_text(value: Any) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", str(value or "").casefold())
+
+
+def infer_column_semantic_role(column: dict[str, Any]) -> str:
+    """Assign a portable semantic role from schema facts only.
+
+    This is intentionally a small vocabulary.  It describes how a field can
+    participate in a workflow, not what business domain the field belongs to.
+    """
+    kind = str(column.get("kind", "")).casefold()
+    if kind in {"id", "identifier", "uuid", "key", "code"}:
+        return "identifier"
+    if kind in {"number", "numeric", "decimal", "integer", "float"}:
+        return "measure"
+    if kind in {"date", "datetime", "time", "timestamp"}:
+        return "temporal"
+    text = normalized_text(column.get("query_name") or column.get("name"))
+    scores = {
+        role: sum(1 for marker in markers if normalized_text(marker) in text)
+        for role, markers in GENERIC_COLUMN_ROLE_MARKERS.items()
+    }
+    role, score = max(scores.items(), key=lambda item: item[1])
+    return role if score else "attribute"
+
+
+def source_column_descriptors(source: dict[str, Any]) -> list[dict[str, Any]]:
+    descriptors: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for table in source.get("tables", []) if isinstance(source.get("tables"), list) else []:
+        if not isinstance(table, dict):
+            continue
+        table_name = str(table.get("sheet_or_table") or table.get("table") or table.get("table_name") or "")
+        for column in table.get("columns", []) if isinstance(table.get("columns"), list) else []:
+            if not isinstance(column, dict):
+                continue
+            name = str(column.get("query_name") or column.get("name") or "")
+            if not name or (table_name, name) in seen:
+                continue
+            seen.add((table_name, name))
+            descriptors.append({
+                "source_id": str(source.get("source_id", "")),
+                "table": table_name,
+                "column": name,
+                "kind": str(column.get("kind", "other")),
+                "semantic_role": infer_column_semantic_role(column),
+            })
+    return descriptors
+
+
 def is_external_knowledge_node(node: dict[str, Any]) -> bool:
     text = " ".join(str(node.get(key, "")) for key in ("name", "description", "type")).casefold()
     return any(marker.casefold() in text for marker in KNOWLEDGE_MARKERS) or any(
         marker in text
         for marker in ("crawler", "scraper", "web search", "remote api", "external api", "爬虫", "网络检索", "外部接口", "远程接口")
+    )
+
+
+def looks_like_structured_rule_source(source: dict[str, Any], result_source_ids: set[str]) -> bool:
+    """Recover a missing rule role from a generic structural profile.
+
+    The preferred source is ``material_roles`` emitted by relation discovery.
+    The fallback is retained only for legacy artifacts and uses portable
+    vocabulary (rule/policy, narrative, selector, identifier), never a
+    scenario-specific field name.
+    """
+    source_id = str(source.get("source_id", ""))
+    if source_id in result_source_ids:
+        return False
+    roles = source.get("roles") if isinstance(source.get("roles"), list) else []
+    if any(str(role.get("node_type", "")) == "rule" for role in roles if isinstance(role, dict)):
+        return True
+    material_roles = {
+        str(value) for value in source.get("material_roles", [])
+        if str(value)
+    }
+    if "rule_or_policy_material" in material_roles:
+        return True
+    table_roles = {
+        str(table.get("inferred_material_role", ""))
+        for table in source.get("tables", []) if isinstance(table, dict)
+    }
+    if "rule_or_policy_material" in table_roles:
+        return True
+    text = " ".join(str(source.get(key, "")) for key in ("path", "view_name", "table_name")).casefold()
+    if any(marker in text for marker in ("rule", "policy", "规则", "政策", "规范")):
+        return True
+    descriptors = source_column_descriptors(source)
+    # A small policy table can legitimately lack an explicit relation node;
+    # broad transactional/event tables must not be promoted merely because
+    # they happen to contain a description and a status field.
+    if len(descriptors) > 20:
+        return False
+    role_counts = defaultdict(int)
+    for item in descriptors:
+        role_counts[str(item.get("semantic_role", ""))] += 1
+    return (
+        role_counts["narrative"] >= 1
+        and role_counts["selector"] >= 1
+        and role_counts["identifier"] >= 1
     )
 
 
@@ -156,6 +664,7 @@ def normalize_operational_runtime_contract(
         if isinstance(node, dict) and is_external_knowledge_node(node)
     }
     result_source_ids = set(unique_strings(normalized.get("result_source_ids")))
+    inferred_rule_source_ids: list[str] = []
     runtime_source_ids: list[str] = []
     template_source_ids: list[str] = []
     for source in normalized.get("sources", []):
@@ -166,6 +675,28 @@ def normalize_operational_runtime_contract(
             for role in source.get("roles", [])
             if isinstance(role, dict) and str(role.get("node_id", "")) not in external_node_ids
         ]
+        if looks_like_structured_rule_source(source, result_source_ids) and not any(
+            str(role.get("node_type", "")) == "rule"
+            for role in source["roles"] if isinstance(role, dict)
+        ):
+            digest = hashlib.sha1(
+                f"inferred-rule\0{source.get('source_id', '')}".encode("utf-8")
+            ).hexdigest()[:12]
+            source["roles"].append({
+                "node_id": f"inferred_rule_{digest}",
+                "node_name": Path(str(source.get("path", ""))).stem or str(source.get("source_id", "")),
+                "node_type": "rule",
+                "inference": "distillation_structural_fallback",
+            })
+            source.setdefault("material_roles", []).append("rule_or_policy_material")
+            inferred_rule_source_ids.append(str(source.get("source_id", "")))
+        source["material_roles"] = list(dict.fromkeys(
+            str(value) for value in source.get("material_roles", []) if str(value)
+        ))
+        if "rule_or_policy_material" in source["material_roles"]:
+            source["material_role"] = "rule_or_policy_material"
+        elif source.get("material_roles"):
+            source["material_role"] = str(source["material_roles"][0])
         role_types = {str(role.get("node_type", "")) for role in source["roles"]}
         source_id = str(source.get("source_id", ""))
         runtime_roles = role_types.intersection({"actor", "input", "object", "rule", "state"})
@@ -218,6 +749,14 @@ def normalize_operational_runtime_contract(
         for source_id in unique_strings(normalized.get("rule_source_ids"))
         if source_id in runtime_ids
     ]
+    normalized["rule_source_ids"] = list(dict.fromkeys([
+        *normalized["rule_source_ids"],
+        *[source_id for source_id in inferred_rule_source_ids if source_id in runtime_ids],
+    ]))
+    normalized["rule_source_inference"] = (
+        "explicit_or_structural_contract"
+        if normalized["rule_source_ids"] else "missing"
+    )
     normalized["external_capabilities"] = [
         {
             "node_id": str(node.get("id", "")),
@@ -239,6 +778,60 @@ def normalize_operational_runtime_contract(
         "design_time_templates_are_not_runtime_dependencies": True,
     }
     return normalized
+
+
+def compact_trace_evidence(operational: dict[str, Any], *, include_rows: bool) -> dict[str, Any]:
+    trace = operational.get("trace_evidence") if isinstance(operational.get("trace_evidence"), dict) else {}
+    bundles = []
+    for bundle in trace.get("bundles", [])[:2]:
+        if not isinstance(bundle, dict):
+            continue
+        sources = []
+        for source in bundle.get("sources", [])[:12]:
+            if not isinstance(source, dict):
+                continue
+            item = {
+                "source_id": source.get("source_id"),
+                "path": source.get("path"),
+                "table": source.get("table"),
+                "role": source.get("role"),
+                "selected_columns": source.get("selected_columns", []),
+            }
+            if include_rows:
+                item["rows"] = [
+                    {
+                        "row_number": row.get("row_number"),
+                        "values": dict(list(row.get("values", {}).items())[:16]),
+                    }
+                    for row in source.get("rows", [])[:2]
+                    if isinstance(row, dict)
+                ]
+            sources.append(item)
+        bundles.append({
+            "bundle_id": bundle.get("bundle_id"),
+            "anchor": bundle.get("anchor", {}),
+            "coverage": bundle.get("coverage", {}),
+            "sources": sources,
+            "links": [
+                {
+                    "link_id": item.get("link_id"),
+                    "source_id": item.get("source_id"),
+                    "target_id": item.get("target_id"),
+                    "key_pairs": item.get("key_pairs", []),
+                    "confidence": item.get("confidence"),
+                    "matched_row_count": item.get("matched_row_count"),
+                    "fanout_warning": item.get("fanout_warning"),
+                }
+                for item in bundle.get("links", [])[:12]
+                if isinstance(item, dict)
+            ],
+            "semantic_evidence": bundle.get("semantic_evidence", [])[:2] if include_rows else [],
+        })
+    return {
+        "status": trace.get("status", "missing"),
+        "strategy": trace.get("strategy", ""),
+        "bundles": bundles,
+    }
 
 
 def validate_identifier(owner: str, value: Any, errors: list[str]) -> str:
@@ -345,6 +938,35 @@ def validate_flow(path: Path, relation_path: Path, relation_fingerprint: str) ->
         errors.append("流程产物没有引用当前 operational-data-contract.json")
     if operational_path.is_file() and operational_claim.get("fingerprint") != sha256_file(operational_path):
         errors.append("流程产物引用的数据执行契约 fingerprint 已过期")
+    micro_path = relation_path.parent / "micro-process.json"
+    micro_claim = source.get("micro_process") if isinstance(source.get("micro_process"), dict) else {}
+    try:
+        claimed_micro_path = Path(str(micro_claim.get("artifact", ""))).resolve()
+    except OSError:
+        claimed_micro_path = Path("__invalid__")
+    if claimed_micro_path != micro_path.resolve():
+        errors.append("流程产物没有引用当前已批准的 micro-process.json")
+    elif not micro_path.is_file():
+        errors.append("当前关系目录缺少 micro-process.json")
+    elif micro_claim.get("fingerprint") != sha256_file(micro_path):
+        errors.append("流程产物引用的 micro-process fingerprint 已过期")
+    else:
+        try:
+            micro = load_json(micro_path, MAX_OPERATIONAL_BYTES)
+        except ContractError as exc:
+            errors.append(str(exc))
+            micro = {}
+        if micro.get("kind") != "trace_micro_process" or micro.get("status") != "approved":
+            errors.append("micro-process.json 必须是已批准的样本无关复现契约")
+        elif micro_claim.get("status") != "approved":
+            errors.append("流程产物未声明已批准的 micro-process 状态")
+
+    # Re-verify the platform authority at the consumption boundary.  A flow
+    # may have been produced before an approval was revoked, the trace may
+    # have been regenerated, or a caller may be trying to bypass derive's
+    # validation by supplying a hand-written flow artifact.
+    errors.extend(platform_evidence_receipt_errors(relation_path.parent))
+
     expected_execution_policy = {
         "rule_resolution": "complete_rule_record_before_bulk_query",
         "bulk_data_access": "bounded_read_only_sql",
@@ -352,7 +974,15 @@ def validate_flow(path: Path, relation_path: Path, relation_fingerprint: str) ->
         "agent_direct_file_read": False,
         "unstructured_access": "parse_or_ocr_then_provenance_chunk_search",
     }
-    if payload.get("execution_policy") != expected_execution_policy:
+    # The flow contract owns this object and may add new, machine-verifiable
+    # safeguards (for example the selected trace policy).  Rejecting an
+    # otherwise valid flow merely because it carries an additive safeguard
+    # silently breaks forward compatibility between the two platform skills.
+    execution_policy = payload.get("execution_policy")
+    if not isinstance(execution_policy, dict) or any(
+        execution_policy.get(key) != value
+        for key, value in expected_execution_policy.items()
+    ):
         errors.append("流程产物缺少规则优先、只读 SQL 和关联校验执行策略")
     stages = payload.get("stages")
     if not isinstance(stages, list) or not 1 <= len(stages) <= MAX_STAGE_SKILLS:
@@ -714,6 +1344,16 @@ def stage_execution_contract(stage: dict[str, Any], operational: dict[str, Any])
             or str(route.get("target_id", "")) in source_ids
         )
     ]
+    trace_bundle_ids = [
+        str(bundle.get("bundle_id", ""))
+        for bundle in operational.get("trace_evidence", {}).get("bundles", [])
+        if isinstance(bundle, dict)
+        and any(
+            str(source.get("source_id", "")) in source_ids
+            for source in bundle.get("sources", [])
+            if isinstance(source, dict)
+        )
+    ]
     return {
         "source_ids": sorted(set(source_ids)),
         "large_source_ids": sorted(set(large_source_ids)),
@@ -723,6 +1363,8 @@ def stage_execution_contract(stage: dict[str, Any], operational: dict[str, Any])
         "link_ids": sorted(set(link_ids)),
         "document_source_ids": sorted(set(document_source_ids)),
         "semantic_route_ids": sorted(set(semantic_route_ids)),
+        "trace_bundle_ids": sorted(set(trace_bundle_ids)),
+        "trace_guidance": "validated_design_time_blueprint_revalidate_on_runtime_data" if trace_bundle_ids else "not_available",
         "agent_direct_file_read": False,
         "large_data_access": "bounded_read_only_sql" if large_source_ids else "bounded_tool_access",
         "rule_record_mode": "complete_selected_record" if rule_source_ids else "not_applicable",
@@ -880,6 +1522,7 @@ def build_brief(
                 }
                 for item in operational.get("semantic_routes", [])
             ],
+            "trace_evidence": compact_trace_evidence(operational, include_rows=True),
         },
         "distillation_policy": {
             "required_outputs": [
@@ -1018,7 +1661,7 @@ def claims_template(
             "platform_independent": True,
             "python_requirement": ">=3.10",
             "resource_paths": "relative_to_each_skill",
-            "credentials": "preserve_system_skill_configuration",
+            "credentials": "preserve_public_defaults_externalize_credentials",
         },
         "file_inventory": inventory,
         "foundation_skills": foundations,
@@ -1087,6 +1730,136 @@ def prepare(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     }
     atomic_json(output_root / "prepare-status.json", payload)
     return 0, {**payload, "distillation_brief": brief}
+
+
+def baseline_candidate(template: dict[str, Any]) -> dict[str, Any]:
+    """Fill only reusable plan prose from accepted contracts.
+
+    This deliberately does not inspect source rows, infer a domain rule, or
+    create a business-specific decision procedure.  It gives every scenario a
+    valid, reviewable capability-plan baseline so the distillation flow itself
+    does not consume an Agent turn just to restate accepted flow contracts.
+    """
+    claims = json.loads(json.dumps(template, ensure_ascii=False))
+    scenario = claims.get("scenario") if isinstance(claims.get("scenario"), dict) else {}
+    scenario_name = str(scenario.get("name", "business scenario")).strip() or "business scenario"
+    scenario_token = hashlib.sha256(scenario_name.encode("utf-8")).hexdigest()[:10]
+    prefix = f"scenario-{scenario_token}"
+    bundle_name = f"{prefix}-capabilities"
+    claims["bundle"]["name"] = bundle_name
+    claims["bundle"]["description"] = (
+        f"Portable capability source for the {scenario_name} scenario, for third-party Agents to use "
+        "accepted data contracts, stage responsibilities, and flow routing without direct raw-file access."
+    )
+    for foundation in claims.get("foundation_skills", []):
+        if not isinstance(foundation, dict):
+            continue
+        kind = str(foundation.get("kind", "reader"))
+        formats = ", ".join(unique_strings(foundation.get("formats"))) or "declared source files"
+        foundation["skill_name"] = f"{prefix}-{kind}-reader"
+        foundation["display_name"] = f"{scenario_name} {kind} data reader"
+        foundation["description"] = (
+            f"Use this read-only {kind} foundation when {scenario_name} receives {formats} inputs "
+            "required by an accepted stage contract; it returns bounded, provenance-bearing data and never makes a business decision."
+        )
+        foundation["when_to_use"] = [
+            f"A {scenario_name} request includes a declared {formats} runtime source.",
+            "A stage input contract requires a bounded, read-only source lookup or verification.",
+        ]
+        foundation["scenario_instructions"] = [
+            "Use only the declared file roles and runtime bindings; preserve source identifiers and query provenance.",
+        ]
+        foundation["non_goals"] = [
+            "Do not infer a business rule, decide an outcome, modify a source file, or load a full large source into Agent context.",
+        ]
+    for stage in claims.get("stage_skills", []):
+        if not isinstance(stage, dict):
+            continue
+        stage_id = str(stage.get("stage_id", "stage"))
+        stage_slug = re.sub(r"[^a-z0-9]+", "-", stage_id.casefold().replace("_", "-")).strip("-") or "stage"
+        stage["skill_name"] = f"{prefix}-{stage_slug}"[:63].rstrip("-")
+        display_name = str(stage.get("display_name", stage_id)).strip() or stage_id
+        outcome = str(stage.get("outcome", "the accepted stage outcome")).strip()
+        stage["description"] = (
+            f"Use this skill when a {scenario_name} request reaches the {display_name} stage or the prior accepted handoff is available. "
+            f"It produces {outcome} under the stage input/output contracts and does not perform adjacent-stage responsibilities."
+        )
+        stage["invocation_triggers"] = [
+            f"The user explicitly requests the {display_name} responsibility in {scenario_name}.",
+            "The accepted predecessor handoff satisfies this stage input contract.",
+        ]
+        input_ids = list(dict.fromkeys(
+            node_id
+            for contract in stage.get("input_contract", []) if isinstance(contract, dict)
+            for node_id in unique_strings(contract.get("relation_node_ids"))
+        ))
+        procedure = [
+            {
+                "action": "Verify only the declared stage inputs and keep evidence bounded to the accepted contract.",
+                "basis": "input_contract" if input_ids else "flow_stage",
+                "source_ids": input_ids[:2] if input_ids else [stage_id],
+            },
+            {
+                "action": "Produce the accepted stage outcome and a traceable handoff without extending the business procedure.",
+                "basis": "flow_stage",
+                "source_ids": [stage_id],
+            },
+        ]
+        controls = unique_strings(stage.get("control_ids"))
+        if controls:
+            procedure.insert(1, {
+                "action": "Apply the accepted stage control before making a decision; do not derive rules from historical examples.",
+                "basis": "control",
+                "source_ids": controls,
+            })
+        stage["procedure"] = procedure
+        stage["non_goals"] = [
+            "Do not execute predecessor or successor stages, and do not invent unsupported branches, rules, approvals, or exceptions.",
+        ]
+    orchestrator = claims.get("orchestrator") if isinstance(claims.get("orchestrator"), dict) else {}
+    orchestrator["skill_name"] = f"{prefix}-orchestrator"
+    orchestrator["description"] = (
+        f"Use this orchestrator for an end-to-end {scenario_name} request or a request spanning multiple stages. "
+        "It routes only through the accepted main flow, preserves handoffs and boundaries, and does not replace stage-level business execution."
+    )
+    orchestrator["invocation_triggers"] = [
+        f"The user requests an end-to-end {scenario_name} outcome.",
+        "The request spans two or more accepted stages and requires controlled routing.",
+    ]
+    orchestrator["failure_policy"] = [
+        "Stop the affected stage and report the missing input, rule, source compatibility, or validation evidence.",
+        "Keep unresolved branches as explicit questions; never choose them from historical frequency or fabricated facts.",
+    ]
+    orchestrator["non_goals"] = [
+        "Do not replace a stage Skill, invent a business decision, publish the package, or bypass the accepted main flow.",
+    ]
+    for item in claims.get("unsupported_formats", []):
+        if isinstance(item, dict):
+            item["reason"] = "No portable parser is bundled for this format; convert it to a declared supported format before execution."
+    return claims
+
+
+def draft(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
+    output_root, relation_path, flow_path, relations, flow, relation_fingerprint, flow_fingerprint = source_context(args)
+    candidate_path = Path(args.claims).resolve() if getattr(args, "claims", "") else output_root / "capability-plan.candidate.json"
+    if candidate_path.exists():
+        return 2, {
+            "schema_version": SCHEMA_VERSION,
+            "status": "blocked_candidate_exists",
+            "claims": str(candidate_path),
+            "next_action": "Review or rename the existing candidate; the draft command never overwrites a human-authored plan.",
+        }
+    template = claims_template(relations, flow, relation_path, flow_path, relation_fingerprint, flow_fingerprint)
+    candidate = baseline_candidate(template)
+    atomic_json(candidate_path, candidate)
+    return 0, {
+        "schema_version": SCHEMA_VERSION,
+        "status": "candidate_created",
+        "claims": str(candidate_path),
+        "semantic_origin": "accepted-contract-baseline",
+        "raw_data_access": "none",
+        "next_action": "Run preflight; refine only bounded business wording if a reviewer has accepted additional semantics.",
+    }
 
 
 def source_context(args: argparse.Namespace) -> tuple[Path, Path, Path, dict[str, Any], dict[str, Any], str, str]:
@@ -1218,7 +1991,7 @@ def validate_plan(
         "platform_independent": True,
         "python_requirement": ">=3.10",
         "resource_paths": "relative_to_each_skill",
-        "credentials": "preserve_system_skill_configuration",
+        "credentials": "preserve_public_defaults_externalize_credentials",
     }
     for key, expected in expected_portability.items():
         if portability.get(key) != expected:
@@ -1507,12 +2280,37 @@ def candidate_context(args: argparse.Namespace) -> tuple[
 
 
 def validation_payload(
-    claims: dict[str, Any], relations: dict[str, Any], flow: dict[str, Any], relation_path: Path,
+    claims: dict[str, Any], relations: dict[str, Any], flow: dict[str, Any], output_root: Path, relation_path: Path,
     flow_path: Path, relation_fingerprint: str, flow_fingerprint: str, claims_path: Path,
 ) -> dict[str, Any]:
     errors = validate_plan(
         claims, relations, flow, relation_path, flow_path, relation_fingerprint, flow_fingerprint
     )
+    reliability_gates: dict[str, Any] = {}
+    question_errors = open_question_gate_errors(flow.get("open_questions"))
+    if question_errors:
+        errors.extend(question_errors)
+        reliability_gates["open_questions"] = {
+            "status": "blocked",
+            "errors": question_errors,
+            "policy": "Unresolved or critical business questions cannot be transferred into a publishable capability package.",
+        }
+    _, operational, operational_errors = operational_context(relations, relation_path)
+    recipe_verification: dict[str, Any] | None = None
+    if not operational_errors:
+        recipe_verification = compiled_recipe_verification(output_root, flow, operational)
+        if recipe_verification.get("publishable") is not True:
+            uncovered = recipe_verification.get("uncovered_source_ids", [])
+            reason = str(recipe_verification.get("reason", ""))
+            if uncovered:
+                errors.append(
+                    "compiled-recipes.json 未覆盖已声明的知识判定源：" + ", ".join(map(str, uncovered))
+                )
+            elif reason:
+                errors.append(reason)
+            else:
+                errors.append("compiled-recipes.json 未通过可验证发布门禁")
+            reliability_gates["compiled_recipes"] = recipe_verification
     if not errors:
         return {
             "schema_version": SCHEMA_VERSION,
@@ -1521,10 +2319,11 @@ def validation_payload(
             "claims": str(claims_path),
             "foundation_count": len(claims.get("foundation_skills", [])),
             "stage_skill_count": len(claims.get("stage_skills", [])),
-            "total_skill_count": len(claims.get("foundation_skills", [])) + len(claims.get("stage_skills", [])) + 1,
+            "total_skill_count": len(claims.get("foundation_skills", [])) + len(claims.get("stage_skills", [])) + 2,
+            "recipe_verification": recipe_verification,
             "next_action": "使用完全相同的候选路径运行 finalize。",
         }
-    return {
+    payload = {
         "schema_version": SCHEMA_VERSION,
         "status": "validation_failed",
         "error_count": len(errors),
@@ -1538,9 +2337,16 @@ def validation_payload(
             "只生成当前格式真正需要的基础能力，并在描述中写清场景文件角色和调用时机。",
             "程序步骤必须引用流程阶段、输入输出、控制、状态或交接 ID，不得凭历史记录补微观逻辑。",
             "所有输出 Skill 必须脱离 Studio，资源使用相对路径，秘密只来自环境变量。",
+            "未解决问题必须记录可审计 resolution；临时放行必须写 runtime_exception 和用户批准证据。",
+            "每个已声明结构化知识判定源必须有覆盖整类规则的 reviewed family recipe。",
         ],
         "next_action": "一次性修正 repair_target 后重跑 preflight；fingerprint 过期时先重新 prepare。",
     }
+    if recipe_verification is not None:
+        payload["recipe_verification"] = recipe_verification
+    if reliability_gates:
+        payload["reliability_gates"] = reliability_gates
+    return payload
 
 
 def preflight(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
@@ -1549,7 +2355,7 @@ def preflight(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         flow_fingerprint, claims_path, claims,
     ) = candidate_context(args)
     payload = validation_payload(
-        claims, relations, flow, relation_path, flow_path, relation_fingerprint, flow_fingerprint, claims_path
+        claims, relations, flow, output_root, relation_path, flow_path, relation_fingerprint, flow_fingerprint, claims_path
     )
     validation_path = output_root / "validation-errors.json"
     if payload["status"] == "validation_failed":
@@ -1647,7 +2453,7 @@ def render_tabular_skill(item: dict[str, Any], scenario_name: str, operational: 
         "", "## 调用条件", "", *[f"- {value}" for value in item["when_to_use"]],
         "", "## 执行", "",
         "1. 先用 `contract` 读取机器可读来源、正确表头、生命周期、列、角色和连接候选。只对当前规则、阶段或 SQL 实际引用的 runtime_input source_id 运行带 `--source-id` 的 `preflight-contract`；design_time_template 永远不是缺失输入。",
-        "2. 若用户请求依赖规则，先对规则源运行 `search-contract`，返回命中的完整规则行；问题清单、违规类型、参考示例、用途及同一行其他字段都必须保留。若命中多条，继续用用户条件缩小；仍有多条实质不同规则时列出规则标识并请求选择，禁止拼接成一条规则。",
+        "2. 若用户请求依赖结构化规则或政策，先对对应来源运行 `search-contract`，返回命中的完整记录；记录标识、选择字段、叙述字段及同一行其他字段都必须保留。若命中多条，继续用用户条件缩小；仍有多条实质不同记录时列出记录标识并请求选择，禁止拼接成一条记录。",
         "3. Agent 只根据用户目标与完整规则行推导投影、谓词、分组和 SQL；不得从历史结果样例固化规则。",
         "4. 每条跨表链路先运行 `validate-join`，检查空值、双向未匹配和连接放大。单键出现多对多时，只能继续验证契约已经列出的复合键组；所有键组均未通过则停止，不猜键。",
         "5. 使用 `query-contract` 只注册 SQL 中实际出现的视图并执行有界只读 SQL；多来源 SQL 必须用 `--link-id` 在同一次命令中重新校验连接。运行文件名与蒸馏样本不同时用 `--bind <source-id>=<relative-path>` 显式绑定，校验字段兼容性而非历史文件摘要。大型 Excel 不允许退化为 Agent 读取或内存样本物化。",
@@ -1724,8 +2530,8 @@ def render_ocr_skill(item: dict[str, Any], scenario_name: str) -> str:
         "", "~~~text",
         "python \"<this-skill>/scripts/parse.py\" --path \"<file>\" --format json --output \"<ocr-output.json>\"",
         "~~~", "", "## 配置", "",
-        "- `config/defaults.json` 完整继承系统 `ocr-parser` 的既有字段和值；生成器不得删除、清空或改写已有服务地址与 API Key。",
-        "- 第三方运行环境仍可用同名环境变量覆盖包内配置；不得在日志、Agent 上下文或业务结果中回显凭据。",
+        "- `config/defaults.json` 继承系统 `ocr-parser` 的公开配置字段和值；API Key 等凭据不会写入能力包。",
+        "- 第三方运行环境必须通过同名环境变量提供凭据并可覆盖包内配置；不得在日志、Agent 上下文或业务结果中回显凭据。",
         "- 可用 `OCR_LANG_LIST`、`OCR_TABLE_ENABLE_PDF`、`OCR_TABLE_ENABLE_IMAGE`、`OCR_AUTO_ROTATE_PDF` 和 `OCR_AUTO_ROTATE_IMAGE` 调整识别。",
         "", "## 场景约束", "", *[f"- {value}" for value in item["scenario_instructions"]],
         "", "## 非职责", "", *[f"- {value}" for value in item["non_goals"]],
@@ -1751,8 +2557,8 @@ def render_knowledge_skill(item: dict[str, Any], scenario_name: str) -> str:
         "python \"<this-skill>/scripts/scenario_kb.py\" search --query \"<业务问题与限定条件>\" --limit 5 [--required]",
         "python \"<this-skill>/scripts/scenario_kb.py\" source --document-id \"<document-id>\" --chunk-id \"<chunk-id>\"",
         "~~~", "", "## 配置", "",
-        "- `config/defaults.json` 完整继承系统 `vector-kb` 的服务地址、知识库 ID、API Key、超时和其他字段；生成器不得删减或清空。",
-        "- 第三方环境可用 `VECTOR_KB_*` 环境变量覆盖包内配置；任何输出均不得回显凭据。",
+        "- `config/defaults.json` 继承系统 `vector-kb` 的服务地址、知识库 ID、超时和其他公开字段；API Key 不会写入能力包。",
+        "- 第三方环境必须通过 `VECTOR_KB_API_KEY` 等同名环境变量提供凭据并可覆盖包内配置；任何输出均不得回显凭据。",
         "", "## 场景约束", "", *[f"- {value}" for value in item["scenario_instructions"]],
         "", "## 非职责", "", *[f"- {value}" for value in item["non_goals"]],
         "", "## 可移植运行", "",
@@ -1766,6 +2572,839 @@ def render_contract_item(item: dict[str, Any], format_key: str) -> str:
     nodes = format_list(item.get("relation_node_ids", []))
     required = "必需" if item.get("required", False) else "可选"
     return f"- **{item.get('name', '')}**（{required}；{formats}；关系节点 {nodes}）：{item.get('description', '')}"
+
+
+def scenario_executor_skill_name(bundle_name: str) -> str:
+    suffix = "-main-executor"
+    base = re.sub(r"[^a-z0-9-]+", "-", str(bundle_name).casefold()).strip("-") or "business-scenario"
+    return f"{base[:63 - len(suffix)].rstrip('-')}{suffix}"
+
+
+def _source_columns(source: dict[str, Any]) -> list[str]:
+    return list(dict.fromkeys(
+        str(column.get("query_name") or column.get("name") or "")
+        for table in source.get("tables", []) if isinstance(table, dict)
+        for column in table.get("columns", []) if isinstance(column, dict)
+        if str(column.get("query_name") or column.get("name") or "")
+    ))
+
+
+def _pick_column(columns: list[str], markers: tuple[str, ...]) -> str:
+    for marker in markers:
+        for column in columns:
+            if marker.casefold() in column.casefold():
+                return column
+    return ""
+
+
+def source_material_role(source: dict[str, Any]) -> str:
+    roles = {
+        str(role.get("node_type", ""))
+        for role in source.get("roles", []) if isinstance(role, dict)
+    }
+    if "rule" in roles:
+        return "rule_or_policy_material"
+    if "output" in roles:
+        return "result_or_outcome_record"
+    explicit = str(source.get("material_role", ""))
+    if explicit:
+        return explicit
+    values = [str(item) for item in source.get("material_roles", []) if str(item)]
+    return values[0] if values else "unknown_material"
+
+
+def source_row_count(source: dict[str, Any]) -> int:
+    return max(
+        (int(table.get("row_count") or 0) for table in source.get("tables", []) if isinstance(table, dict)),
+        default=0,
+    )
+
+
+def build_capability_model(
+    flow_contract: dict[str, Any], operational: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the portable, domain-neutral model consumed by the executor.
+
+    The model is deliberately separate from Skill prose.  It preserves the
+    accepted flow, source grain, semantic field roles, validated lineage and
+    historical trace blueprint so another Agent can execute the same pattern
+    against compatible runtime data without re-discovering the workflow.
+    """
+    sources = [item for item in operational.get("sources", []) if isinstance(item, dict)]
+    runtime_ids = set(unique_strings(operational.get("runtime_source_ids")))
+    result_ids = set(unique_strings(operational.get("result_source_ids")))
+    rule_ids = set(unique_strings(operational.get("rule_source_ids")))
+    profiles = []
+    for source in sources:
+        source_id = str(source.get("source_id", ""))
+        descriptors = source_column_descriptors(source)
+        profiles.append({
+            "source_id": source_id,
+            "path": source.get("path", ""),
+            "kind": source.get("kind", ""),
+            "material_role": source_material_role(source),
+            "declared_roles": source.get("roles", []),
+            "runtime_required": source_id in runtime_ids,
+            "design_time_result": source_id in result_ids,
+            "row_count": source_row_count(source),
+            "tables": [
+                {
+                    "table": table.get("sheet_or_table") or table.get("table_name"),
+                    "row_count": table.get("row_count"),
+                    "column_count": table.get("column_count"),
+                    "inferred_material_role": table.get("inferred_material_role", ""),
+                }
+                for table in source.get("tables", []) if isinstance(table, dict)
+            ],
+            "field_semantics": descriptors[:240],
+        })
+    stage_records = [
+        {
+            "stage_id": stage.get("stage_id", stage.get("id", "")),
+            "name": stage.get("name", ""),
+            "stage_type": stage.get("stage_type", ""),
+            "objective": stage.get("objective", ""),
+            "outcome": stage.get("outcome", ""),
+            "input_contract": stage.get("input_contract", []),
+            "output_contract": stage.get("output_contract", []),
+            "predecessor_stage_ids": stage.get("predecessor_stage_ids", []),
+            "successor_stage_ids": stage.get("successor_stage_ids", []),
+            "procedure": stage.get("procedure", []),
+        }
+        for stage in flow_contract.get("stages", []) if isinstance(stage, dict)
+    ]
+    trace = compact_trace_evidence(operational, include_rows=False)
+    warnings = [
+        str(value) for value in operational.get("warnings", [])
+        if str(value)
+    ]
+    unresolved = []
+    if not rule_ids:
+        unresolved.append({"kind": "rule_source", "message": "No structured rule/policy source was proven by the accepted relation contract."})
+    if not any(profile["runtime_required"] for profile in profiles):
+        unresolved.append({"kind": "runtime_source", "message": "No runtime-bound source was proven by the accepted relation contract."})
+    if not flow_contract.get("main_flow"):
+        unresolved.append({"kind": "flow", "message": "The accepted flow has no main sequence."})
+    return {
+        "schema_version": 1,
+        "model_type": "evidence_backed_business_capability",
+        "inference_policy": {
+            "source": "accepted_relations_flow_and_historical_trace",
+            "domain_specific_rules": "not_embedded",
+            "runtime_content": "must_be_rebound_and_revalidated",
+            "historical_trace": "design_time_blueprint_only",
+        },
+        "flow": {
+            "main_flow": flow_contract.get("main_flow", []),
+            "execution_mode": flow_contract.get("execution_mode", "evidence_pipeline"),
+            "stages": stage_records,
+            "controls": flow_contract.get("controls", []),
+            "open_questions": flow_contract.get("open_questions", []),
+        },
+        "source_profiles": profiles,
+        "rule_source_ids": sorted(rule_ids),
+        "runtime_source_ids": sorted(runtime_ids),
+        "result_source_ids": sorted(result_ids),
+        "lineage": {
+            "joins": [
+                {
+                    "link_id": link.get("link_id"),
+                    "source_id": link.get("source_id"),
+                    "target_id": link.get("target_id"),
+                    "recommended_candidate": link.get("recommended_candidate", {}),
+                    "candidate_key_sets": link.get("candidate_key_sets", []),
+                    "runtime_eligible": link.get("runtime_eligible", True),
+                }
+                for link in operational.get("links", []) if isinstance(link, dict)
+            ],
+            "semantic_routes": operational.get("semantic_routes", []),
+        },
+        "historical_trace": trace,
+        "output_templates": flow_contract.get("design_time_output_templates", []),
+        "warnings": warnings,
+        "unresolved": unresolved,
+    }
+
+
+def build_execution_plan(flow_contract: dict[str, Any], operational: dict[str, Any]) -> dict[str, Any]:
+    """Compile a domain-neutral execution plan from accepted evidence facts."""
+    sources = [item for item in operational.get("sources", []) if isinstance(item, dict)]
+    source_by_id = {str(item.get("source_id", "")): item for item in sources}
+    runtime_ids = set(unique_strings(operational.get("runtime_source_ids")))
+    result_ids = set(unique_strings(operational.get("result_source_ids")))
+    rule_ids = [source_id for source_id in unique_strings(operational.get("rule_source_ids")) if source_id in source_by_id]
+
+    def trace_roles() -> dict[str, set[str]]:
+        result: dict[str, set[str]] = defaultdict(set)
+        trace = operational.get("trace_evidence") if isinstance(operational.get("trace_evidence"), dict) else {}
+        for bundle in trace.get("bundles", []) if isinstance(trace.get("bundles"), list) else []:
+            if not isinstance(bundle, dict):
+                continue
+            for item in bundle.get("sources", []) if isinstance(bundle.get("sources"), list) else []:
+                if not isinstance(item, dict):
+                    continue
+                source_id = str(item.get("source_id", ""))
+                if source_id:
+                    result[source_id].add(str(item.get("role", "")))
+        return result
+
+    traced_roles = trace_roles()
+    output_columns = {
+        str(column)
+        for template in flow_contract.get("design_time_output_templates", [])
+        if isinstance(template, dict)
+        for column in template.get("output_columns", []) if str(column)
+    }
+    ranked_candidates = []
+    for source in sources:
+        source_id = str(source.get("source_id", ""))
+        if source_id not in runtime_ids or source_id in rule_ids or source_id in result_ids:
+            continue
+        descriptors = source_column_descriptors(source)
+        overlap = sum(1 for item in descriptors if item["column"] in output_columns)
+        semantic_weight = sum(
+            1 for item in descriptors if item["semantic_role"] in {"subject", "measure", "temporal", "decision"}
+        )
+        trace_weight = len(traced_roles.get(source_id, set()).intersection({"linked_source", "result_anchor"}))
+        ranked_candidates.append({
+            "source_id": source_id,
+            "path": source.get("path", ""),
+            # Output overlap identifies useful projection fields; row grain
+            # and the historical trace identify the source to anchor a
+            # request.  The latter must win when a detail source is joined to
+            # several aggregate/context sources.
+            "score": round(overlap * 0.2 + trace_weight * 4 + semantic_weight * 0.1 + min(source_row_count(source) / 100_000, 10), 4),
+            "evidence": {
+                "output_column_overlap": overlap,
+                "trace_roles": sorted(traced_roles.get(source_id, set())),
+                "semantic_field_count": semantic_weight,
+            },
+        })
+    ranked_candidates.sort(key=lambda item: (-item["score"], item["source_id"]))
+    primary_id = str(ranked_candidates[0]["source_id"]) if ranked_candidates else ""
+    primary = source_by_id.get(primary_id, {})
+
+    rule_profiles = []
+    dispatch_source = source_by_id.get(rule_ids[0], {}) if rule_ids else {}
+    for source_id in rule_ids:
+        source = source_by_id.get(source_id, {})
+        descriptors = source_column_descriptors(source)
+        by_role: dict[str, list[str]] = defaultdict(list)
+        for descriptor in descriptors:
+            by_role[str(descriptor["semantic_role"])].append(str(descriptor["column"]))
+        selector_columns = list(dict.fromkeys(by_role.get("selector", []) + by_role.get("decision", [])))
+        identifier_columns = by_role.get("identifier", [])
+        narrative_columns = by_role.get("narrative", [])
+        rule_profiles.append({
+            "source_id": source_id,
+            "path": source.get("path", ""),
+            "selector_columns": selector_columns[:20],
+            "identifier_columns": identifier_columns[:20],
+            "narrative_columns": narrative_columns[:40],
+            "decision_columns": by_role.get("decision", [])[:20],
+            "field_semantics": descriptors[:240],
+        })
+    first_rule = rule_profiles[0] if rule_profiles else {}
+    dispatch_key = (first_rule.get("selector_columns") or [""])[0]
+    knowledge_id = (first_rule.get("identifier_columns") or [""])[0]
+    knowledge_description = (first_rule.get("narrative_columns") or [""])[0]
+
+    joins: list[dict[str, Any]] = []
+    for link in operational.get("links", []):
+        if not isinstance(link, dict) or link.get("runtime_eligible") is False:
+            continue
+        left, right = str(link.get("source_id", "")), str(link.get("target_id", ""))
+        if left not in runtime_ids or right not in runtime_ids or left == right:
+            continue
+        recommended = link.get("recommended_candidate") if isinstance(link.get("recommended_candidate"), dict) else {}
+        key_pairs = recommended.get("key_pairs") if isinstance(recommended.get("key_pairs"), list) else []
+        candidate_sets = link.get("candidate_key_sets") if isinstance(link.get("candidate_key_sets"), list) else []
+        joins.append({
+            "link_id": link.get("link_id"),
+            "left_source_id": left,
+            "right_source_id": right,
+            "left_source": source_by_id.get(left, {}).get("path", left),
+            "right_source": source_by_id.get(right, {}).get("path", right),
+            "recommended_key_pairs": [
+                {
+                    "left": pair.get("source_field") if left == str(link.get("source_id", "")) else pair.get("target_field"),
+                    "right": pair.get("target_field") if left == str(link.get("source_id", "")) else pair.get("source_field"),
+                }
+                for pair in key_pairs if isinstance(pair, dict)
+            ],
+            "candidate_key_sets": candidate_sets[:10],
+            "validation": "revalidate_nulls_unmatched_rows_and_fanout_at_runtime",
+            "preferred": left == primary_id or right == primary_id,
+        })
+    joins.sort(key=lambda item: (not bool(item.get("preferred")), str(item.get("link_id", ""))))
+
+    flow_stage_ids = [
+        str(item) for item in flow_contract.get("main_flow", []) if str(item)
+    ] or [
+        str(stage.get("stage_id", ""))
+        for stage in flow_contract.get("stages", [])
+        if isinstance(stage, dict) and str(stage.get("stage_id", ""))
+    ]
+    steps: list[dict[str, Any]] = [
+        {
+            "order": 1,
+            "operation": "RESOLVE_SCOPE",
+            "source_ids": sorted(runtime_ids),
+            "contract": "normalize the request and bind only declared compatible runtime sources",
+        },
+    ]
+    if rule_ids:
+        steps.append({
+            "order": len(steps) + 1,
+            "operation": "LOCATE_COMPLETE_RULE_RECORD",
+            "source_ids": rule_ids,
+            "selector_columns": [profile.get("selector_columns", []) for profile in rule_profiles],
+            "contract": "select one complete governing record and preserve its provenance before bulk reads",
+        })
+    if ranked_candidates:
+        steps.append({
+            "order": len(steps) + 1,
+            "operation": "READ_RUNTIME_EVIDENCE",
+            "source_ids": [item["source_id"] for item in ranked_candidates],
+            "primary_source_id": primary_id,
+            "candidate_sources": ranked_candidates[:12],
+            "contract": "search bounded evidence from the ranked source set; do not discard a source solely because it is not primary",
+        })
+    if joins:
+        steps.append({
+            "order": len(steps) + 1,
+            "operation": "VALIDATE_LINEAGE_AND_JOIN",
+            "link_ids": [item.get("link_id") for item in joins],
+            "contract": "use only accepted key sets and report null, unmatched, fanout and truncation evidence",
+        })
+    if flow_stage_ids:
+        steps.append({
+            "order": len(steps) + 1,
+            "operation": "APPLY_ACCEPTED_FLOW",
+            "stage_ids": flow_stage_ids,
+            "contract": "execute the accepted stage sequence and preserve stage inputs, outputs and unresolved questions",
+        })
+    templates = flow_contract.get("design_time_output_templates") if isinstance(flow_contract.get("design_time_output_templates"), list) else []
+    output_specs = []
+    for template in templates:
+        if not isinstance(template, dict):
+            continue
+        output_specs.append({
+            "output_id": template.get("template_id"),
+            "name": template.get("name"),
+            "format": template.get("format", "xlsx"),
+            "columns": template.get("output_columns", []),
+            "column_semantics": template.get("column_semantics", []),
+            "required_source_ids": sorted(runtime_ids),
+            "pipeline": [*steps, {
+                "order": len(steps) + 1,
+                "operation": "MATERIALIZE_DECLARED_OUTPUT",
+                "output": template.get("name", "result"),
+                "contract": "write the declared output shape with rule, data and coverage provenance",
+            }],
+        })
+    model = build_capability_model(flow_contract, operational)
+    model["selection"] = {
+        "primary_source_id": primary_id,
+        "primary_candidates": ranked_candidates[:12],
+        "rule_profiles": rule_profiles,
+    }
+    field_roles: dict[str, list[str]] = defaultdict(list)
+    for descriptor in source_column_descriptors(primary):
+        field_roles[str(descriptor["semantic_role"])].append(
+            f"{primary.get('path', '')}.{descriptor['column']}"
+        )
+    dispatch_config = {
+        "knowledge_table": dispatch_source.get("path", "") if dispatch_source else "",
+        "dispatch_key_column": dispatch_key,
+        "knowledge_id_column": knowledge_id,
+        "knowledge_description_column": knowledge_description,
+        "nl_columns": first_rule.get("narrative_columns", []),
+        "dispatch_policy": "select_complete_record_then_use_declared_selector_or_decision_fields; preserve_full_record",
+        "rule_sources": rule_profiles,
+        "field_role_map": {
+            "by_semantic_role": dict(field_roles),
+            "primary_source_id": primary_id,
+            "primary_source_path": primary.get("path", "") if primary else "",
+        },
+    }
+    model["execution_sequence"] = steps
+    model["output_specs"] = output_specs
+    return {
+        "schema_version": 2,
+        "mode": "knowledge_engine" if rule_ids and dispatch_key else "evidence_pipeline",
+        "primary_source_id": primary_id,
+        "primary_source_path": primary.get("path", "") if primary else "",
+        "primary_candidates": ranked_candidates[:12],
+        "rule_source_ids": rule_ids,
+        "capability_model": model,
+        "dispatch_config": dispatch_config,
+        "join_plan": joins,
+        "output_specs": output_specs,
+        "steps": steps,
+        "semantic_boundary": "The engine supplies the accepted flow, complete governing records, bounded runtime evidence, validated lineage and output mapping; the Agent applies business semantics only to that evidence and reports uncertainty.",
+    }
+
+
+def compiled_recipe_catalog(output_root: Path, operational: dict[str, Any]) -> dict[str, Any]:
+    """Validate optional reviewed rule recipes without embedding domain logic in code.
+
+    A recipe is a scenario artifact, reviewed against declared rule and runtime
+    schemas.  The portable executor only evaluates supported recipes; it falls
+    back to a bounded evidence handoff when no recipe is present for a rule.
+    """
+    path = output_root / "compiled-recipes.json"
+    if not path.is_file():
+        return {
+            "schema_version": 1,
+            "recipes": [],
+            "policy": "No reviewed deterministic recipe is available; use the evidence handoff and never infer a result automatically.",
+        }
+    payload = load_json(path, MAX_CANDIDATE_BYTES)
+    if payload.get("schema_version") != 1 or not isinstance(payload.get("recipes"), list):
+        raise ContractError("compiled-recipes.json must contain schema_version 1 and a recipes list")
+    sources = {
+        str(item.get("source_id", "")): item
+        for item in operational.get("sources", []) if isinstance(item, dict)
+    }
+    runtime_ids = {str(item) for item in operational.get("runtime_source_ids", [])}
+    rule_ids = {str(item) for item in operational.get("rule_source_ids", [])}
+
+    def fields(source_id: str) -> set[str]:
+        source = sources.get(source_id, {})
+        return {
+            str(column.get("query_name") or column.get("name") or "")
+            for table in source.get("tables", []) if isinstance(table, dict)
+            for column in table.get("columns", []) if isinstance(column, dict)
+            and str(column.get("query_name") or column.get("name") or "")
+        }
+
+    seen_ids: set[str] = set()
+    for recipe in payload["recipes"]:
+        if not isinstance(recipe, dict):
+            raise ContractError("Each compiled recipe must be an object")
+        recipe_id = str(recipe.get("id", ""))
+        if not recipe_id or recipe_id in seen_ids:
+            raise ContractError("Each compiled recipe requires a unique id")
+        seen_ids.add(recipe_id)
+        kind = str(recipe.get("kind", ""))
+        if kind not in {"grouped_cooccurrence", "grouped_cooccurrence_from_rule_text"}:
+            raise ContractError(f"Unsupported compiled recipe kind: {recipe.get('kind')}")
+        selector = recipe.get("rule_selector")
+        if not isinstance(selector, dict) or str(selector.get("source_id", "")) not in rule_ids:
+            raise ContractError(f"Compiled recipe {recipe_id} must select one declared rule source")
+        selector_fields = fields(str(selector["source_id"]))
+        equals = selector.get("equals", {})
+        fingerprint = str(selector.get("rule_fingerprint", "")).strip()
+        is_family = str(selector.get("mode", "")) == "any_complete_rule"
+        if not isinstance(equals, dict) or not set(map(str, equals)).issubset(selector_fields):
+            raise ContractError(f"Compiled recipe {recipe_id} has an invalid rule selector")
+        if is_family:
+            if equals or fingerprint:
+                raise ContractError(
+                    f"Rule-family recipe {recipe_id} may not embed a historical rule value or fingerprint"
+                )
+        elif not equals and not fingerprint:
+            raise ContractError(f"Compiled recipe {recipe_id} has an invalid rule selector")
+        source_id = str(recipe.get("source_id", ""))
+        if source_id not in runtime_ids:
+            raise ContractError(f"Compiled recipe {recipe_id} references a non-runtime source")
+        source_fields = fields(source_id)
+        group_by = [str(item) for item in recipe.get("group_by", []) if str(item)]
+        all_of_raw = recipe.get("all_of", [])
+        any_of_raw = recipe.get("any_of", [])
+        if kind == "grouped_cooccurrence_from_rule_text":
+            if not is_family:
+                raise ContractError(f"Rule-family recipe {recipe_id} must use mode=any_complete_rule")
+            item_field = str(recipe.get("item_field", ""))
+            if item_field not in source_fields:
+                raise ContractError(f"Rule-family recipe {recipe_id} item_field is not present in its source")
+            rule_fields = [str(item) for item in recipe.get("rule_text_fields", []) if str(item)]
+            if not rule_fields or not set(rule_fields).issubset(selector_fields):
+                raise ContractError(f"Rule-family recipe {recipe_id} rule_text_fields must be narrative fields of its rule source")
+            if int(recipe.get("minimum_terms", 2)) < 2 or int(recipe.get("minimum_terms", 2)) > 8:
+                raise ContractError(f"Rule-family recipe {recipe_id} minimum_terms must be 2-8")
+            annotations_from_rule = recipe.get("result_annotations_from_rule", {})
+            if not isinstance(annotations_from_rule, dict) or not annotations_from_rule or not set(
+                str(value) for value in annotations_from_rule.values()
+            ).issubset(selector_fields):
+                raise ContractError(f"Rule-family recipe {recipe_id} result_annotations_from_rule is invalid")
+            covered_outputs = recipe.get("covered_output_node_ids")
+            if not isinstance(covered_outputs, list) or not unique_strings(covered_outputs):
+                raise ContractError(f"Rule-family recipe {recipe_id} must declare covered_output_node_ids")
+            replay_assertions = recipe.get("historical_replay_assertions")
+            if not isinstance(replay_assertions, list) or not replay_assertions:
+                raise ContractError(f"Rule-family recipe {recipe_id} must include historical_replay_assertions")
+            replay_ids: set[str] = set()
+            for assertion in replay_assertions:
+                if not isinstance(assertion, dict):
+                    raise ContractError(f"Rule-family recipe {recipe_id} replay assertion must be an object")
+                assertion_id = str(assertion.get("id", "")).strip()
+                if not assertion_id or assertion_id in replay_ids:
+                    raise ContractError(f"Rule-family recipe {recipe_id} replay assertions require unique ids")
+                replay_ids.add(assertion_id)
+                if normalized_question_value(assertion.get("status")) not in {"passed", "approved", "通过"}:
+                    raise ContractError(f"Rule-family recipe {recipe_id} replay assertion {assertion_id} is not passed")
+                if not str(assertion.get("trace_bundle_id", "")).strip() or not str(assertion.get("evidence_ref", "")).strip():
+                    raise ContractError(f"Rule-family recipe {recipe_id} replay assertion {assertion_id} lacks trace evidence")
+                if not unique_strings(assertion.get("output_node_ids")):
+                    raise ContractError(f"Rule-family recipe {recipe_id} replay assertion {assertion_id} lacks output coverage")
+            if all_of_raw or any_of_raw:
+                raise ContractError(f"Rule-family recipe {recipe_id} must not embed historical predicate literals")
+            continue
+        if not isinstance(all_of_raw, list) or not isinstance(any_of_raw, list):
+            raise ContractError(f"Compiled recipe {recipe_id} predicates must be lists")
+        predicates = [
+            item for item in [*all_of_raw, *any_of_raw]
+            if isinstance(item, dict)
+        ]
+        if not group_by or not all_of_raw or not any_of_raw or len(predicates) != len(all_of_raw) + len(any_of_raw):
+            raise ContractError(f"Compiled recipe {recipe_id} requires group_by, all_of and any_of predicates")
+        if not set(group_by).issubset(source_fields):
+            raise ContractError(f"Compiled recipe {recipe_id} group_by is not present in its source")
+        for predicate in predicates:
+            if (
+                str(predicate.get("field", "")) not in source_fields
+                or str(predicate.get("operator", "")) not in {"contains", "equals"}
+                or not str(predicate.get("value", ""))
+            ):
+                raise ContractError(f"Compiled recipe {recipe_id} has an invalid predicate")
+        measure = str(recipe.get("summary_measure", ""))
+        if measure and measure not in source_fields:
+            raise ContractError(f"Compiled recipe {recipe_id} summary_measure is not present in its source")
+        context_ids = recipe.get("context_source_ids", [])
+        if not isinstance(context_ids, list) or any(str(item) not in runtime_ids for item in context_ids):
+            raise ContractError(f"Compiled recipe {recipe_id} references an invalid context runtime source")
+    return payload
+
+
+def declared_structured_knowledge_source_ids(flow: dict[str, Any], operational: dict[str, Any]) -> list[str]:
+    """Return rule sources that an accepted stage declares as executable knowledge adjudication."""
+
+    return sorted(declared_structured_knowledge_requirements(flow, operational))
+
+
+def declared_structured_knowledge_requirements(
+    flow: dict[str, Any], operational: dict[str, Any],
+) -> dict[str, list[str]]:
+    """Map each declared structured rule source to its required stage outputs."""
+
+    requirements: dict[str, set[str]] = defaultdict(set)
+    declared_rule_ids = set(unique_strings(operational.get("rule_source_ids")))
+    rule_node_ids = {
+        str(role.get("node_id", ""))
+        for source in operational.get("sources", []) if isinstance(source, dict)
+        and str(source.get("source_id", "")) in declared_rule_ids
+        for role in source.get("roles", []) if isinstance(role, dict)
+        and str(role.get("node_type", "")).casefold() in {"rule", "policy", "control"}
+        and str(role.get("node_id", ""))
+    }
+    for stage in flow.get("stages", []) if isinstance(flow.get("stages"), list) else []:
+        if not isinstance(stage, dict):
+            continue
+        input_node_ids = set(unique_strings(stage.get("input_node_ids")))
+        is_decision_stage = str(stage.get("stage_type", "")) == "decision"
+        if not is_decision_stage and not input_node_ids.intersection(rule_node_ids):
+            continue
+        execution = stage_execution_contract(stage, operational)
+        output_node_ids = unique_strings(stage.get("output_node_ids"))
+        for source_id in unique_strings(execution.get("structured_rule_source_ids")):
+            requirements[source_id].update(output_node_ids)
+    return {source_id: sorted(output_ids) for source_id, output_ids in sorted(requirements.items())}
+
+
+def approved_trace_bundle_ids(flow: dict[str, Any]) -> tuple[set[str], str]:
+    """Resolve the accepted trace bundle that a replay assertion is allowed to cite."""
+
+    source = flow.get("source") if isinstance(flow.get("source"), dict) else {}
+    micro_claim = source.get("micro_process") if isinstance(source.get("micro_process"), dict) else {}
+    try:
+        micro_path = Path(str(micro_claim.get("artifact", ""))).resolve()
+        micro = load_json(micro_path, MAX_OPERATIONAL_BYTES)
+        micro_source = micro.get("source") if isinstance(micro.get("source"), dict) else {}
+        review_path = Path(str(micro_source.get("trace_review", ""))).resolve()
+        review = load_json(review_path, MAX_OPERATIONAL_BYTES)
+    except (OSError, ContractError) as exc:
+        return set(), f"accepted trace review cannot be read: {exc}"
+    receipt_errors = platform_evidence_receipt_errors(micro_path.parent)
+    if receipt_errors:
+        return set(), "accepted trace approval receipt is invalid: " + "; ".join(receipt_errors)
+    if micro_claim.get("fingerprint") != sha256_file(micro_path):
+        return set(), "accepted micro-process fingerprint changed after flow approval"
+    if micro_source.get("trace_review_fingerprint") != sha256_file(review_path):
+        return set(), "accepted trace review fingerprint changed after micro-process approval"
+    if micro.get("status") != "approved" or review.get("kind") != "trace_review" or review.get("status") != "approved":
+        return set(), "accepted trace review is not approved"
+    trace = review.get("trace") if isinstance(review.get("trace"), dict) else {}
+    bundle_id = str(trace.get("bundle_id", "")).strip()
+    if not bundle_id:
+        return set(), "accepted trace review does not declare a trace bundle id"
+    return {bundle_id}, ""
+
+
+def recipe_coverage_status(
+    flow: dict[str, Any], operational: dict[str, Any], recipe_catalog: dict[str, Any],
+) -> dict[str, Any]:
+    """Prove that every declared structured adjudication has a reviewed family recipe.
+
+    A recipe selected by one historical rule value is deliberately insufficient:
+    it cannot prove generalization to the next batch.  Only a value-free
+    ``grouped_cooccurrence_from_rule_text`` family recipe can cover a declared
+    rule source for publication.
+    """
+
+    requirements = declared_structured_knowledge_requirements(flow, operational)
+    declared = sorted(requirements)
+    recipes = recipe_catalog.get("recipes") if isinstance(recipe_catalog.get("recipes"), list) else []
+    covering_recipes = [
+        recipe for recipe in recipes
+        if isinstance(recipe, dict)
+        and recipe.get("kind") == "grouped_cooccurrence_from_rule_text"
+        and isinstance(recipe.get("rule_selector"), dict)
+        and str(recipe["rule_selector"].get("mode", "")) == "any_complete_rule"
+        and str(recipe["rule_selector"].get("source_id", "")) in set(declared)
+    ]
+    covered = sorted({
+        str(recipe["rule_selector"].get("source_id", ""))
+        for recipe in covering_recipes
+    })
+    uncovered = sorted(set(declared) - set(covered))
+    if not declared:
+        return {
+            "status": "not_required",
+            "verifiable": True,
+            "publishable": True,
+            "declared_knowledge_source_ids": [],
+            "covered_source_ids": [],
+            "uncovered_source_ids": [],
+            "recipe_count": len(recipes),
+            "policy": "No structured knowledge adjudication is declared by an accepted stage.",
+        }
+    trace_bundle_ids, trace_error = approved_trace_bundle_ids(flow)
+    output_coverage: dict[str, set[str]] = defaultdict(set)
+    replay_coverage: dict[str, set[str]] = defaultdict(set)
+    replay_assertion_ids: dict[str, list[str]] = defaultdict(list)
+    for recipe in covering_recipes:
+        selector = recipe.get("rule_selector") if isinstance(recipe.get("rule_selector"), dict) else {}
+        source_id = str(selector.get("source_id", ""))
+        output_coverage[source_id].update(unique_strings(recipe.get("covered_output_node_ids")))
+        for assertion in recipe.get("historical_replay_assertions", []) if isinstance(recipe.get("historical_replay_assertions"), list) else []:
+            if not isinstance(assertion, dict):
+                continue
+            assertion_id = str(assertion.get("id", "")).strip()
+            evidence_ref = str(assertion.get("evidence_ref", "")).strip()
+            bundle_id = str(assertion.get("trace_bundle_id", "")).strip()
+            passed = normalized_question_value(assertion.get("status")) in {"passed", "approved", "通过"}
+            if assertion_id and evidence_ref and passed and bundle_id in trace_bundle_ids:
+                replay_assertion_ids[source_id].append(assertion_id)
+                replay_coverage[source_id].update(unique_strings(assertion.get("output_node_ids")))
+    missing_outputs = {
+        source_id: sorted(set(required_outputs) - output_coverage[source_id])
+        for source_id, required_outputs in requirements.items()
+        if set(required_outputs) - output_coverage[source_id]
+    }
+    missing_replays = {
+        source_id: sorted(set(required_outputs) - replay_coverage[source_id])
+        for source_id, required_outputs in requirements.items()
+        if set(required_outputs) - replay_coverage[source_id]
+    }
+    reasons: list[str] = []
+    if uncovered:
+        reasons.append("Empty, exact-value, or partial recipes cannot prove coverage of declared knowledge adjudication.")
+    if missing_outputs:
+        reasons.append("Executable recipes do not cover every required output node of the governed stage.")
+    if trace_error:
+        reasons.append(trace_error)
+    if missing_replays:
+        reasons.append("Historical replay assertions are missing, failed, or do not cover every required output node.")
+    if reasons:
+        return {
+            "status": "unverified",
+            "verifiable": False,
+            "publishable": False,
+            "declared_knowledge_source_ids": declared,
+            "covered_source_ids": covered,
+            "uncovered_source_ids": uncovered,
+            "recipe_count": len(recipes),
+            "required_recipe_kind": "grouped_cooccurrence_from_rule_text",
+            "required_selector_mode": "any_complete_rule",
+            "required_output_node_ids_by_source": requirements,
+            "covered_output_node_ids_by_source": {
+                source_id: sorted(output_coverage[source_id]) for source_id in declared
+            },
+            "missing_output_node_ids_by_source": missing_outputs,
+            "accepted_trace_bundle_ids": sorted(trace_bundle_ids),
+            "historical_replay_assertion_ids_by_source": {
+                source_id: sorted(replay_assertion_ids[source_id]) for source_id in declared
+            },
+            "missing_replay_output_node_ids_by_source": missing_replays,
+            "reason": " ".join(reasons),
+        }
+    return {
+        "status": "verified",
+        "verifiable": True,
+        "publishable": True,
+        "declared_knowledge_source_ids": declared,
+        "covered_source_ids": covered,
+        "uncovered_source_ids": [],
+        "recipe_count": len(recipes),
+        "required_recipe_kind": "grouped_cooccurrence_from_rule_text",
+        "required_selector_mode": "any_complete_rule",
+        "required_output_node_ids_by_source": requirements,
+        "covered_output_node_ids_by_source": {
+            source_id: sorted(output_coverage[source_id]) for source_id in declared
+        },
+        "accepted_trace_bundle_ids": sorted(trace_bundle_ids),
+        "historical_replay_assertion_ids_by_source": {
+            source_id: sorted(replay_assertion_ids[source_id]) for source_id in declared
+        },
+    }
+
+
+def compiled_recipe_verification(
+    output_root: Path, flow: dict[str, Any], operational: dict[str, Any],
+) -> dict[str, Any]:
+    """Load a reviewed catalog and turn catalog/coverage failures into a release gate."""
+
+    declared = declared_structured_knowledge_source_ids(flow, operational)
+    try:
+        catalog = compiled_recipe_catalog(output_root, operational)
+    except ContractError as exc:
+        return {
+            "status": "unverified",
+            "verifiable": False,
+            "publishable": False,
+            "declared_knowledge_source_ids": declared,
+            "covered_source_ids": [],
+            "uncovered_source_ids": declared,
+            "recipe_count": 0,
+            "reason": f"compiled-recipes.json is invalid: {exc}",
+        }
+    return recipe_coverage_status(flow, operational, catalog)
+
+
+def portable_flow_contract(claims: dict[str, Any], flow: dict[str, Any], operational: dict[str, Any]) -> dict[str, Any]:
+    """Keep only execution facts needed by the portable primary entrypoint."""
+
+    flow_stages = {
+        str(item.get("id", "")): item
+        for item in flow.get("stages", [])
+        if isinstance(item, dict) and str(item.get("id", ""))
+    }
+    stages = []
+    knowledge_driven = False
+    for item in claims.get("stage_skills", []):
+        if not isinstance(item, dict):
+            continue
+        stage_id = str(item.get("stage_id", ""))
+        source_stage = flow_stages.get(stage_id, {})
+        execution = item.get("execution_contract") if isinstance(item.get("execution_contract"), dict) else {}
+        if execution.get("structured_rule_source_ids") or execution.get("semantic_route_ids"):
+            knowledge_driven = True
+        stages.append({
+            "stage_id": stage_id,
+            "name": source_stage.get("name", item.get("display_name", stage_id)),
+            "stage_type": source_stage.get("stage_type", ""),
+            "objective": item.get("objective", source_stage.get("objective", "")),
+            "outcome": item.get("outcome", source_stage.get("outcome", "")),
+            "input_contract": item.get("input_contract", []),
+            "output_contract": item.get("output_contract", []),
+            "control_ids": item.get("control_ids", []),
+            "predecessor_stage_ids": item.get("predecessor_stage_ids", []),
+            "successor_stage_ids": item.get("successor_stage_ids", []),
+            "open_question_ids": item.get("open_question_ids", []),
+            "procedure": item.get("procedure", []),
+            "execution_contract": execution,
+        })
+    contract = {
+        "schema_version": 1,
+        "scenario": claims.get("scenario", flow.get("scenario", {})),
+        "execution_mode": "knowledge_engine" if knowledge_driven else "evidence_pipeline",
+        "main_flow": [str(item) for item in claims.get("orchestrator", {}).get("main_flow", [])],
+        "stages": stages,
+        "controls": [item for item in flow.get("controls", []) if isinstance(item, dict)],
+        "open_questions": [item for item in flow.get("open_questions", []) if isinstance(item, dict)],
+        "execution_policy": flow.get("execution_policy", {}),
+        "runtime_source_ids": operational.get("runtime_source_ids", []),
+        "rule_source_ids": operational.get("rule_source_ids", []),
+        "result_source_ids": operational.get("result_source_ids", []),
+        "design_time_output_templates": operational.get("design_time_output_templates", []),
+        "output_contract": operational.get("output_contract", {}),
+        "contract_fingerprint": operational.get("source", {}).get("portable_copy_of_fingerprint", ""),
+    }
+    contract["execution_plan"] = build_execution_plan(contract, operational)
+    contract["capability_model"] = contract["execution_plan"].get("capability_model", {})
+    if contract["execution_plan"].get("mode") == "knowledge_engine":
+        contract["execution_mode"] = "knowledge_engine"
+    return contract
+
+
+def render_executor_skill(
+    claims: dict[str, Any], flow_contract: dict[str, Any], operational: dict[str, Any],
+    executor_name: str,
+) -> str:
+    scenario = claims.get("scenario", {})
+    runtime_ids = format_list(flow_contract.get("runtime_source_ids", []), "无运行时表格输入")
+    rule_ids = format_list(flow_contract.get("rule_source_ids", []), "未声明结构化规则源")
+    stages = flow_contract.get("stages", [])
+    stage_lines = [
+        f"- `{stage.get('stage_id', '')}`：{stage.get('name', '')}；{stage.get('objective', '')}"
+        for stage in stages if isinstance(stage, dict)
+    ] or ["- 当前流程没有可执行阶段描述；必须根据返回的证据缺口停止并报告。"]
+    source_lines = [
+        f"- `{source.get('source_id', '')}` / `{source.get('view_name', '')}` / `{source.get('path', '')}`："
+        f"生命周期 `{source.get('lifecycle', 'runtime_input')}`，运行时绑定 `{source.get('runtime_binding', 'required_when_referenced')}`"
+        for source in operational.get("sources", [])
+        if isinstance(source, dict) and source.get("runtime_required") is True
+    ] or ["- 当前没有可绑定的运行时输入。"]
+    return "\n".join([
+        skill_frontmatter(
+            executor_name,
+            f"端到端执行“{scenario.get('name', '')}”业务场景：一次调用完成规则定位、运行时数据检索、关联校验、证据汇总和可追溯交付；适用于第三方 Agent 处理完整业务请求。",
+        ),
+        "",
+        "## Agent handoff contract",
+        "",
+        "- The `agent_handoff` artifact is the Agent-facing source of truth. Its stdout is intentionally compact; read `agent_handoff` once and use the sibling full `artifact` only when audit detail is explicitly needed.",
+        "- Consume `execution_steps` in order. Do not recreate the stage state machine, inspect generator code, or retry the same request after a successful artifact is written.",
+        "- A completed deterministic result exposes `result_handle`. For a follow-up that filters or summarizes the same result, invoke only `continue --result <artifact> --filter <result-field>=<value>`; never call `execute`, `search-rules`, `query`, a shell data tool, or a raw source reader again.",
+        "- Read `references/capability-model.json` and `references/execution-plan.json` as the machine-readable business pipeline: resolve scope, locate a governing record when one exists, read ranked runtime sources, validate lineage, apply the accepted flow, then materialize the declared output.",
+        "- `references/compiled-recipes.json` contains reviewed declarative rule recipes. When `execute` reports `completed_deterministically`, its `deterministic_result` is the final business fact; report it directly and never reconstruct its SQL or run the rule again.",
+        "- `references/dispatch-config.json` and `references/output-specs.json` are executable metadata, not examples. Preserve their rule id, dispatch value, source provenance, and output columns in the final result.",
+        "- When status is `ready_for_agent_judgment`, use the governing record when present, the accepted flow, and `candidate_evidence` to make one business-evaluation pass, then fill every field in `result_contract`.",
+        "- If `candidate_evidence.coverage.complete_for_all_matching_runtime_rows` is false, disclose that the evidence is a bounded preview and do not claim an exhaustive audit.",
+        "- Use `query` only when `next_step.query_allowed_only_if` is satisfied. A query must name the missing field or relationship and must not restart rule discovery.",
+        f"# {scenario.get('name', '')} 主执行器", "",
+        f"这是“{scenario.get('name', '')}”能力包的唯一首选端到端入口。执行模式：`{flow_contract.get('execution_mode', 'evidence_pipeline')}`。",
+        "主执行器先做机器可验证的规则、数据和证据准备，再把有限结果交给 Agent 应用完整规则；它不把原始大表加载进上下文，也不把语义不确定性伪装成确定结论。",
+        "", "## 强制调用策略", "",
+        "1. 用户请求覆盖整个业务场景时，只先调用本 Skill 的 `execute`；不要先逐个调用阶段 Skill，也不要手工启动状态机。",
+        "2. `execute` 返回 `completed_deterministically` 时，直接使用 `deterministic_result` 交付；同一结果的追问只能复用 `result_handle` 执行 `continue` 投影。返回 `ready_for_agent_judgment` 时，不得用临时 SQL 猜测；应报告该规则尚未有已审阅的确定性规则族并进入平台审阅。",
+        "3. 返回 `blocked_rule_not_found`、`blocked_rule_selection_required` 或 `blocked_missing_or_incompatible_sources` 时，先说明证据缺口；不得循环重试同一请求或猜测规则。",
+        "4. 只有主执行器明确返回可追踪的 SQL/关联缺口时，才使用 `query` 做一次有界补充；阶段 Skill 是降级/人工分步调试入口，不是正常端到端路径。",
+        "", "## 固定入口", "",
+        "~~~text",
+        f"python \"<this-skill>/scripts/execute_scenario.py\" describe",
+        f"python \"<this-skill>/scripts/execute_scenario.py\" produce --request \"<用户完整请求>\" --data-root \"<data-root>\" --output \"<evidence-package.json>\" --bind \"<source-id>=<relative-runtime-file>\"",
+        f"python \"<this-skill>/scripts/execute_scenario.py\" continue --result \"<evidence-package.json>\" --filter \"<已交付结果字段>=<用户限定值>\"",
+        f"python \"<this-skill>/scripts/execute_scenario.py\" query --data-root \"<data-root>\" --sql \"<bounded SELECT>\" --link-id \"<validated-link-id>@<key-set-index>\"",
+        "~~~", "",
+        "## 场景执行事实", "",
+        f"- 规则源：{rule_ids}",
+        f"- 运行时输入：{runtime_ids}",
+        f"- 主流程：{format_list(flow_contract.get('main_flow', []), '未声明')}",
+        *stage_lines,
+        "", "## 运行时绑定", "", *source_lines,
+        "", "## 输出边界", "",
+        "- 输出必须首先给出业务结论或明确的阻塞原因，然后列出规则完整行、数据源/查询、关联校验和证据定位。",
+        "- `ready_for_agent_judgment` 只表示证据包完整可供 Agent 应用 accepted flow/controls，不表示脚本替代了业务语义判断。",
+        "- 所有行级结果有界；全量结果必须由显式导出请求写入指定文件，不能打印到 Agent 上下文。",
+        "- 运行时缺失、规则多选、关联放大或规则与数据无法对应时，停止并返回可修复的证据缺口。",
+        "", "## 非职责", "",
+        "- 不修改原始业务文件，不创建临时 Python/SQL/HTTP 客户端，不依赖原平台 Tool、固定挂载目录或持久会话。",
+        "- 不使用历史样本代替当前运行时数据，不将设计时输出模板当作运行时输入。",
+        "",
+    ])
 
 
 def render_stage_skill(
@@ -1822,6 +3461,11 @@ def render_stage_skill(
             f"- 语义检索路径 {format_list(execution['semantic_route_ids'])} 只能用于查找证据；"
             "未出现明确业务主键时，不得把文档命中与结构化记录强行连接。"
         )
+    if execution.get("trace_bundle_ids"):
+        lines.append(
+            f"- 设计期追踪蓝图 {format_list(execution['trace_bundle_ids'])} 已证明同一结果锚点可沿指定来源、投影字段和键组回溯；"
+            "运行时必须在当前批次重新校验规则适用性、键值与基数，不得复制历史样例取值。"
+        )
     lines.append("- 机器可读来源、表头、列、字段链路和非结构化检索路径见基础 Skill 的 `references/operational-data-contract.json`。")
     lines.extend(["", "## 执行", ""])
     lines.extend([
@@ -1858,7 +3502,8 @@ def render_stage_skill(
     else:
         lines.append("- 无与本阶段直接关联的已声明待确认项。")
     lines.extend(["", "## 非职责", "", *[f"- {value}" for value in item["non_goals"]], "", "## 可移植运行", ""])
-    lines.append("完成推理后把有界结果写为 JSON，并运行 `python \"<this-skill>/scripts/run_stage.py\" finish --work-order \"<work-order.json>\" --result \"<result.json>\" --output \"<handoff.json>\"`。阶段运行器会验证必需输出并拒绝原始业务文件路径。")
+    lines.append("完成推理后把有界结果写为 JSON，并运行 `python \"<this-skill>/scripts/run_stage.py\" finish --work-order \"<work-order.json>\" --result \"<result.json>\" --output \"<handoff.json>\"`。阶段运行器会验证必需输出、产物存在性和 SHA-256，并拒绝原始业务文件路径。")
+    lines.append("文件型输出必须使用 `value` 或 `artifact` 中的 `kind=exported_query_result`/`bounded_artifact_reference`、绝对 `path`、文件后缀和真实 `sha256`；可直接复用 `query_tabular.py export-contract` 返回的 `artifact` 对象。不得把原始行、全文或未校验路径塞进交接 JSON。")
     lines.append("本 Skill 不依赖原平台 Tool、固定目录或会话状态。调用方负责提供输入；运行配置由依赖基础 Skill 完整携带或由第三方同名环境变量覆盖。")
     lines.append("")
     return "\n".join(lines)
@@ -1924,7 +3569,480 @@ def copy_template(template_name: str, target: Path) -> None:
     source = Path(__file__).resolve().parents[1] / "assets" / template_name
     if not source.is_dir():
         raise ContractError(f"缺少基础能力模板：{source}")
-    shutil.copytree(source, target)
+    shutil.copytree(source, target, ignore=_source_copy_ignore)
+
+
+def release_skill_root_document(claims: dict[str, Any], executor_name: str) -> str:
+    """Create a standard top-level Skill entrypoint for archive importers."""
+
+    bundle = claims["bundle"]
+    scenario = claims["scenario"]
+    return "\n".join([
+        "---",
+        f"name: {bundle['name']}",
+        f"description: {json.dumps(str(bundle['description']), ensure_ascii=False)}",
+        "---",
+        "",
+        f"# {scenario['name']}",
+        "",
+        "Read `system_prompt.md` before serving this scenario. For a complete business request, use the primary executor first:",
+        f"`skills/{executor_name}/scripts/execute_scenario.py execute`.",
+        "",
+        "For hosts that support MCP, install the sibling `mcp-stdio.zip` package instead; it exposes the same primary executor as discoverable tools.",
+        "",
+    ])
+
+
+def render_mcp_installation(server_name: str) -> str:
+    return "\n".join([
+        f"# {server_name} portable MCP package",
+        "",
+        "This package is detached from the source platform. It exposes the distilled primary executor as standard stdio MCP tools.",
+        "",
+        "## Install",
+        "",
+        "```bash",
+        "pip install -r requirements.txt",
+        "python run_mcp.py",
+        "```",
+        "",
+        "Configure an MCP host with the absolute path to `run_mcp.py`. See `mcp_config.example.json`; package-oriented hosts can also import `mcp.json`.",
+        "",
+        "The server emits ASCII-only JSON-RPC on stdout. This intentionally remains valid when a legacy Windows host incorrectly decodes child output with GBK; business artifacts remain UTF-8 files.",
+        "",
+        "## Tools",
+        "",
+        "- `describe_capability`, `describe_schema`, and `list_outputs` inspect the package contract.",
+        "- `execute` is the primary transaction: it selects the governing record, checks runtime sources, collects bounded linked evidence, and writes an Agent handoff when an output directory is supplied.",
+        "- `list_knowledge`, `search_knowledge`, and `query_data` are diagnostic fallbacks only. Do not use them to recreate a successful `execute` transaction.",
+        "",
+    ])
+
+
+def mcp_tool_definitions(namespace: str) -> list[dict[str, Any]]:
+    """Render the package-host MCP contract used by the reference platform."""
+    data_location = {
+        "data_dir": {"type": "string", "description": "Directory containing the uploaded runtime data files."},
+    }
+
+    def tool(action: str, description: str, properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
+        schema: dict[str, Any] = {"type": "object", "properties": properties}
+        if required:
+            schema["required"] = required
+        return {
+            "name": f"{namespace}__{action}",
+            "action": action,
+            "description": description,
+            "inputSchema": schema,
+        }
+
+    return [
+        tool("describe_capability", "Describe the capability, required runtime inputs, and recommended tool sequence.", {}),
+        tool("describe_schema", "Return declared sources, columns, lifecycle roles, and validated links.", {}),
+        tool("list_outputs", "Return the declared business result contract.", {}),
+        tool("list_knowledge", "List declared knowledge rows before selecting a governing record.", {
+            **data_location,
+            "limit": {"type": "integer", "default": 50},
+        }, ["data_dir"]),
+        tool("search_knowledge", "Search knowledge rows to locate a complete governing record.", {
+            **data_location,
+            "keyword": {"type": "string"},
+            "limit": {"type": "integer", "default": 20},
+        }, ["data_dir", "keyword"]),
+        tool("execute", "Run one complete business request: select a governing rule, validate bound runtime sources and links, and return the evidence handoff for one business-evaluation pass.", {
+            **data_location,
+            "output_id": {"type": "string", "description": "Output identifier from list_outputs."},
+            "params": {"type": ["string", "object", "null"], "description": "The complete business request, including the original rule context for a follow-up."},
+            "max_rows": {"type": "integer"},
+            "out_dir": {"type": "string"},
+        }, ["data_dir"]),
+        tool("query_data", "Diagnostic fallback: run a bounded read-only SELECT only when execute reports one named missing field or relationship.", {
+            **data_location,
+            "sql": {"type": "string"},
+            "save_result": {"type": "boolean", "default": False},
+            "out_dir": {"type": "string"},
+        }, ["data_dir", "sql"]),
+    ]
+
+
+def platform_compatibility_contracts(executor_root: Path, claims: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[str]]:
+    """Create the data files consumed by the reference package-host runtime."""
+    operational = load_json(executor_root / "references" / "operational-data-contract.json", MAX_CANDIDATE_BYTES)
+    flow = load_json(executor_root / "references" / "flow-contract.json", MAX_CANDIDATE_BYTES)
+    source_ids = {str(item) for item in operational.get("rule_source_ids", [])}
+    tables: list[dict[str, Any]] = []
+    source_name_by_id: dict[str, str] = {}
+    for index, source in enumerate(operational.get("sources", []), start=1):
+        if not isinstance(source, dict):
+            continue
+        source_id = str(source.get("source_id", ""))
+        raw_path = str(source.get("path", ""))
+        table_name = Path(raw_path).stem if raw_path and "://" not in raw_path else str(source.get("view_name", ""))
+        table_name = table_name or str(source.get("view_name", "")) or f"source_{index}"
+        source_name_by_id[source_id] = table_name
+        first_table = next((item for item in source.get("tables", []) if isinstance(item, dict)), {})
+        columns = [
+            {"name": str(column.get("query_name") or column.get("name")), "kind": column.get("kind", "text")}
+            for column in first_table.get("columns", []) if isinstance(column, dict)
+            and str(column.get("query_name") or column.get("name") or "")
+        ]
+        tables.append({
+            "table_name": table_name,
+            "source_id": source_id,
+            "file_path": raw_path,
+            "lifecycle": source.get("lifecycle", "runtime_input"),
+            "role": "knowledge" if source_id in source_ids else "input",
+            "columns": columns,
+            "header_row": first_table.get("header", {}).get("header_row", 0) if isinstance(first_table.get("header"), dict) else 0,
+        })
+    relations = [
+        {
+            "source_table": source_name_by_id.get(str(link.get("source_id", "")), str(link.get("source_id", ""))),
+            "target_table": source_name_by_id.get(str(link.get("target_id", "")), str(link.get("target_id", ""))),
+            "key_pairs": link.get("key_pairs") or link.get("recommended_candidate", {}),
+        }
+        for link in operational.get("links", []) if isinstance(link, dict)
+    ]
+    knowledge_table = next((source_name_by_id.get(source_id, "") for source_id in source_ids if source_name_by_id.get(source_id)), "")
+    execution_plan = flow.get("execution_plan") if isinstance(flow.get("execution_plan"), dict) else {}
+    output_specs = {
+        "outputs": [{
+            "output_id": "execute_business_request",
+            "name": claims["scenario"].get("business_outcome") or claims["scenario"].get("name", "business result"),
+            "format": "scenario_evidence",
+            "description": "Run the primary scenario transaction and return the selected governing rule, validated linked evidence, execution steps and Agent handoff.",
+            "result_contract": execution_plan.get("result_contract", {}),
+        }],
+    }
+    domain = {
+        "schema_version": RELEASE_CONTRACT_VERSION,
+        "scenario": claims["scenario"],
+        "tables": tables,
+        "relations": relations,
+        "knowledge_table": knowledge_table,
+    }
+    dispatch = {"knowledge_table": knowledge_table, "dispatch_key_column": ""}
+    required_tables = [
+        item["table_name"]
+        for item in tables
+        if item.get("lifecycle") == "runtime_input"
+    ]
+    return domain, output_specs, dispatch, required_tables
+
+
+def render_platform_system_prompt(
+    claims: dict[str, Any], executor_name: str, required_tables: list[str],
+) -> str:
+    """Render instructions for the reference platform's standard Skill importer."""
+    scenario = claims.get("scenario", {})
+    scenario_name = str(scenario.get("name", "业务场景"))
+    purpose = str(scenario.get("purpose", "完成已声明的业务目标"))
+    tables = "、".join(required_tables) or "由 describe_schema 返回的运行时表"
+    return "\n".join([
+        f"# {scenario_name} 子 Agent System Prompt",
+        "",
+        "## 唯一允许的执行路径",
+        "",
+        "本能力包的业务执行只能使用平台提供的能力动作，内部主入口是 "
+        "`main_skill/scripts/skill_executor.py`。不得绕过该入口读取包内 JSON/配置文件、"
+        "临时创建 Python 或 SQL 脚本，或自行猜测表结构、关联关系和业务规则。",
+        "",
+        "可用平台动作：`describe_capability`、`describe_schema`、`list_outputs`、"
+        "`list_knowledge`、`search_knowledge`、`execute`、`query_data`。其中 `execute` 是唯一的正常业务路径；其余动作只用于它报告的明确证据缺口。",
+        "",
+        "## 业务职责",
+        "",
+        f"你负责“{scenario_name}”场景：{purpose}。",
+        f"运行时业务数据由宿主上传并绑定；本场景需要的表为：{tables}。",
+        "",
+        "## 执行顺序",
+        "",
+        "1. 对完整业务请求，首先且只调用一次 `execute`，传入用户的完整请求作为 `params`、宿主提供的 `data_dir`，以及可写的 `out_dir`。不要先分拆为搜索规则、读表、阶段 Skill 或手工 SQL。",
+        "2. 以 `execute` 返回的 `selected_rule`、`candidate_evidence`、`execution_steps`、`result_contract` 和 `agent_handoff` 为唯一业务事实，完成一次判定和交付。零命中、规则不唯一或来源不兼容时，按返回的 blocker 向用户说明，禁止猜测或盲目重试。",
+        "3. 只有 `next_step` 明确指出缺失字段或未解决关联时，才使用一次 `query_data` 做该补充；不得用它重新实现整条审计规则。",
+        "4. 用户对刚完成的审计结果提出筛选、统计或追问时，优先基于本轮交付的结果和证据继续回答。确需重新执行时，`params` 必须包含原始规则上下文与新条件，不能只传一句过滤条件。",
+        "5. 输出结论时说明所用规则、数据范围、关键字段、证据路径以及未匹配/截断/待确认边界。",
+        "",
+        "## 禁止事项",
+        "",
+        "- 禁止把历史结果样本当作运行时规则或当前业务事实。",
+        "- 禁止直接打开大文件、全量灌入上下文，或执行未声明的外部访问。",
+        "- 禁止在证据不足、关联未验证或规则不唯一时编造结论。",
+        f"- 禁止绕过 `{executor_name}` 对应的主能力入口。",
+        "",
+    ])
+
+
+def render_platform_main_skill_guide(required_tables: list[str]) -> str:
+    tables = "、".join(required_tables) or "由 describe_schema 返回的运行时表"
+    return "\n".join([
+        "# 平台主 Skill 使用说明",
+        "",
+        "本目录由平台运行时加载。业务执行入口是 `scripts/skill_executor.py`；"
+        "请通过平台暴露的 `execute`、`query_data` 等动作调用，不要直接读取本目录的配置 JSON。",
+        "",
+        f"运行时需提供的数据表：{tables}。",
+        "",
+        "标准顺序：`execute` → 依据返回的证据完成一次判定与交付。仅当 `next_step` 指出具体证据缺口时才使用一次 `query_data`。",
+        "",
+    ])
+
+
+def build_release_bundle(
+    claims: dict[str, Any], output_root: Path, skills_root: Path, executor_name: str,
+    skill_manifest: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Emit installable Skill and stdio-MCP packages beside the source tree.
+
+    Distillation previously stopped at a nested Skills directory.  That is
+    sufficient for this Studio but not for a third-party host, which needs a
+    concrete import archive or a process-level MCP endpoint.
+    """
+
+    staging = output_root / ".release-staging"
+    if staging.exists():
+        if not staging.resolve().is_relative_to(output_root.resolve()):
+            raise ContractError("Release staging directory escapes the distillation output root")
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+    try:
+        skill_root = staging / "skill"
+        skill_root.mkdir()
+        # The host scans every root-level Skill and exposes each one to the
+        # Agent.  Stage readers and orchestrators are useful source-package
+        # diagnostics, but publishing them makes the host choose among a set of
+        # incomplete implementation fragments.  Publish only the primary
+        # executor as `main_skill`; its package actions retain the controlled
+        # diagnostic fallbacks when a real evidence gap needs one.
+        executor_source = skills_root / executor_name
+        if not executor_source.is_dir():
+            raise ContractError(f"Generated main executor is missing: {executor_name}")
+        shutil.copytree(executor_source, skill_root / "main_skill", ignore=_source_copy_ignore)
+        compatibility_root = Path(__file__).resolve().parents[1] / "assets" / "portable-platform-compatibility"
+        if not compatibility_root.is_dir():
+            raise ContractError("Missing portable platform compatibility assets")
+        shutil.copy2(
+            compatibility_root / "scripts" / "compatibility_runtime.py",
+            skill_root / "main_skill" / "scripts" / "compatibility_runtime.py",
+        )
+        shutil.copy2(
+            compatibility_root / "scripts" / "skill_executor.py",
+            skill_root / "main_skill" / "scripts" / "skill_executor.py",
+        )
+        domain_knowledge, output_specs, dispatch_config, required_tables = platform_compatibility_contracts(
+            skill_root / "main_skill", claims,
+        )
+        atomic_json(skill_root / "main_skill" / "domain_knowledge.json", domain_knowledge)
+        atomic_json(skill_root / "main_skill" / "output_specs.json", output_specs)
+        atomic_json(skill_root / "main_skill" / "dispatch_config.json", dispatch_config)
+        atomic_text(
+            skill_root / "system_prompt.md",
+            render_platform_system_prompt(claims, executor_name, required_tables),
+        )
+        atomic_text(
+            skill_root / "main_skill" / "SKILL.md",
+            render_platform_main_skill_guide(required_tables),
+        )
+
+        mcp_root = staging / "mcp"
+        copy_template("portable-mcp-adapter", mcp_root)
+        shutil.copytree(skills_root / executor_name, mcp_root / "main_executor", ignore=_source_copy_ignore)
+        shutil.copytree(skill_root / "main_skill", mcp_root / "main_skill", ignore=_source_copy_ignore)
+        shutil.copytree(
+            compatibility_root / "tools", mcp_root / "tools", ignore=_source_copy_ignore,
+        )
+        runtime_dependencies = sorted({
+            dependency
+            for item in skill_manifest
+            if item.get("name") == executor_name
+            for dependency in item.get("python_dependencies", [])
+        })
+        atomic_text(
+            mcp_root / "requirements.txt",
+            "\n".join(runtime_dependencies) + ("\n" if runtime_dependencies else ""),
+        )
+        server_name = executor_name.removesuffix("-main-executor") or executor_name
+        namespace = "s_" + hashlib.sha256(server_name.encode("utf-8")).hexdigest()[:8]
+        tool_definitions = mcp_tool_definitions(namespace)
+        atomic_json(mcp_root / "mcp.json", {
+            "schema_version": RELEASE_CONTRACT_VERSION,
+            "protocol": "mcp",
+            "spec_version": "2024-11-05",
+            "protocol_version": "2024-11-05",
+            "namespace": namespace,
+            "server_name": server_name,
+            "skill_name": server_name,
+            "display_name": claims["scenario"].get("name", server_name),
+            "summary": claims["bundle"].get("description", ""),
+            "required_tables": required_tables,
+            "knowledge_table": dispatch_config["knowledge_table"],
+            "execution_mode": "knowledge_engine",
+            "command": "python",
+            "args": ["run_mcp.py"],
+            "entrypoint": "run_mcp.py",
+            "main_executor": executor_name,
+            "transport": "stdio",
+            "stdout_contract": "ascii_json_rpc",
+            "requires_host_llm_reasoning": True,
+            "primary_install_mode": "mcp_stdio",
+            "tools": tool_definitions,
+        })
+        atomic_json(mcp_root / "mcp_config.example.json", {
+            "mcpServers": {
+                server_name: {
+                    "command": "python",
+                    "args": ["/absolute/path/to/package/run_mcp.py"],
+                }
+            }
+        })
+        atomic_text(mcp_root / "INSTALL.md", render_mcp_installation(server_name))
+        atomic_json(mcp_root / "manifest.json", {
+            "schema_version": RELEASE_CONTRACT_VERSION,
+            "format": "portable-business-capability-mcp",
+            "scenario": claims["scenario"],
+            "bundle": claims["bundle"],
+            "main_executor": executor_name,
+            "namespace": namespace,
+            "tool_actions": [
+                "describe_capability", "list_outputs", "describe_schema", "list_knowledge",
+                "search_knowledge", "execute", "query_data",
+            ],
+            "tool_names": [item["name"] for item in tool_definitions],
+            "runtime_dependencies": runtime_dependencies,
+        })
+
+        artifacts_root = staging / "artifacts"
+        artifacts_root.mkdir()
+        skill_archive = Path(shutil.make_archive(
+            str(artifacts_root / "skill"), "zip", root_dir=staging, base_dir="skill"
+        ))
+        mcp_archive = Path(shutil.make_archive(
+            str(artifacts_root / "mcp-stdio"), "zip", root_dir=staging, base_dir="mcp"
+        ))
+        release_payload = {
+            "schema_version": RELEASE_CONTRACT_VERSION,
+            "format": "portable-business-capability-release",
+            "scenario": claims["scenario"],
+            "bundle": claims["bundle"],
+            "main_executor": executor_name,
+            "install_modes": {
+                "skill_directory": {
+                    "root": "skill",
+                    "archive": "artifacts/skill.zip",
+                    "system_prompt": "system_prompt.md",
+                    "primary_entrypoint": "main_skill/scripts/skill_executor.py",
+                },
+                "mcp_stdio": {
+                    "root": "mcp",
+                    "archive": "artifacts/mcp-stdio.zip",
+                    "config": "mcp/mcp_config.example.json",
+                    "descriptor": "mcp/mcp.json",
+                    "command": "python",
+                    "args": ["run_mcp.py"],
+                    "stdout_contract": "ascii_json_rpc",
+                },
+            },
+            "artifact_digests": {
+                "skill_zip": sha256_file(skill_archive),
+                "mcp_stdio_zip": sha256_file(mcp_archive),
+            },
+        }
+        atomic_json(staging / "release.json", release_payload)
+        target = output_root / "release"
+        safe_replace_directory(target, staging, output_root)
+        return {
+            "schema_version": RELEASE_CONTRACT_VERSION,
+            "root": "release",
+            "skill_archive": "release/artifacts/skill.zip",
+            "mcp_stdio_archive": "release/artifacts/mcp-stdio.zip",
+            "mcp_config": "release/mcp/mcp_config.example.json",
+            "stdout_contract": "ascii_json_rpc",
+            "artifact_digests": release_payload["artifact_digests"],
+        }
+    except Exception:
+        if staging.exists():
+            shutil.rmtree(staging)
+        raise
+
+
+def validate_release_bundle(output_root: Path, executor_name: str) -> list[str]:
+    root = output_root / "release"
+    required = [
+        root / "release.json",
+        root / "skill" / "system_prompt.md",
+        root / "skill" / "main_skill" / "SKILL.md",
+        root / "skill" / "main_skill" / "scripts" / "execute_scenario.py",
+        root / "skill" / "main_skill" / "scripts" / "recipe_runtime.py",
+        root / "skill" / "main_skill" / "references" / "compiled-recipes.json",
+        root / "mcp" / "run_mcp.py",
+        root / "mcp" / "mcp_server.py",
+        root / "mcp" / "mcp.json",
+        root / "mcp" / "mcp_config.example.json",
+        root / "mcp" / "main_executor" / "scripts" / "execute_scenario.py",
+        root / "mcp" / "main_executor" / "scripts" / "recipe_runtime.py",
+        root / "mcp" / "main_executor" / "references" / "compiled-recipes.json",
+        root / "mcp" / "main_skill" / "scripts" / "skill_executor.py",
+        root / "mcp" / "main_skill" / "domain_knowledge.json",
+        root / "mcp" / "main_skill" / "output_specs.json",
+        root / "mcp" / "main_skill" / "dispatch_config.json",
+        root / "mcp" / "tools" / "knowledge" / "search_knowledge.py",
+        root / "mcp" / "tools" / "knowledge" / "list_knowledge.py",
+        root / "artifacts" / "skill.zip",
+        root / "artifacts" / "mcp-stdio.zip",
+    ]
+    errors = [f"Missing release artifact: {path.relative_to(output_root).as_posix()}" for path in required if not path.is_file()]
+    if errors:
+        return errors
+    try:
+        release = load_json(root / "release.json", MAX_CANDIDATE_BYTES)
+        mcp = load_json(root / "mcp" / "mcp.json", MAX_CANDIDATE_BYTES)
+    except ContractError as exc:
+        return [str(exc)]
+    if release.get("format") != "portable-business-capability-release":
+        errors.append("Release manifest format is invalid")
+    if mcp.get("protocol") != "mcp" or mcp.get("transport") != "stdio":
+        errors.append("MCP package does not declare standard stdio transport")
+    if mcp.get("main_executor") != executor_name:
+        errors.append("MCP package primary executor differs from the capability manifest")
+    if mcp.get("stdout_contract") != "ascii_json_rpc":
+        errors.append("MCP package does not declare an ASCII-safe stdout contract")
+    namespace = str(mcp.get("namespace", ""))
+    tools = mcp.get("tools", [])
+    if not namespace or not isinstance(tools, list) or not tools:
+        errors.append("MCP package lacks a discoverable namespace/tool descriptor")
+    elif any(
+        not isinstance(item, dict)
+        or not str(item.get("action", ""))
+        or item.get("name") != f"{namespace}__{item.get('action')}"
+        or not isinstance(item.get("inputSchema"), dict)
+        for item in tools
+    ):
+        errors.append("MCP package tool descriptor is invalid")
+    server_text = (root / "mcp" / "mcp_server.py").read_text(encoding="utf-8")
+    if "ensure_ascii=True" not in server_text or "sys.stdout.buffer.write" not in server_text:
+        errors.append("MCP server does not enforce an ASCII-safe wire format")
+    expected_members = {
+        "skill/system_prompt.md": root / "artifacts" / "skill.zip",
+        "skill/main_skill/scripts/execute_scenario.py": root / "artifacts" / "skill.zip",
+        "skill/main_skill/scripts/recipe_runtime.py": root / "artifacts" / "skill.zip",
+        "skill/main_skill/references/compiled-recipes.json": root / "artifacts" / "skill.zip",
+        "mcp/run_mcp.py": root / "artifacts" / "mcp-stdio.zip",
+        "mcp/mcp_server.py": root / "artifacts" / "mcp-stdio.zip",
+        "mcp/mcp.json": root / "artifacts" / "mcp-stdio.zip",
+        "mcp/main_skill/scripts/skill_executor.py": root / "artifacts" / "mcp-stdio.zip",
+        "mcp/main_executor/scripts/recipe_runtime.py": root / "artifacts" / "mcp-stdio.zip",
+    }
+    archive_names: dict[Path, set[str]] = {}
+    for archive in set(expected_members.values()):
+        try:
+            with zipfile.ZipFile(archive) as opened:
+                archive_names[archive] = set(opened.namelist())
+        except (OSError, zipfile.BadZipFile) as exc:
+            errors.append(f"Invalid release archive {archive.name}: {exc}")
+    for member, archive in expected_members.items():
+        if member not in archive_names.get(archive, set()):
+            errors.append(f"Release archive {archive.name} is missing {member}")
+    return errors
 
 
 def _source_copy_ignore(_: str, names: list[str]) -> set[str]:
@@ -1959,7 +4077,9 @@ def platform_skill_secrets() -> dict[str, dict[str, str]]:
     return {}
 
 
-def materialize_system_skill_credentials(source_skill: str, target: Path) -> dict[str, Any]:
+def materialize_system_skill_credentials(
+    source_skill: str, target: Path, *, include_secret_values: bool = False,
+) -> dict[str, Any]:
     spec = next(
         (value for value in FOUNDATION_SPECS.values() if value.get("source_skill") == source_skill), {}
     )
@@ -1973,23 +4093,46 @@ def materialize_system_skill_credentials(source_skill: str, target: Path) -> dic
         source_value = str(config.get(json_key, "") or "").strip()
         environment_value = str(os.environ.get(environment_key, "") or "").strip()
         stored_value = str(stored.get(environment_key, "") or "").strip()
-        value = environment_value or stored_value or source_value
-        origin = "environment" if environment_value else "platform_secret_store" if stored_value else "source_config" if source_value else "missing"
-        if value and value != source_value:
-            config[json_key] = value
-            atomic_json(config_path, config)
+        if include_secret_values:
+            value = environment_value or stored_value or source_value
+            origin = "environment" if environment_value else "platform_secret_store" if stored_value else "source_config" if source_value else "missing"
+            if value and value != source_value:
+                config[json_key] = value
+                atomic_json(config_path, config)
+            exported = bool(value)
+        else:
+            # A platform credential may be available to the generator, but it
+            # must never cross the packaging boundary into a third-party Skill.
+            # Keep public defaults intact and let the target environment provide
+            # the same named variable at runtime.
+            value = environment_value or stored_value or source_value
+            origin = (
+                "environment_not_exported" if environment_value
+                else "platform_secret_store_not_exported" if stored_value
+                else "source_config_not_exported" if source_value
+                else "missing"
+            )
+            if source_value:
+                config[json_key] = ""
+                atomic_json(config_path, config)
+            exported = False
         fields.append({
             "environment_key": environment_key,
             "config_path": relative_path,
             "config_key": json_key,
             "configured": bool(value),
             "origin": origin,
+            "exported": exported,
         })
     return {
-        "policy": "preserve_and_materialize_without_redaction",
+        "policy": (
+            "preserve_and_materialize_without_redaction"
+            if include_secret_values else "preserve_public_defaults_externalize_credentials"
+        ),
         "source_skill": source_skill,
         "fields": fields,
         "all_required_credentials_configured": all(item["configured"] for item in fields),
+        "credentials_exported": any(item["exported"] for item in fields),
     }
 
 
@@ -2020,7 +4163,9 @@ def copy_customized_system_skill(
     if item["kind"] == "knowledge":
         wrapper = Path(__file__).resolve().parents[1] / "assets" / "portable-knowledge-wrapper" / "scripts" / "scenario_kb.py"
         shutil.copy2(wrapper, target / "scripts" / "scenario_kb.py")
-    credential_status = materialize_system_skill_credentials(source_skill, target)
+    credential_status = materialize_system_skill_credentials(
+        source_skill, target, include_secret_values=False
+    )
     resources = inherited_resource_inventory(source, target)
     atomic_json(target / "references" / "scenario_binding.json", {
         "schema_version": 1,
@@ -2040,6 +4185,95 @@ def copy_customized_system_skill(
     }
 
 
+def infer_design_time_output_templates(
+    relation_path: Path, relations: dict[str, Any], operational: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Retain output shape/provenance without turning a historical result into runtime input."""
+    cards_path = relation_path.parent / "evidence-cards.json"
+    catalog_path = relation_path.parent / "_field-evidence" / "catalog.json"
+    if not cards_path.is_file() or not catalog_path.is_file():
+        return []
+    try:
+        cards_payload = load_json(cards_path, MAX_EVIDENCE_BYTES)
+        catalog = load_json(catalog_path, MAX_EVIDENCE_BYTES)
+    except ContractError:
+        return []
+    cards = {
+        str(item.get("id", "")): item
+        for item in cards_payload.get("cards", [])
+        if isinstance(item, dict) and str(item.get("id", ""))
+    }
+    output_evidence_ids = {
+        str(evidence_id)
+        for node in relations.get("nodes", [])
+        if isinstance(node, dict) and str(node.get("type", "")) == "output"
+        for evidence_id in node.get("evidence_ids", [])
+        if str(evidence_id)
+    }
+    candidate_files: dict[str, set[str]] = defaultdict(set)
+    for evidence_id in output_evidence_ids:
+        card = cards.get(evidence_id, {})
+        for source in card.get("sources", []) if isinstance(card.get("sources"), list) else []:
+            if isinstance(source, dict) and source.get("file"):
+                candidate_files[str(source["file"])].add(evidence_id)
+    runtime_paths = {
+        str(source.get("path", ""))
+        for source in operational.get("sources", [])
+        if isinstance(source, dict) and source.get("runtime_required") is True
+    }
+    templates: list[dict[str, Any]] = []
+    for item in catalog.get("files", []) if isinstance(catalog.get("files"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        relative_path = str(item.get("path", ""))
+        if not relative_path or relative_path not in candidate_files or relative_path in runtime_paths:
+            continue
+        tables = []
+        output_columns: list[str] = []
+        column_semantics: list[dict[str, Any]] = []
+        for table in item.get("tables", []) if isinstance(item.get("tables"), list) else []:
+            if not isinstance(table, dict):
+                continue
+            columns = [
+                str(column.get("query_name") or column.get("name"))
+                for column in table.get("columns", [])
+                if isinstance(column, dict) and str(column.get("query_name") or column.get("name"))
+            ]
+            output_columns.extend(column for column in columns if column not in output_columns)
+            for column in table.get("columns", []) if isinstance(table.get("columns"), list) else []:
+                if not isinstance(column, dict):
+                    continue
+                name = str(column.get("query_name") or column.get("name") or "")
+                if not name or any(item.get("column") == name for item in column_semantics):
+                    continue
+                column_semantics.append({
+                    "column": name,
+                    "kind": str(column.get("kind", "other")),
+                    "semantic_role": infer_column_semantic_role(column),
+                })
+            tables.append({
+                "table": table.get("table_name") or table.get("name"),
+                "row_count": table.get("row_count"),
+                "column_count": table.get("column_count", len(columns)),
+                "columns": columns,
+            })
+        templates.append({
+            "template_id": "output-" + hashlib.sha256(relative_path.encode("utf-8")).hexdigest()[:12],
+            "name": Path(relative_path).stem,
+            "path": relative_path,
+            "format": str(item.get("extension", Path(relative_path).suffix)).lstrip("."),
+            "source_kind": item.get("kind", "tabular"),
+            "runtime_required": False,
+            "original_file_required_at_runtime": False,
+            "evidence_ids": sorted(candidate_files[relative_path]),
+            "tables": tables,
+            "output_columns": output_columns,
+            "column_semantics": column_semantics,
+            "usage": "Use this only as the final result schema and field naming contract; query current runtime sources for values.",
+        })
+    return templates
+
+
 def portable_operational_contract(claims: dict[str, Any]) -> dict[str, Any]:
     source = claims.get("source") if isinstance(claims.get("source"), dict) else {}
     claim = source.get("operational_data_contract") if isinstance(source.get("operational_data_contract"), dict) else {}
@@ -2051,6 +4285,28 @@ def portable_operational_contract(claims: dict[str, Any]) -> dict[str, Any]:
     relation_path = Path(str(relation_claim.get("artifact", ""))).resolve()
     relations = load_json(relation_path, MAX_SOURCE_BYTES)
     portable = normalize_operational_runtime_contract(relations, payload)
+    output_templates = infer_design_time_output_templates(relation_path, relations, portable)
+    portable["design_time_output_templates"] = output_templates
+    portable["output_contract"] = {
+        "template_count": len(output_templates),
+        "templates": [
+            {
+                "template_id": item.get("template_id"),
+                "name": item.get("name"),
+                "format": item.get("format"),
+                "columns": item.get("output_columns", []),
+                "column_semantics": item.get("column_semantics", []),
+                "runtime_required": False,
+            }
+            for item in output_templates
+        ],
+        "required_result_fields": [
+            "business_conclusion", "decision_reason", "scope_or_measure",
+            "rule_provenance", "data_provenance", "coverage", "uncertainties",
+        ],
+        "policy": "Historical result files define structure only; never use them as current business evidence.",
+    }
+    portable["trace_evidence"] = compact_trace_evidence(portable, include_rows=False)
     upstream = portable.get("source") if isinstance(portable.get("source"), dict) else {}
     portable["source"] = {
         "field_evidence_fingerprint": upstream.get("field_evidence_fingerprint", ""),
@@ -2074,6 +4330,7 @@ def render_agent_prompts(
     scenario = claims.get("scenario", {})
     orchestrator = claims["orchestrator"]
     foundations = [item for item in skills if item.get("kind") == "foundation"]
+    main_executors = [item for item in skills if item.get("kind") == "main_executor"]
     foundation_kinds = {str(item.get("foundation_kind", "")) for item in foundations}
     stages = [item for item in claims.get("stage_skills", []) if isinstance(item, dict)]
     source_lines = []
@@ -2123,26 +4380,35 @@ def render_agent_prompts(
         document_step = "当前数据契约没有 TXT、Markdown、Word、PDF 或图片来源，也没有安装文档/OCR 基础 Skill。运行时若出现这些契约外格式，停止并要求从数据关系发现重新生成能力包；不得让 Agent 临时直接打开全文或假装已有解析能力。"
         provenance_step = "不得把契约外文档的语义命中强行归到结构化记录；只有重新发现后生成了带 source_digest、locator、chunk_id 与 text_digest 的检索路径，才能把非结构化证据纳入判定。"
     lines = [
+        "## Third-party execution contract",
+        "",
+        "For a complete business request, call the generated main executor exactly once first. Continue from its `execution_steps` and `next_step`; do not manually call stage skills in sequence.",
+        "A successful artifact is not a failure even when stdout is short. Read the `agent_handoff` file once, apply the selected complete rule to its `candidate_evidence.records`, and produce the declared result contract.",
+        "If `candidate_evidence.coverage.complete_for_all_matching_runtime_rows` is false, disclose the bounded preview and truncation in the result; never claim that the preview is exhaustive and never blind-retry the executor.",
         f"# {scenario.get('name', '')} Agent 系统提示词", "",
         f"你是“{scenario.get('name', '')}”业务 Agent。你的目标是：{scenario.get('purpose', flow.get('scenario', {}).get('business_outcome', '完成场景业务目标'))}。",
         "你只负责理解用户意图、选择业务阶段、根据完整业务证据推理并组织结果。文件解析、OCR、索引、大表扫描和 SQL 执行必须交给已安装 Skill，禁止把原始大文件或整篇文档直接读入上下文。", "",
-        "禁止临时创建 Python、SQL 执行器、HTTP 客户端或文件解析脚本。每个已安装 Skill 都提供 `scripts/` CLI；先运行场景总控状态机和阶段运行器，再按阶段工作单调用基础 Skill 脚本。", "",
+        "禁止临时创建 Python、SQL 执行器、HTTP 客户端或文件解析脚本。每个已安装 Skill 都提供 `scripts/` CLI；完整请求先调用主执行 Skill，只有降级或单阶段请求才启动总控状态机和阶段运行器。", "",
         "## 已安装能力", "",
-        f"- 场景总控：`{orchestrator.get('skill_name', '')}`。端到端请求、跨阶段请求或不确定路由时必须先调用它。",
+        *[
+            f"- **首选端到端入口**：`{item.get('name', '')}`。完整业务请求必须先调用其 `execute`；一次返回规则、运行时数据、关联校验和证据包。"
+            for item in main_executors
+        ],
+        f"- 场景总控：`{orchestrator.get('skill_name', '')}`。仅在主执行器阻塞、用户明确指定阶段或需要降级调试时调用。",
         *stage_lines,
         *foundation_lines,
         "", "## 数据来源契约", "", *source_lines,
         "", "所有基础 Skill 都携带 `references/operational-data-contract.json`。运行时由调用方提供 `<data-root>`；文件名变化时只能用基础 Skill 的 `--bind <source-id>=<relative-path>` 显式绑定，不得猜测路径。`design_time_template` 只提供输出字段/类型/格式约束，缺少其历史原文件不是运行阻塞。", "",
         "## 强制执行顺序", "",
-        "1. 识别用户是在请求整个场景还是某一阶段，并选择场景总控或对应阶段 Skill。",
-        "2. 若任务受规则约束，必须先取得完整适用规则记录。表格规则源用 `search-contract` 返回完整一行，规则名称、问题清单、违规类型、参考示例、用途及同一行其他字段均保留；文档规则源先建索引，检索并取得完整适用章节及定位。零命中时报告缺失；多条命中时先按用户条件缩小，仍有实质不同候选则列出规则标识并请求选择，禁止把多条规则拼接成一条。不得只摘一句或一个命中片段。",
-        "3. 根据用户需求和完整规则行，推导实际需要的结构化字段、过滤条件、分组、比较逻辑、结果字段以及非结构化检索词。历史结果只保留模板结构和可选脱敏示例，用于输出字段约束、验证与对账；其原文件不是运行输入，也不能成为规则。",
+        "1. 完整业务请求优先调用主执行 Skill 的 `execute`，不要先逐个读取或调用阶段 Skill；仅在主执行器阻塞、用户明确指定阶段或需要降级调试时选择总控/阶段 Skill。",
+        "2. 若任务受结构化规则或政策约束，必须先取得完整适用记录。表格来源返回完整一行，文档来源先建索引并取得完整适用章节及定位；记录标识、选择字段、叙述字段及同一行其他字段均保留。零命中时报告缺失；多条命中时先按用户条件缩小，仍有实质不同候选则列出记录标识并请求选择，禁止拼接成一条。不得只摘一句或一个命中片段。",
+        "3. 根据用户需求和完整规则行，结合 operational-data-contract 的 trace_evidence 蓝图选择已验证的来源角色、投影字段和连接路径，再推导本次过滤条件、分组、比较逻辑、结果字段及非结构化检索词。蓝图只证明设计期真实实例能够贯通；运行时必须用当前数据重新验证键值、基数和规则适用性。历史结果只保留模板结构和可选脱敏示例，其原文件不是运行输入，也不能成为规则。",
         "4. 对每条结构化关联先运行 `validate-join`。单键出现无法解释的多对多时，只能按 operational-data-contract 中已有的 `candidate_key_sets` 继续验证复合键；查询时用 `<link-id>@<key-set-index>` 绑定已通过的键组。连接为零、未匹配异常或所有候选仍放大时停止并报告，禁止猜测替代键。",
         "5. 大型 Excel/CSV/Parquet 等只能通过契约化只读 SQL 访问。只预检和注册当前规则/SQL 引用的 runtime_input；运行数据按字段兼容性校验，不要求与蒸馏样本的大小或内容摘要相同。预览和核验使用 `query-contract`；用户要求全部结果时使用 `export-contract` 写 CSV/Parquet，并只把行数、查询摘要和文件摘要返回上下文。Agent 不得直接打开、全量 sample 或把全部记录放入上下文。",
         f"6. {document_step}",
         f"7. {provenance_step}",
         "8. 若已安装 knowledge 基础 Skill，只有相关流程节点或完整规则明确需要外部知识时才调用 `scenario_kb.py`；由 Agent 根据完整规则决定检索内容。规则声明为必需时使用 `--required`，知识库、爬虫或其他已声明外部能力全部不可用/零命中则必须返回 `manual_intervention_required` 并要求人工处理；不得凭空补齐。知识切片必须带来源，不能替代规则和业务事实。",
-        "9. 用阶段 Skill 的 `run_stage.py start/finish` 生成工作单和交接文件，并由总控 Skill 的 `orchestrate.py` 记录顺序；只传递最小必要的结构化对象和证据定位。",
+        "9. 仅在主执行器要求降级或用户明确指定阶段时，用阶段 Skill 的 `run_stage.py start/finish` 生成工作单和交接文件，并由总控 Skill 的 `orchestrate.py` 记录顺序；正常端到端请求不要手工推进状态机。",
         "10. 输出前对照规则完整行、SQL 谓词、连接校验、结果字段和证据定位。若输入或证据不足，明确说明缺口，不补造事实。", "",
         "## 输出要求", "",
         "- 先回答业务结论或交付物，再说明所用规则、数据范围和关键证据。",
@@ -2202,6 +4468,56 @@ def validate_generated_skills(skills_root: Path) -> list[str]:
             errors.append(f"{skill_dir.name}/SKILL.md description 过短")
         scripts_root = skill_dir / "scripts"
         scripts = sorted(scripts_root.glob("*.py")) if scripts_root.is_dir() else []
+        executor_entrypoint = scripts_root / "execute_scenario.py"
+        stage_entrypoint = scripts_root / "run_stage.py"
+        orchestrator_entrypoint = scripts_root / "orchestrate.py"
+        if executor_entrypoint.is_file():
+            try:
+                contract = load_json(
+                    skill_dir / "references" / "operational-data-contract.json", MAX_OPERATIONAL_BYTES
+                )
+                flow_contract = load_json(
+                    skill_dir / "references" / "flow-contract.json", MAX_CANDIDATE_BYTES
+                )
+                if contract.get("status") != "ready":
+                    errors.append(f"{skill_dir.name}/references/operational-data-contract.json is not ready")
+                if not str(flow_contract.get("execution_mode", "")).strip():
+                    errors.append(f"{skill_dir.name}/references/flow-contract.json is missing execution_mode")
+                if not isinstance(flow_contract.get("main_flow"), list):
+                    errors.append(f"{skill_dir.name}/references/flow-contract.json is missing main_flow")
+            except ContractError as exc:
+                errors.append(str(exc))
+        elif stage_entrypoint.is_file():
+            try:
+                contract = load_json(skill_dir / "references" / "contract.json", MAX_CANDIDATE_BYTES)
+                if not str(contract.get("stage_id", "")).strip():
+                    errors.append(f"{skill_dir.name}/references/contract.json is missing stage_id")
+                # A preparation/closure stage may intentionally hand off an
+                # internal state without owning a material output node.  The
+                # empty list is an explicit contract; only a missing or
+                # malformed field is a generation error.
+                if not isinstance(contract.get("output_contract"), list):
+                    errors.append(f"{skill_dir.name}/references/contract.json is missing output_contract")
+            except ContractError as exc:
+                errors.append(str(exc))
+        elif orchestrator_entrypoint.is_file():
+            try:
+                routing = load_json(
+                    skill_dir / "references" / "capability-routing.json", MAX_CANDIDATE_BYTES
+                )
+                if not isinstance(routing.get("main_flow"), list) or not isinstance(routing.get("routing"), list):
+                    errors.append(f"{skill_dir.name}/references/capability-routing.json is missing main_flow/routing")
+            except ContractError as exc:
+                errors.append(str(exc))
+        else:
+            try:
+                operational = load_json(
+                    skill_dir / "references" / "operational-data-contract.json", MAX_CANDIDATE_BYTES
+                )
+                if operational.get("status") != "ready":
+                    errors.append(f"{skill_dir.name}/references/operational-data-contract.json is not ready")
+            except ContractError as exc:
+                errors.append(str(exc))
         if not scripts:
             errors.append(f"{skill_dir.name} 缺少 scripts/*.py 可执行入口；不得让第三方 Agent 临时编写脚本")
         if "scripts/" not in text:
@@ -2228,7 +4544,10 @@ def write_capability_map(claims: dict[str, Any], path: Path) -> None:
     }
     lines = ["flowchart LR"]
     orchestrator = claims["orchestrator"]
+    executor_name = scenario_executor_skill_name(str(claims["bundle"]["name"]))
+    lines.append(f'    main_executor["{compact(executor_name, 80)}\\n首选端到端入口"]')
     lines.append(f'    orchestrator["{compact(orchestrator["display_name"], 80).replace(chr(34), chr(39))}"]')
+    lines.append("    main_executor -.-> orchestrator")
     for item in claims["foundation_skills"]:
         lines.append(f'    {item["id"].replace("-", "_")}{{{{"{compact(item["display_name"], 70)}"}}}}')
     for item in claims["stage_skills"]:
@@ -2250,6 +4569,8 @@ def write_report(manifest: dict[str, Any], path: Path) -> None:
         f"- 能力包源码名称：`{manifest['bundle']['name']}`",
         f"- 目标：{manifest['bundle']['target_agents']}",
         f"- 总 Skill 数：{manifest['skill_count']}",
+        f"- 主执行 Skill：`{manifest.get('main_executor_skill', '')}`（完整请求首选入口）",
+        f"- 通用能力模型：`{manifest.get('artifacts', {}).get('capability_model', '')}`（来源角色、字段语义、历史追踪蓝图、流程和输出契约）",
         f"- 流程阶段 Skill：{manifest['stage_skill_count']}（与流程节点 1:1）",
         f"- 基础文件 Skill：{manifest['foundation_skill_count']}",
         "- 第三方 Agent 提示词：`agent_prompts.md`（可直接复制为系统提示词）",
@@ -2283,7 +4604,7 @@ def write_report(manifest: dict[str, Any], path: Path) -> None:
     lines.extend(["", "## 可移植性", ""])
     lines.extend([
         "- 生成 Skill 仅使用相对资源路径，不依赖原平台 Tool、挂载目录或持久会话。",
-        "- 定制系统 Skill 完整继承配置字段和值；已配置凭据按原字段物化，但 manifest、报告和提示词不回显其值。",
+        "- 定制系统 Skill 完整继承公开配置字段和值；秘密字段保持空值并由第三方运行环境通过同名环境变量注入，manifest、报告和提示词不回显其值。",
         "- 每个 Skill 都携带稳定 scripts 入口；阶段工作单与总控状态机阻止第三方 Agent 临时拼写执行脚本。",
         "- 阶段 Skill 的输入、输出、控制、交接和待确认项均来自已验收上游。",
         "- 最终发布前仍需由独立 package-business-skill 校验、版本化和打包。", "",
@@ -2309,6 +4630,82 @@ def generate_bundle(
     ocr_skill_name = foundation_names.get("foundation-ocr", "")
     skill_manifest: list[dict[str, Any]] = []
     operational = portable_operational_contract(claims)
+    flow_contract = portable_flow_contract(claims, flow, operational)
+    recipe_catalog = compiled_recipe_catalog(output_root, operational)
+    recipe_verification = recipe_coverage_status(flow, operational, recipe_catalog)
+    if recipe_verification.get("publishable") is not True:
+        uncovered = ", ".join(map(str, recipe_verification.get("uncovered_source_ids", [])))
+        raise ContractError(
+            "compiled-recipes.json 未覆盖已声明的知识判定源"
+            + (f"：{uncovered}" if uncovered else "")
+        )
+    executor_name = scenario_executor_skill_name(str(claims["bundle"]["name"]))
+    if executor_name in {str(item["skill_name"]) for item in [*claims["foundation_skills"], *claims["stage_skills"]]}:
+        raise ContractError(f"生成的主执行 Skill 名称冲突：{executor_name}")
+
+    executor_root = staging / executor_name
+    copy_template("portable-scenario-executor", executor_root)
+    # Keep the bounded contract reader beside the primary entrypoint. This
+    # makes the primary Skill usable when a third-party platform installs only
+    # one Skill directory instead of exposing sibling Skill paths.
+    reader_template = (
+        Path(__file__).resolve().parents[1]
+        / "assets" / "portable-tabular-reader" / "scripts" / "query_tabular.py"
+    )
+    shutil.copy2(reader_template, executor_root / "scripts" / "query_tabular.py")
+    if any(item.get("kind") == "tabular" for item in claims.get("foundation_skills", [])):
+        shutil.copy2(
+            reader_template.parent.parent / "requirements.txt",
+            executor_root / "requirements.txt",
+        )
+    atomic_json(executor_root / "references" / "operational-data-contract.json", operational)
+    atomic_json(executor_root / "references" / "flow-contract.json", flow_contract)
+    execution_plan = flow_contract.get("execution_plan", {})
+    atomic_json(
+        executor_root / "references" / "capability-model.json",
+        execution_plan.get("capability_model", {}),
+    )
+    atomic_json(executor_root / "references" / "execution-plan.json", execution_plan)
+    atomic_json(executor_root / "references" / "compiled-recipes.json", recipe_catalog)
+    atomic_json(
+        executor_root / "references" / "dispatch-config.json",
+        execution_plan.get("dispatch_config", {}),
+    )
+    atomic_json(
+        executor_root / "references" / "output-specs.json",
+        {"outputs": execution_plan.get("output_specs", [])},
+    )
+    atomic_text(
+        executor_root / "SKILL.md",
+        render_executor_skill(claims, flow_contract, operational, executor_name),
+    )
+    write_skill_metadata(
+        executor_root,
+        executor_name,
+        f"{claims['scenario']['name']}主执行器",
+        f"端到端执行{claims['scenario']['name']}：规则定位、数据检索、关联校验、证据汇总和可追溯交付。",
+    )
+    skill_manifest.append({
+        "name": executor_name,
+        "kind": "main_executor",
+        "role": "primary_end_to_end_executor",
+        "priority": "first",
+        "path": f"skills/{executor_name}",
+        "depends_on": list(foundation_names.values()),
+        "python_dependencies": python_dependencies(executor_root),
+        "executables": sorted(
+            path.relative_to(executor_root).as_posix()
+            for path in (executor_root / "scripts").glob("*.py")
+        ),
+        "execution_modes": ["describe", "search-rules", "produce", "execute", "query"],
+        "reference_contracts": [
+            "references/capability-model.json",
+            "references/execution-plan.json",
+            "references/compiled-recipes.json",
+            "references/operational-data-contract.json",
+            "references/flow-contract.json",
+        ],
+    })
 
     for item in claims["foundation_skills"]:
         skill_root = staging / item["skill_name"]
@@ -2418,12 +4815,37 @@ def generate_bundle(
     agent_prompt_path = output_root / "agent_prompts.md"
     atomic_text(agent_prompt_path, render_agent_prompts(claims, flow, operational, skill_manifest))
     agent_prompt_digest = sha256_file(agent_prompt_path)
+    release = build_release_bundle(claims, output_root, target, executor_name, skill_manifest)
+    release_errors = validate_release_bundle(output_root, executor_name)
+    if release_errors:
+        raise ContractError("Generated release package failed validation: " + "; ".join(release_errors))
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "generator_contract_version": GENERATOR_CONTRACT_VERSION,
         "status": "complete",
         "generated_at": utc_now(),
-        "strategy": "accepted_flow_to_portable_multi_skill_source",
+        "strategy": "accepted_flow_to_portable_primary_executor_with_stage_fallback",
+        "verification": recipe_verification,
+        "publication": {
+            # The generator can prove replay/recipe completeness, but it is
+            # not the human authority that may release an installable package.
+            # Platform storage changes this record only after an independent
+            # package review; until then these archives are a release
+            # candidate, never a publishable capability.
+            "status": "pending_human_platform_package_approval",
+            "verifiable": True,
+            "publishable": False,
+            "approval_required": {
+                "authority": PLATFORM_APPROVAL_ISSUER,
+                "artifact_kind": "capability_package",
+                "decision": "pending",
+                "review_scope": [
+                    "release/release.json",
+                    "release/artifacts/skill.zip",
+                    "release/artifacts/mcp-stdio.zip",
+                ],
+            },
+        },
         "source": {
             "relation_fingerprint": relation_fingerprint,
             "flow_fingerprint": flow_fingerprint,
@@ -2456,7 +4878,10 @@ def generate_bundle(
                     "credentials_configured": bool(
                         item.get("credential_status", {}).get("all_required_credentials_configured")
                     ),
-                    "configuration_policy": "preserved_from_system_skill_without_redaction",
+                    "credentials_exported": bool(
+                        item.get("credential_status", {}).get("credentials_exported")
+                    ),
+                    "configuration_policy": "preserve_public_defaults_externalize_credentials",
                 }
                 for item in skill_manifest
                 if item.get("foundation_kind") in {"ocr", "knowledge"}
@@ -2467,9 +4892,12 @@ def generate_bundle(
         "skill_count": len(skill_manifest),
         "foundation_skill_count": len(claims["foundation_skills"]),
         "stage_skill_count": len(claims["stage_skills"]),
+        "main_executor_skill": executor_name,
+        "main_executor_skill_count": 1,
         "orchestrator_skill": orchestrator["skill_name"],
         "main_flow": orchestrator["main_flow"],
         "skills": skill_manifest,
+        "release": release,
         "artifacts": {
             "skills": "skills",
             "manifest": "capability-manifest.json",
@@ -2477,15 +4905,69 @@ def generate_bundle(
             "map": "capability-map.mmd",
             "plan": "capability-plan.json",
             "agent_prompts": "agent_prompts.md",
+            "capability_model": f"skills/{executor_name}/references/capability-model.json",
+            "release": "release/release.json",
+            "skill_archive": "release/artifacts/skill.zip",
+            "mcp_stdio_archive": "release/artifacts/mcp-stdio.zip",
+            "mcp_config": "release/mcp/mcp_config.example.json",
         },
         "artifact_digests": {
             "agent_prompts": agent_prompt_digest,
+            "skill_archive": release["artifact_digests"]["skill_zip"],
+            "mcp_stdio_archive": release["artifact_digests"]["mcp_stdio_zip"],
             "portable_operational_contract": hashlib.sha256(
                 (json.dumps(operational, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
             ).hexdigest(),
         },
     }
     return manifest
+
+
+def blocked_reliability_manifest(
+    claims: dict[str, Any], claims_path: Path, relation_fingerprint: str, flow_fingerprint: str,
+    validation: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist an explicit non-publishable manifest without discarding the candidate."""
+
+    gates = validation.get("reliability_gates") if isinstance(validation.get("reliability_gates"), dict) else {}
+    if set(gates) == {"compiled_recipes"}:
+        status = "blocked_unverified_recipes"
+    elif set(gates) == {"open_questions"}:
+        status = "blocked_open_questions"
+    else:
+        status = "blocked_reliability_gates"
+    source = claims.get("source") if isinstance(claims.get("source"), dict) else {}
+    operational = source.get("operational_data_contract") if isinstance(source.get("operational_data_contract"), dict) else {}
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generator_contract_version": GENERATOR_CONTRACT_VERSION,
+        "status": status,
+        "generated_at": utc_now(),
+        "scenario": claims.get("scenario", {}),
+        "bundle": claims.get("bundle", {}),
+        "source": {
+            "relation_fingerprint": relation_fingerprint,
+            "flow_fingerprint": flow_fingerprint,
+            "operational_contract_fingerprint": operational.get("fingerprint", ""),
+        },
+        "verification": {
+            "status": "unverified",
+            "verifiable": False,
+            "publishable": False,
+            "recipe_coverage": validation.get("recipe_verification"),
+        },
+        "publication": {
+            "status": "blocked",
+            "verifiable": False,
+            "publishable": False,
+        },
+        "candidate": {
+            "claims": str(claims_path),
+            "preserved": True,
+        },
+        "reliability_gates": gates,
+        "next_action": "Resolve every reliability gate, then rerun preflight and finalize with the same candidate path.",
+    }
 
 
 def compact_summary(manifest: dict[str, Any], offset: int, limit: int) -> dict[str, Any]:
@@ -2503,6 +4985,8 @@ def compact_summary(manifest: dict[str, Any], offset: int, limit: int) -> dict[s
         "stage_skill_count": manifest.get("stage_skill_count"),
         "orchestrator_skill": manifest.get("orchestrator_skill"),
         "runtime_requirements": manifest.get("runtime_requirements", {}),
+        "verification": manifest.get("verification", {}),
+        "publication": manifest.get("publication", {}),
         "offset": offset,
         "limit": limit,
         "has_more": offset + limit < len(skills),
@@ -2518,10 +5002,17 @@ def finalize(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         flow_fingerprint, claims_path, claims,
     ) = candidate_context(args)
     validation = validation_payload(
-        claims, relations, flow, relation_path, flow_path, relation_fingerprint, flow_fingerprint, claims_path
+        claims, relations, flow, output_root, relation_path, flow_path, relation_fingerprint, flow_fingerprint, claims_path
     )
     if validation["status"] != "valid":
         atomic_json(output_root / "validation-errors.json", validation)
+        if validation.get("reliability_gates"):
+            atomic_json(
+                output_root / "capability-manifest.json",
+                blocked_reliability_manifest(
+                    claims, claims_path, relation_fingerprint, flow_fingerprint, validation
+                ),
+            )
         return 2, validation
     try:
         manifest = generate_bundle(claims, flow, output_root, relation_fingerprint, flow_fingerprint)
@@ -2562,11 +5053,24 @@ def brief(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
 
 
 def summary(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
-    manifest = load_json(Path(args.result).resolve(), MAX_SOURCE_BYTES)
+    manifest_path = Path(args.result).resolve()
+    manifest = load_json(manifest_path, MAX_SOURCE_BYTES)
     if manifest.get("status") != "complete":
         raise ContractError("capability-manifest.json 尚未 complete")
+    if (manifest_path.parent / "validation-errors.json").exists():
+        raise ContractError("能力蒸馏输出目录存在 validation-errors.json；不得交付旧的 complete 能力包")
     if manifest.get("generator_contract_version") != GENERATOR_CONTRACT_VERSION:
         raise ContractError("能力蒸馏产物的生成器契约版本已过期；必须重新 prepare/finalize，禁止交付旧源码")
+    verification = manifest.get("verification") if isinstance(manifest.get("verification"), dict) else {}
+    publication = manifest.get("publication") if isinstance(manifest.get("publication"), dict) else {}
+    if (
+        verification.get("verifiable") is not True
+        or publication.get("status") != "approved"
+        or publication.get("publishable") is not True
+    ):
+        raise ContractError(
+            "能力蒸馏产物尚未获得平台人工能力包审批；不得交付源码或发布能力包"
+        )
     _, relation_path, _, relations, _, relation_fingerprint, flow_fingerprint = source_context(args)
     source = manifest.get("source") if isinstance(manifest.get("source"), dict) else {}
     if source.get("relation_fingerprint") != relation_fingerprint or source.get("flow_fingerprint") != flow_fingerprint:
@@ -2574,6 +5078,16 @@ def summary(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     operational_path, _, operational_errors = operational_context(relations, relation_path)
     if operational_errors or source.get("operational_contract_fingerprint") != sha256_file(operational_path):
         raise ContractError("能力蒸馏产物的数据执行契约 fingerprint 已过期；不得交付旧源码")
+    package_receipt_errors = platform_package_receipt_errors(
+        relation_path.parent,
+        manifest_path,
+        manifest,
+    )
+    if package_receipt_errors:
+        raise ContractError(
+            "能力包平台审批回执无效；不得交付源码或发布能力包："
+            + "；".join(package_receipt_errors)
+        )
     skills_root = Path(args.result).resolve().parent / "skills"
     generation_errors = validate_generated_skills(skills_root) if skills_root.is_dir() else ["缺少 skills 目录"]
     prompt_path = Path(args.result).resolve().parent / "agent_prompts.md"
@@ -2642,7 +5156,7 @@ def summary(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         for item in external_services
         if isinstance(item, dict)
         and item.get("kind") in {"ocr_http_api", "vector_kb_http_api"}
-        and item.get("configuration_policy") == "preserved_from_system_skill_without_redaction"
+        and item.get("configuration_policy") == "preserve_public_defaults_externalize_credentials"
     }
     expected_services = {
         skill: "ocr_http_api" if kind == "ocr" else "vector_kb_http_api"
@@ -2650,6 +5164,25 @@ def summary(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     }
     if declared_services != expected_services:
         generation_errors.append("系统基础 Skill 外部服务声明缺失或不一致")
+    executor_name = str(manifest.get("main_executor_skill", ""))
+    release = manifest.get("release") if isinstance(manifest.get("release"), dict) else {}
+    if release.get("schema_version") != RELEASE_CONTRACT_VERSION:
+        generation_errors.append("Capability release contract is missing or outdated")
+    elif not executor_name:
+        generation_errors.append("Capability release has no primary executor")
+    else:
+        release_root = Path(args.result).resolve().parent
+        generation_errors.extend(validate_release_bundle(release_root, executor_name))
+        expected_release_digests = (
+            release.get("artifact_digests") if isinstance(release.get("artifact_digests"), dict) else {}
+        )
+        for key, relative in (
+            ("skill_zip", "release/artifacts/skill.zip"),
+            ("mcp_stdio_zip", "release/artifacts/mcp-stdio.zip"),
+        ):
+            artifact = release_root / relative
+            if artifact.is_file() and expected_release_digests.get(key) != sha256_file(artifact):
+                generation_errors.append(f"Release archive digest changed: {relative}")
     if generation_errors:
         raise ContractError("生成源码已损坏或不再可移植：" + "；".join(generation_errors))
     return 0, compact_summary(manifest, args.offset, args.limit)
@@ -2658,13 +5191,13 @@ def summary(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("prepare", "preflight", "finalize"):
+    for name in ("prepare", "draft", "preflight", "finalize"):
         command = commands.add_parser(name)
         command.add_argument("--relations", default="/workspace/outputs/data-relations/scenario-relationship.json")
         command.add_argument("--flow", default="/workspace/outputs/business-flow/business-flow.json")
         command.add_argument("--output", default="/workspace/outputs/capability-distillation")
         command.add_argument("--summary-limit", type=int, default=30)
-        if name in {"preflight", "finalize"}:
+        if name in {"draft", "preflight", "finalize"}:
             command.add_argument("--claims", required=True)
     brief_parser = commands.add_parser("brief")
     brief_parser.add_argument("--brief", default="/workspace/outputs/capability-distillation/distillation-brief.json")
@@ -2685,6 +5218,7 @@ def run(argv: Sequence[str] | None = None) -> tuple[int, dict[str, Any]]:
     args = build_parser().parse_args(argv)
     handlers = {
         "prepare": prepare,
+        "draft": draft,
         "brief": brief,
         "preflight": preflight,
         "finalize": finalize,

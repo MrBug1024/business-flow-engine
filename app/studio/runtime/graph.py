@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 import threading
@@ -16,7 +17,6 @@ from typing import Any, Literal
 
 from jsonschema import Draft202012Validator
 from deepagents.backends.composite import CompositeBackend
-from deepagents.backends.filesystem import FilesystemBackend
 from deepagents.middleware.filesystem import FilesystemMiddleware, FilesystemPermission
 from langchain.agents import create_agent
 from langchain.agents.middleware import (
@@ -48,8 +48,21 @@ from app.studio.runtime.model_adapter import ModelTurn, StudioChatModel
 from app.studio.models import AIRun, BusinessRecord
 from app.studio.capabilities.registry import list_skills, materialize_skill_view
 from app.studio.runtime.sandbox import sandbox_manager
+from app.studio.runtime.skill_filesystem import Utf8SkillFilesystemBackend
+from app.studio.runtime.micro_process_handoff import (
+    MicroProcessHandoff,
+    is_business_flow_start_command,
+    is_business_flow_start_request,
+    prepare_micro_process_handoff,
+    resume_targets_micro_process_gate,
+)
 from app.studio.capabilities.skill_middleware import ReloadingSkillsMiddleware
 from app.studio.storage import new_id, store
+from app.studio.distillation_gates import (
+    apply_approved_role_manifest,
+    apply_selected_trace_anchor,
+    distillation_command_blocker,
+)
 
 
 SKILL_SOURCE = "/skills/"
@@ -63,7 +76,9 @@ _FILE_TOOL_OPERATIONS = {
     "glob": "search",
     "grep": "search",
 }
+_READ_ONLY_RUNTIME_FILE_TOOLS = frozenset({"ls", "read_file", "glob", "grep"})
 _WORKSPACE_SNAPSHOT_LIMIT = 10_000
+_LOGGER = logging.getLogger(__name__)
 
 
 class _CapabilityDiscoveryInput(BaseModel):
@@ -207,9 +222,37 @@ class StudioGraphRuntime:
         *,
         requested_model: str | None,
         user_prompt: str | None,
+        prompt_role: str = "user",
         include_history: bool = True,
         resume_payload: dict[str, Any] | None = None,
     ) -> Iterator[dict[str, Any]]:
+        # This is a server-owned bridge, deliberately before model and Skill
+        # discovery.  A request to start business-flow derivation cannot turn
+        # an absent micro-process candidate into an Agent clarification.  The
+        # platform creates the exact candidate and asks its signed human
+        # approval question instead.
+        is_user_flow_start = (
+            prompt_role == "user" and is_business_flow_start_request(user_prompt)
+        )
+        is_legacy_gate_resume = resume_targets_micro_process_gate(record, resume_payload)
+        if is_user_flow_start or is_legacy_gate_resume:
+            call_id = f"micro_process_handoff_{run.id}"
+            # A legacy Agent clarification may still have a durable model
+            # checkpoint.  Leave it intact for audit/recovery, but bind this
+            # new official decision to the recovery run so future resumes do
+            # not re-enter the stale ask_user call.
+            checkpoint_run_id = run.id if is_legacy_gate_resume else self.checkpoint_id(run)
+            handoff = prepare_micro_process_handoff(
+                record,
+                session_id=run.session_id,
+                run_id=run.id,
+                checkpoint_run_id=checkpoint_run_id,
+                tool_call_id=call_id,
+            )
+            if handoff.handled:
+                yield from _micro_process_handoff_events(record, run, handoff, call_id)
+                return
+
         discovered_capabilities = discover_capabilities(record)
         direct_protocols = {"task_progress", "user_input", "workspace_file"}
         direct_capabilities = [
@@ -261,7 +304,7 @@ class StudioGraphRuntime:
         backend = CompositeBackend(
             default=sandbox,
             routes={
-                SKILL_SOURCE: FilesystemBackend(
+                SKILL_SOURCE: Utf8SkillFilesystemBackend(
                     root_dir=skill_view,
                     virtual_mode=True,
                 )
@@ -344,6 +387,7 @@ class StudioGraphRuntime:
                     record,
                     run,
                     user_prompt,
+                    prompt_role=prompt_role,
                     include_history=include_history and not has_checkpoint,
                 )
             }
@@ -806,6 +850,56 @@ class StudioGraphRuntime:
     ) -> ToolMessage:
         """Observe DeepAgents runtime Tools without folding them into Studio Tool discovery."""
 
+        anchor_blocker: str | None = None
+        role_manifest_blocker: str | None = None
+        correction_retrace_blocker: str | None = None
+        if name == "execute":
+            original_command = str(arguments.get("command") or "")
+            rewritten_command, anchor_blocker = apply_selected_trace_anchor(record, original_command)
+            normalized_command = rewritten_command.replace("\\", "/").casefold()
+            is_trace_analyze = bool(
+                re.search(r"analyze_relations\.py[\"']?\s+analyze(?:\s|$)", normalized_command)
+            )
+            if anchor_blocker is None and is_trace_analyze:
+                try:
+                    # Validate the host-side signature and source hashes before
+                    # exposing only its fixed sandbox path to the command.
+                    # The model never receives a path it can repoint at a
+                    # different role assignment.
+                    store.require_approved_role_manifest(record)
+                    rewritten_command, role_manifest_blocker = apply_approved_role_manifest(rewritten_command)
+                    if role_manifest_blocker is None and re.search(
+                        r"--trace-review(?:\s|=|$)",
+                        rewritten_command.replace("\\", "/").casefold(),
+                    ):
+                        correction_retrace_blocker = (
+                            "Blocked: an Agent command cannot choose a trace-review file. "
+                            "Use the platform trace action, which validates and injects the one canonical review."
+                        )
+                    elif role_manifest_blocker is None and store.require_trace_review_corrections_for_retrace(record):
+                        # The HTTP retrace action archives the old correction
+                        # review, proves its relation IDs reached the selected
+                        # chain, then preserves the audit on the fresh review.
+                        # A generic Agent shell execution cannot safely do
+                        # those transactional steps, so it must not silently
+                        # consume or overwrite the user's correction.
+                        correction_retrace_blocker = (
+                            "Blocked: a user-confirmed key-pair correction is pending deterministic retracing. "
+                            "Use the platform trace action from the current scenario; an Agent sandbox command "
+                            "cannot replace the correction archive and post-trace evidence check."
+                        )
+                except ValueError as exc:
+                    role_manifest_blocker = f"Blocked: current approved role manifest is unavailable: {exc}"
+            if rewritten_command != original_command:
+                # ``arguments`` normally aliases ``request.tool_call['args']``.
+                # Update both explicitly so the wrapped handler receives the
+                # user-approved selector even if a future middleware copies
+                # one of these dictionaries.
+                arguments["command"] = rewritten_command
+                call_args = request.tool_call.get("args")
+                if isinstance(call_args, dict):
+                    call_args["command"] = rewritten_command
+
         skill = _skill_resource_for_call(request.state, name, arguments)
         is_activation = skill is not None and skill[1].casefold() == "skill.md"
         skill_name = skill[0] if skill is not None else _skill_for_sandbox_command(
@@ -856,11 +950,216 @@ class StudioGraphRuntime:
             **({"skill_id": parent_skill_id} if is_activation else {}),
         }
         request.runtime.stream_writer(base_event)
+        if name == "execute":
+            # Recompute canonical artifact hashes immediately before a
+            # downstream Skill runs.  A review record alone is not enough:
+            # an Agent or a stale process could have changed the reviewed
+            # bytes since the user approved them.
+            command = str(arguments.get("command") or "")
+            if (
+                record.distillation.current_phase == "micro_process"
+                and is_business_flow_start_command(command)
+            ):
+                handoff = prepare_micro_process_handoff(
+                    record,
+                    session_id=run.session_id,
+                    run_id=run.id,
+                    checkpoint_run_id=self.checkpoint_id(run),
+                    tool_call_id=f"micro_process_handoff_{call_id}",
+                )
+                if handoff.handled and handoff.question is None:
+                    _append_runtime_invocation(
+                        run,
+                        call_id,
+                        "Micro-process handoff",
+                        "server_action",
+                        "failed",
+                        handoff.detail or "Micro-process approval handoff could not be prepared.",
+                        parent_skill_id=parent_skill_id,
+                        skill_name=skill_name,
+                    )
+                    run.status = "failed"
+                    run.error = handoff.detail or "Micro-process approval handoff could not be prepared."
+                    run.finished_at = time()
+                    store.save(record)
+                    request.runtime.stream_writer(
+                        {
+                            "type": "tool_call",
+                            "kind": "server_action",
+                            "call_id": f"micro_process_handoff_{call_id}",
+                            "name": "Micro-process handoff",
+                            "function_name": "create_micro_process_candidate",
+                            "status": "failed",
+                            "input": {"command": handoff.command},
+                            "error": run.error,
+                        }
+                    )
+                    return ToolMessage(
+                        content=json.dumps(
+                            {"status": "blocked_evidence_gate", "message": run.error},
+                            ensure_ascii=False,
+                        ),
+                        tool_call_id=call_id,
+                        name=name,
+                    )
+                if handoff.drafted:
+                    request.runtime.stream_writer(
+                        {
+                            "type": "tool_call",
+                            "kind": "server_action",
+                            "call_id": f"micro_process_handoff_{call_id}",
+                            "name": "Micro-process handoff",
+                            "function_name": "create_micro_process_candidate",
+                            "status": "succeeded",
+                            "input": {"command": handoff.command},
+                            "output": handoff.detail,
+                        }
+                    )
+            store.refresh_distillation_artifact_contracts(record)
+            distillation_blocker = distillation_command_blocker(
+                record,
+                str(arguments.get("command") or ""),
+            )
+            blocker = (
+                anchor_blocker
+                or role_manifest_blocker
+                or correction_retrace_blocker
+                or distillation_blocker
+            )
+            if blocker:
+                approval_question: dict[str, Any] | None = None
+                question_changed = False
+                if (
+                    distillation_blocker
+                    and not anchor_blocker
+                    and not role_manifest_blocker
+                    and not correction_retrace_blocker
+                ):
+                    approval_question, question_changed = store.ensure_distillation_approval_question(
+                        record,
+                        session_id=run.session_id,
+                        run_id=run.id,
+                        # LangGraph resumes through the original checkpoint,
+                        # while the UI should still show the run that actually
+                        # reached this approval boundary.
+                        checkpoint_run_id=self.checkpoint_id(run),
+                        tool_call_id=call_id,
+                    )
+                    if approval_question is None:
+                        contract = record.distillation.artifact_contracts.get(
+                            str(record.distillation.current_phase),
+                            {},
+                        )
+                        if contract.get("approval_error_code"):
+                            blocker = (
+                                f"{blocker} Approval dialog unavailable: "
+                                f"{contract.get('detail') or 'platform approval validation failed.'}"
+                            )
+                if approval_question is not None:
+                    run.status = "waiting_for_user"
+                    run.summary = "Waiting for platform distillation approval."
+                    if question_changed:
+                        _append_runtime_invocation(
+                            run,
+                            call_id,
+                            display_name,
+                            kind,
+                            "succeeded",
+                            "等待用户审批当前蒸馏产物",
+                            parent_skill_id=parent_skill_id,
+                            skill_name=skill_name,
+                        )
+                    store.save(record)
+                    if question_changed:
+                        request.runtime.stream_writer(
+                            base_event
+                            | {
+                                "status": "succeeded",
+                                "output": "等待用户审批当前蒸馏产物",
+                                "duration_ms": round((perf_counter() - started) * 1000),
+                            }
+                        )
+                    request.runtime.stream_writer(
+                        {"type": "question", "question": approval_question}
+                    )
+                    answers: Any = None
+                    while not _resume_payload_answers_question(
+                        answers,
+                        str(approval_question["id"]),
+                    ):
+                        answers = interrupt(
+                            {
+                                "kind": "distillation_approval",
+                                "question_ids": [approval_question["id"]],
+                                "questions": [approval_question],
+                            }
+                        )
+                _append_runtime_invocation(
+                    run,
+                    call_id,
+                    display_name,
+                    kind,
+                    "failed",
+                    blocker,
+                    parent_skill_id=parent_skill_id,
+                    skill_name=skill_name,
+                )
+                store.save(record)
+                request.runtime.stream_writer(
+                    base_event
+                    | {
+                        "status": "failed",
+                        "error": blocker,
+                        "duration_ms": round((perf_counter() - started) * 1000),
+                    }
+                )
+                return ToolMessage(
+                    content=json.dumps(
+                        {"status": "blocked_evidence_gate", "message": blocker},
+                        ensure_ascii=False,
+                    ),
+                    tool_call_id=call_id,
+                    name=name,
+                )
         try:
             with _BUSINESS_LOCKS[record.id]:
                 response = handler(request)
         except Exception as exc:
             summary = str(exc) or f"{display_name} failed"
+            if name in _READ_ONLY_RUNTIME_FILE_TOOLS:
+                _LOGGER.warning(
+                    "Recoverable Studio read-only tool failure: name=%s call_id=%s business_id=%s",
+                    name,
+                    call_id,
+                    record.id,
+                    exc_info=True,
+                )
+                safe_error = _recoverable_read_only_tool_error(name)
+                _append_runtime_invocation(
+                    run,
+                    call_id,
+                    display_name,
+                    kind,
+                    "failed",
+                    safe_error,
+                    parent_skill_id=parent_skill_id,
+                    skill_name=skill_name,
+                )
+                store.save(record)
+                request.runtime.stream_writer(
+                    base_event
+                    | {
+                        "status": "failed",
+                        "error": safe_error,
+                        "duration_ms": round((perf_counter() - started) * 1000),
+                    }
+                )
+                return ToolMessage(
+                    content=safe_error,
+                    tool_call_id=call_id,
+                    name=name,
+                    status="error",
+                )
             _append_runtime_invocation(
                 run,
                 call_id,
@@ -922,6 +1221,70 @@ class StudioGraphRuntime:
         return response
 
 
+def _micro_process_handoff_events(
+    record: BusinessRecord,
+    run: AIRun,
+    handoff: MicroProcessHandoff,
+    call_id: str,
+) -> Iterator[dict[str, Any]]:
+    """Expose a server-owned handoff without entering the model loop."""
+
+    if handoff.question is None:
+        detail = handoff.detail or "Micro-process approval handoff could not be prepared."
+        _append_runtime_invocation(
+            run,
+            call_id,
+            "Micro-process handoff",
+            "server_action",
+            "failed",
+            detail,
+        )
+        run.status = "failed"
+        run.error = detail
+        run.finished_at = time()
+        store.save(record)
+        yield {
+            "type": "tool_call",
+            "kind": "server_action",
+            "call_id": call_id,
+            "name": "Micro-process handoff",
+            "function_name": "create_micro_process_candidate",
+            "status": "failed",
+            "input": {"command": handoff.command},
+            "error": detail,
+        }
+        yield {"type": "error", "message": detail, "run": run.model_dump(mode="json")}
+        return
+
+    _append_runtime_invocation(
+        run,
+        call_id,
+        "Micro-process handoff",
+        "server_action",
+        "succeeded",
+        handoff.detail,
+    )
+    run.status = "waiting_for_user"
+    run.summary = "Waiting for platform micro-process approval."
+    store.save(record)
+    yield {
+        "type": "tool_call",
+        "kind": "server_action",
+        "call_id": call_id,
+        "name": "Micro-process handoff",
+        "function_name": "create_micro_process_candidate",
+        "status": "succeeded",
+        "input": {"command": handoff.command},
+        "output": handoff.detail,
+    }
+    yield {"type": "question", "question": handoff.question}
+    yield {
+        "type": "waiting_for_user",
+        "status": "waiting_for_user",
+        "question_ids": [str(handoff.question["id"])],
+    }
+
+
 def _live_model_turn(
     record: BusinessRecord,
     messages: list[dict[str, Any]],
@@ -939,8 +1302,11 @@ def _input_messages(
     run: AIRun,
     user_prompt: str | None,
     *,
+    prompt_role: str = "user",
     include_history: bool,
 ) -> list[dict[str, Any]]:
+    if prompt_role not in {"user", "system"}:
+        raise ValueError("Agent prompt role must be user or system.")
     messages: list[dict[str, Any]] = []
     if include_history and run.session_id:
         history = [
@@ -948,11 +1314,16 @@ def _input_messages(
             for item in record.messages
             if item.session_id == run.session_id and item.role in {"user", "assistant", "system"}
         ][-max(1, settings.agent_history_message_limit):]
-        if history and user_prompt and history[-1].role == "user" and history[-1].content == user_prompt:
+        if (
+            history
+            and user_prompt
+            and history[-1].role == prompt_role
+            and history[-1].content == user_prompt
+        ):
             history = history[:-1]
         messages.extend(_bounded_history_messages(history, settings.agent_history_character_limit))
     if user_prompt:
-        messages.append({"role": "user", "content": user_prompt})
+        messages.append({"role": prompt_role, "content": user_prompt})
     return messages
 
 
@@ -1040,6 +1411,19 @@ def _runtime_tool_summary(
         return "Sandbox command failed" if failed else "Sandbox command completed"
     action = "failed" if failed else "completed"
     return f"{tool_name} {action}"
+
+
+def _recoverable_read_only_tool_error(tool_name: str) -> str:
+    """Give the model a retryable read error without leaking implementation details."""
+
+    labels = {
+        "ls": "Directory listing",
+        "read_file": "File read",
+        "glob": "File search",
+        "grep": "Text search",
+    }
+    label = labels.get(tool_name, "Read-only file operation")
+    return f"{label} is temporarily unavailable. Retry with a narrower path or a direct file target."
 
 
 def _file_event_details(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1441,6 +1825,19 @@ def _defer_for_user_input(
         return False
     first_question_id = str(question_calls[0].get("id") or "")
     return call_id != first_question_id
+
+
+def _resume_payload_answers_question(payload: Any, question_id: str) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    answers = payload.get("answers")
+    if not isinstance(answers, list):
+        return False
+    return any(
+        isinstance(item, dict)
+        and str(item.get("question_id") or "") == question_id
+        for item in answers
+    )
 
 
 def _ensure_question(

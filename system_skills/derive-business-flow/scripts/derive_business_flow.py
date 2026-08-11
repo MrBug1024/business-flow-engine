@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
+import os
 import re
 import sys
 from collections import defaultdict, deque
@@ -16,9 +18,13 @@ from typing import Any, Sequence
 
 SCHEMA_VERSION = 1
 UPSTREAM_CAPABILITY = "discover-data-relations"
+PLATFORM_APPROVAL_ISSUER = "business-flow-platform"
+PLATFORM_APPROVAL_KEY_ENV = "BUSINESS_FLOW_PLATFORM_APPROVAL_HMAC_KEY"
 MAX_SOURCE_BYTES = 1 * 1024 * 1024
 MAX_CARDS_BYTES = 8 * 1024 * 1024
 MAX_OPERATIONAL_CONTRACT_BYTES = 8 * 1024 * 1024
+MAX_MICRO_PROCESS_BYTES = 2 * 1024 * 1024
+MAX_PLATFORM_APPROVAL_BYTES = 2 * 1024 * 1024
 MAX_CANDIDATE_BYTES = 96 * 1024
 MAX_BRIEF_CARDS = 40
 MAX_STAGES = 10
@@ -79,6 +85,19 @@ GENERIC_STAGE_NAMES = {
     "execute process",
 }
 
+# An ``open_questions`` entry is not a harmless note once a flow is handed to
+# another agent: it is an explicit statement that a business fact is missing.
+# Keep the release gate machine-verifiable, while leaving the actual business
+# answer in the reviewed candidate rather than inventing it in code.
+RESOLVED_QUESTION_STATUSES = {"resolved", "closed", "answered", "已解决", "已关闭", "已回答"}
+RUNTIME_EXCEPTION_STATUSES = {"runtime_exception", "exception", "waived", "运行时例外", "例外"}
+APPROVED_EXCEPTION_STATUSES = {"approved", "accepted", "允许", "批准", "同意"}
+USER_APPROVAL_ACTORS = {"user", "business_user", "customer", "用户", "业务用户"}
+USER_APPROVAL_DECISIONS = {"approved", "accepted", "允许", "批准", "同意"}
+CRITICAL_QUESTION_MARKERS = {
+    "critical", "blocker", "p0", "p1", "high", "关键", "严重", "重大", "高风险", "高影响",
+}
+
 
 class ContractError(ValueError):
     """Raised when a source or candidate violates a stable handoff contract."""
@@ -122,6 +141,162 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def platform_approval_signing_payload(envelope: dict[str, Any]) -> bytes:
+    """Return the platform's canonical signed representation.
+
+    Approval receipts are an authority boundary.  Keeping the byte format here
+    identical to the workbench service means a copied JSON object, an extra
+    unsigned field, or a changed fingerprint cannot be mistaken for a user
+    approval by a downstream Skill.
+    """
+
+    unsigned = {name: value for name, value in envelope.items() if name != "signature"}
+    return json.dumps(
+        unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def platform_approval_signature(envelope: dict[str, Any], key: str) -> str:
+    return hmac.new(
+        key.encode("utf-8"), platform_approval_signing_payload(envelope), hashlib.sha256,
+    ).hexdigest()
+
+
+def platform_approvals_path(relation_root: Path) -> Path:
+    """Locate the canonical, platform-owned approval ledger."""
+
+    return relation_root.resolve() / "platform-approvals.json"
+
+
+def _same_resolved_path(value: Any, expected: Path) -> bool:
+    try:
+        return Path(str(value)).resolve() == expected.resolve()
+    except OSError:
+        return False
+
+
+def platform_evidence_receipt_errors(relation_root: Path) -> list[str]:
+    """Verify the two signed receipts required to derive a macro flow.
+
+    The chain is deliberately verified from canonical artifacts rather than
+    from candidate-provided paths:
+
+    ``trace-samples -> trace-review receipt -> micro-process receipt``.
+
+    Both receipts must bind the exact current artifact fingerprint and the
+    exact current trace fingerprint.  A free-text ``reviewer`` field is useful
+    audit metadata but is never an authority signal.
+    """
+
+    key = os.environ.get(PLATFORM_APPROVAL_KEY_ENV, "")
+    if not key:
+        return [
+            f"Platform approval verifier is unavailable: {PLATFORM_APPROVAL_KEY_ENV} is not configured. "
+            "Flow derivation is fail-closed."
+        ]
+
+    root = relation_root.resolve()
+    trace_path = root / "trace-samples.json"
+    review_path = root / "trace-review.json"
+    micro_path = root / "micro-process.json"
+    ledger_path = platform_approvals_path(root)
+    for label, path in (
+        ("trace-samples", trace_path),
+        ("trace-review", review_path),
+        ("micro-process", micro_path),
+        ("platform approval ledger", ledger_path),
+    ):
+        if not path.is_file():
+            return [f"Canonical {label} artifact is missing: {path}"]
+
+    try:
+        trace = load_json(trace_path, MAX_MICRO_PROCESS_BYTES)
+        review = load_json(review_path, MAX_MICRO_PROCESS_BYTES)
+        micro = load_json(micro_path, MAX_MICRO_PROCESS_BYTES)
+        ledger = load_json(ledger_path, MAX_PLATFORM_APPROVAL_BYTES)
+    except ContractError as exc:
+        return [f"Platform approval evidence cannot be read: {exc}"]
+
+    errors: list[str] = []
+    trace_fingerprint = file_sha256(trace_path)
+    review_fingerprint = file_sha256(review_path)
+    micro_fingerprint = file_sha256(micro_path)
+
+    if trace.get("status") != "complete":
+        errors.append("Canonical trace-samples.json is not complete")
+    trace_reference = review.get("trace") if isinstance(review.get("trace"), dict) else {}
+    if review.get("schema_version") != SCHEMA_VERSION or review.get("kind") != "trace_review":
+        errors.append("Canonical trace-review.json is not a supported trace_review contract")
+    if review.get("status") != "approved":
+        errors.append("Canonical trace-review.json is not approved")
+    if not _same_resolved_path(trace_reference.get("artifact"), trace_path):
+        errors.append("Trace review does not reference canonical trace-samples.json")
+    if str(trace_reference.get("fingerprint", "")) != trace_fingerprint:
+        errors.append("Trace review does not bind the current trace-samples fingerprint")
+    if not str(trace_reference.get("bundle_id", "")).strip():
+        errors.append("Trace review does not bind a trace bundle")
+
+    approval = review.get("approval") if isinstance(review.get("approval"), dict) else {}
+    if approval.get("decision") != "approved":
+        errors.append("Trace review approval decision is not approved")
+
+    micro_source = micro.get("source") if isinstance(micro.get("source"), dict) else {}
+    if micro.get("schema_version") != SCHEMA_VERSION or micro.get("kind") != "trace_micro_process":
+        errors.append("Canonical micro-process.json is not a supported trace_micro_process contract")
+    if micro.get("status") != "approved":
+        errors.append("Canonical micro-process.json is not approved")
+    if not _same_resolved_path(micro_source.get("trace_review"), review_path):
+        errors.append("Micro-process does not reference canonical trace-review.json")
+    if str(micro_source.get("trace_review_fingerprint", "")) != review_fingerprint:
+        errors.append("Micro-process does not bind the current trace-review fingerprint")
+    micro_approval = micro.get("approval") if isinstance(micro.get("approval"), dict) else {}
+    if micro_approval.get("decision") != "approved":
+        errors.append("Micro-process approval decision is not approved")
+
+    if (
+        ledger.get("schema_version") != SCHEMA_VERSION
+        or ledger.get("kind") != "platform_approval_envelopes"
+        or ledger.get("issuer") != PLATFORM_APPROVAL_ISSUER
+    ):
+        errors.append("Platform approval ledger has an unsupported issuer or schema")
+        return errors
+    approvals = ledger.get("approvals")
+    if not isinstance(approvals, list):
+        return errors + ["Platform approval ledger must contain an approvals array"]
+
+    def has_receipt(kind: str, artifact_fingerprint: str) -> bool:
+        for envelope in approvals:
+            if not isinstance(envelope, dict):
+                continue
+            if (
+                envelope.get("schema_version") != SCHEMA_VERSION
+                or envelope.get("issuer") != PLATFORM_APPROVAL_ISSUER
+                or envelope.get("artifact_kind") != kind
+                or envelope.get("decision") != "approved"
+                or str(envelope.get("artifact_fingerprint", "")) != artifact_fingerprint
+                or str(envelope.get("trace_fingerprint", "")) != trace_fingerprint
+                or not str(envelope.get("approval_id", "")).strip()
+                or not str(envelope.get("subject", "")).strip()
+                or not str(envelope.get("issued_at", "")).strip()
+            ):
+                continue
+            signature = str(envelope.get("signature", "")).strip().casefold()
+            expected = platform_approval_signature(envelope, key).casefold()
+            if hmac.compare_digest(signature, expected):
+                return True
+        return False
+
+    if not has_receipt("trace_review", review_fingerprint):
+        errors.append(
+            "No valid platform-signed trace_review receipt matches the current trace-review and trace-samples artifacts"
+        )
+    if not has_receipt("micro_process", micro_fingerprint):
+        errors.append(
+            "No valid platform-signed micro_process receipt matches the current micro-process and trace-samples artifacts"
+        )
+    return errors
+
+
 def unique_strings(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
@@ -138,6 +313,103 @@ def validate_id(owner: str, value: Any, errors: list[str]) -> str:
     if not ID_PATTERN.fullmatch(identifier):
         errors.append(f"{owner} id 必须是简短稳定的 ASCII 标识：{identifier or '<empty>'}")
     return identifier
+
+
+def normalized_question_value(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "").casefold())
+
+
+def question_is_critical(question: dict[str, Any]) -> bool:
+    if question.get("critical") is True:
+        return True
+    for key in ("severity", "priority", "impact", "risk"):
+        value = normalized_question_value(question.get(key))
+        if value in CRITICAL_QUESTION_MARKERS or any(marker in value for marker in CRITICAL_QUESTION_MARKERS):
+            return True
+    return False
+
+
+def runtime_exception_errors(question: dict[str, Any], identifier: str) -> list[str]:
+    """Require a user-verifiable approval before accepting an uncertainty at runtime."""
+
+    exception = question.get("runtime_exception")
+    if not isinstance(exception, dict):
+        return [
+            f"open_question {identifier} 需要显式 runtime_exception，且必须附带用户批准证据"
+        ]
+    errors: list[str] = []
+    if normalized_question_value(exception.get("status")) not in APPROVED_EXCEPTION_STATUSES:
+        errors.append(f"open_question {identifier}.runtime_exception.status 必须为 approved")
+    if len(str(exception.get("reason", "")).strip()) < 8:
+        errors.append(f"open_question {identifier}.runtime_exception.reason 必须说明运行时例外原因")
+    if len(str(exception.get("scope", "")).strip()) < 4:
+        errors.append(f"open_question {identifier}.runtime_exception.scope 必须说明例外适用范围")
+    approval = exception.get("user_approval")
+    if not isinstance(approval, dict):
+        errors.append(f"open_question {identifier}.runtime_exception 必须包含 user_approval 用户批准证据")
+        return errors
+    if normalized_question_value(approval.get("actor")) not in USER_APPROVAL_ACTORS:
+        errors.append(f"open_question {identifier}.runtime_exception.user_approval.actor 必须标识为用户")
+    if normalized_question_value(approval.get("decision")) not in USER_APPROVAL_DECISIONS:
+        errors.append(f"open_question {identifier}.runtime_exception.user_approval.decision 必须为 approved")
+    if not (
+        str(approval.get("user_id", "")).strip()
+        or str(approval.get("actor_id", "")).strip()
+    ):
+        errors.append(f"open_question {identifier}.runtime_exception.user_approval 缺少 user_id")
+    if not (
+        str(approval.get("evidence_ref", "")).strip()
+        or str(approval.get("evidence_id", "")).strip()
+    ):
+        errors.append(f"open_question {identifier}.runtime_exception.user_approval 缺少 evidence_ref")
+    if len(str(approval.get("approved_at", "")).strip()) < 8:
+        errors.append(f"open_question {identifier}.runtime_exception.user_approval 缺少 approved_at")
+    return errors
+
+
+def open_question_gate_errors(open_questions: Any) -> list[str]:
+    """Return publish blockers for unresolved or critical business questions.
+
+    A resolved non-critical item may remain in the audit trail only with a
+    recorded answer.  A critical item must be removed from ``open_questions``
+    after resolution; otherwise it is an explicit runtime exception and needs
+    a real user approval record.  This prevents a model-only reviewer from
+    silently converting an uncertainty into a deliverable flow.
+    """
+
+    if not isinstance(open_questions, list):
+        return []
+    errors: list[str] = []
+    for index, question in enumerate(open_questions):
+        if not isinstance(question, dict):
+            continue
+        identifier = str(question.get("id") or f"index-{index}")
+        exception = question.get("runtime_exception")
+        if exception is not None:
+            exception_errors = runtime_exception_errors(question, identifier)
+            if not exception_errors:
+                continue
+            errors.extend(exception_errors)
+            continue
+        status = normalized_question_value(question.get("status") or "open")
+        if status in RUNTIME_EXCEPTION_STATUSES:
+            errors.extend(runtime_exception_errors(question, identifier))
+            continue
+        if question_is_critical(question):
+            errors.append(
+                f"critical open_question {identifier} 阻断 finalize；解决后应移出 open_questions，"
+                "或提供已批准的 runtime_exception"
+            )
+            continue
+        if status in RESOLVED_QUESTION_STATUSES:
+            if len(str(question.get("resolution", "")).strip()) < 4:
+                errors.append(f"resolved open_question {identifier} 缺少可审计的 resolution")
+            continue
+        errors.append(
+            f"unresolved open_question {identifier} 阻断 finalize；先记录 resolution，"
+            "或提供带用户批准证据的 runtime_exception"
+        )
+    return errors
 
 
 def is_macro_name(name: str) -> bool:
@@ -195,6 +467,58 @@ def operational_context(
         blockers = operational.get("quality_gates", {}).get("blockers", [])
         errors.append("上游数据执行契约未通过质量门禁：" + "；".join(str(item) for item in blockers))
     return expected_path, operational, fingerprint, errors
+
+
+def micro_process_context(source_path: Path) -> tuple[Path, dict[str, Any], str, list[str]]:
+    """Load the approved, value-free reconstruction before macro inference."""
+
+    path = source_path.parent / "micro-process.json"
+    errors: list[str] = []
+    try:
+        payload = load_json(path, MAX_MICRO_PROCESS_BYTES)
+    except ContractError as exc:
+        return path, {}, "", [str(exc)]
+    fingerprint = file_sha256(path)
+    if payload.get("schema_version") != 1 or payload.get("kind") != "trace_micro_process":
+        errors.append("micro-process.json is not a supported micro-process contract")
+    if payload.get("status") != "approved":
+        errors.append("micro-process.json is not approved")
+    source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+    if not str(source.get("trace_review", "")).strip() or not str(source.get("trace_review_fingerprint", "")).strip():
+        errors.append("micro-process.json does not bind an approved trace review")
+    else:
+        try:
+            review_path = Path(str(source.get("trace_review", ""))).resolve()
+            review = load_json(review_path, MAX_MICRO_PROCESS_BYTES)
+            if source.get("trace_review_fingerprint") != file_sha256(review_path):
+                errors.append("trace review changed after micro-process approval")
+            elif review.get("kind") != "trace_review" or review.get("status") != "approved":
+                errors.append("micro-process does not reference an approved trace review")
+        except (OSError, ContractError):
+            errors.append("micro-process trace review cannot be read")
+    reconstruction = payload.get("sample_reconstruction") if isinstance(payload.get("sample_reconstruction"), dict) else {}
+    operations = reconstruction.get("operations") if isinstance(reconstruction.get("operations"), list) else []
+    if not operations or any(not isinstance(item, dict) or item.get("sample_value_free") is not True for item in operations):
+        errors.append("micro-process must contain only sample_value_free operations")
+    generalization = payload.get("generalization_contract") if isinstance(payload.get("generalization_contract"), dict) else {}
+    prohibited = {str(item) for item in generalization.get("must_not_depend_on", []) if str(item)}
+    if not {"sample_row_number", "sample_cell_value"}.issubset(prohibited):
+        errors.append("micro-process must prohibit sample row and sample value dependencies")
+    approval = payload.get("approval") if isinstance(payload.get("approval"), dict) else {}
+    if approval.get("decision") != "approved" or not str(approval.get("reviewer", "")).strip():
+        errors.append("micro-process approval is incomplete")
+    errors.extend(platform_evidence_receipt_errors(source_path.parent))
+    return path, payload, fingerprint, errors
+
+
+def compact_micro_process(payload: dict[str, Any]) -> dict[str, Any]:
+    reconstruction = payload.get("sample_reconstruction") if isinstance(payload.get("sample_reconstruction"), dict) else {}
+    return {
+        "status": payload.get("status"),
+        "operations": reconstruction.get("operations", []),
+        "generalization_contract": payload.get("generalization_contract", {}),
+        "open_questions": payload.get("open_questions", []),
+    }
 
 
 def validate_upstream(path: Path) -> tuple[dict[str, Any], list[str]]:
@@ -266,11 +590,92 @@ def compact_card(card: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def compact_trace_evidence(operational: dict[str, Any]) -> dict[str, Any]:
+    trace = operational.get("trace_evidence") if isinstance(operational.get("trace_evidence"), dict) else {}
+    bundles = []
+    for bundle in trace.get("bundles", [])[:2]:
+        if not isinstance(bundle, dict):
+            continue
+        bundles.append({
+            "bundle_id": bundle.get("bundle_id"),
+            "anchor": bundle.get("anchor", {}),
+            "coverage": bundle.get("coverage", {}),
+            "links": [
+                {
+                    "link_id": item.get("link_id"),
+                    "source_id": item.get("source_id"),
+                    "target_id": item.get("target_id"),
+                    "key_pairs": item.get("key_pairs", []),
+                    "matched_row_count": item.get("matched_row_count"),
+                    "fanout_warning": item.get("fanout_warning"),
+                }
+                for item in bundle.get("links", [])[:10]
+                if isinstance(item, dict)
+            ],
+            "sources": [
+                {
+                    "source_id": source.get("source_id"),
+                    "path": source.get("path"),
+                    "table": source.get("table"),
+                    "role": source.get("role"),
+                    "selected_columns": source.get("selected_columns", []),
+                }
+                for source in bundle.get("sources", [])[:12]
+                if isinstance(source, dict)
+            ],
+            "semantic_evidence": bundle.get("semantic_evidence", [])[:2],
+        })
+    return {
+        "status": trace.get("status", "missing"),
+        "strategy": trace.get("strategy", ""),
+        "bundles": bundles,
+    }
+
+
+def compact_material_profiles(operational: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expose generic source grain/semantic facts to flow synthesis."""
+    profiles: list[dict[str, Any]] = []
+    for source in operational.get("sources", []) if isinstance(operational.get("sources"), list) else []:
+        if not isinstance(source, dict):
+            continue
+        tables = []
+        for table in source.get("tables", []) if isinstance(source.get("tables"), list) else []:
+            if not isinstance(table, dict):
+                continue
+            tables.append({
+                "table": table.get("sheet_or_table") or table.get("table_name"),
+                "row_count": table.get("row_count"),
+                "column_count": table.get("column_count"),
+                "inferred_material_role": table.get("inferred_material_role", ""),
+                "semantic_profile": table.get("semantic_profile", {}),
+                "columns": [
+                    {
+                        "name": column.get("query_name") or column.get("name"),
+                        "kind": column.get("kind", "other"),
+                        "base": column.get("base", ""),
+                    }
+                    for column in table.get("columns", [])[:120]
+                    if isinstance(column, dict)
+                ],
+            })
+        profiles.append({
+            "source_id": source.get("source_id"),
+            "path": source.get("path"),
+            "kind": source.get("kind"),
+            "roles": source.get("roles", []),
+            "material_roles": source.get("material_roles", []),
+            "runtime_required": source.get("runtime_required", False),
+            "tables": tables,
+        })
+    return profiles
+
+
 def build_brief(
     source: dict[str, Any], source_path: Path, fingerprint: str,
     operational_path: Path, operational: dict[str, Any], operational_fingerprint: str,
 ) -> dict[str, Any]:
     node_by_id, edge_by_id, cited_evidence_ids = source_indexes(source)
+    micro_path, micro_process, micro_fingerprint, _micro_errors = micro_process_context(source_path)
     cards_path = source_path.parent / "evidence-cards.json"
     selected_cards: list[dict[str, Any]] = []
     card_warning = ""
@@ -302,6 +707,11 @@ def build_brief(
                 "artifact": str(operational_path),
                 "fingerprint": operational_fingerprint,
                 "status": operational.get("status"),
+            },
+            "micro_process": {
+                "artifact": str(micro_path),
+                "fingerprint": micro_fingerprint,
+                "status": micro_process.get("status"),
             },
         },
         "scenario": source.get("scenario", {}),
@@ -359,6 +769,8 @@ def build_brief(
                 for item in operational.get("sources", []) if item.get("kind") != "tabular"
             ],
             "rule_source_ids": operational.get("rule_source_ids", []),
+            "governing_source_ids": operational.get("rule_source_ids", []),
+            "material_profiles": compact_material_profiles(operational),
             "links": [
                 {
                     "link_id": item.get("link_id"),
@@ -378,9 +790,21 @@ def build_brief(
                 }
                 for item in operational.get("semantic_routes", []) if isinstance(item, dict)
             ],
+            "trace_evidence": compact_trace_evidence(operational),
+            "approved_micro_process": compact_micro_process(micro_process),
             "required_flow_order": (
-                "先定位并交付完整规则记录，再根据该规则选择字段、连接和谓词，最后对大表执行有界 SQL。"
+                " -> ".join(
+                    str(item) for item in operational.get("query_policy", {}).get("required_sequence", [])
+                    if str(item)
+                )
+                or "resolve scope -> read accepted runtime sources -> validate lineage -> apply accepted procedure -> deliver declared output"
             ),
+        },
+        "historical_capability_evidence": {
+            "material_profiles": compact_material_profiles(operational),
+            "trace": compact_trace_evidence(operational),
+            "approved_micro_process": compact_micro_process(micro_process),
+            "policy": "design_time_trace_blueprint_only; runtime content must be rebound and revalidated",
         },
         "inference_policy": {
             "grain": "macro_business_scenario",
@@ -409,6 +833,7 @@ def claims_template(
 ) -> dict[str, Any]:
     node_by_id, edge_by_id, _ = source_indexes(source)
     scenario = source.get("scenario", {})
+    micro_path, micro_process, micro_fingerprint, _micro_errors = micro_process_context(source_path)
     return {
         "schema_version": SCHEMA_VERSION,
         "source": {
@@ -418,6 +843,11 @@ def claims_template(
             "operational_data_contract": {
                 "artifact": str(operational_path),
                 "fingerprint": operational_fingerprint,
+            },
+            "micro_process": {
+                "artifact": str(micro_path),
+                "fingerprint": micro_fingerprint,
+                "status": micro_process.get("status"),
             },
         },
         "scenario": {
@@ -434,6 +864,7 @@ def claims_template(
             "rule_resolution": "complete_rule_record_before_bulk_query",
             "bulk_data_access": "bounded_read_only_sql",
             "join_policy": "evidence_backed_keys_with_runtime_fanout_validation",
+            "trace_policy": "validated_result_anchor_blueprint_with_runtime_revalidation",
             "agent_direct_file_read": False,
             "unstructured_access": "parse_or_ocr_then_provenance_chunk_search",
             "unstructured_access": "parse_or_ocr_then_provenance_chunk_search",
@@ -478,6 +909,18 @@ def prepare(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     operational_path, operational, operational_fingerprint, operational_errors = operational_context(source, source_path)
     if operational_errors:
         raise ContractError("；".join(operational_errors))
+    micro_path, _micro_process, _micro_fingerprint, micro_errors = micro_process_context(source_path)
+    if micro_errors:
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "status": "blocked_missing_or_invalid_micro_process",
+            "source": str(source_path),
+            "micro_process": str(micro_path),
+            "errors": micro_errors,
+            "next_action": "完成并批准结果链路的微观复现契约；不得直接由历史样本跳到宏观流程。",
+        }
+        atomic_json(output_root / "prepare-status.json", payload)
+        return 2, payload
     brief = build_brief(
         source, source_path, fingerprint, operational_path, operational, operational_fingerprint
     )
@@ -623,6 +1066,24 @@ def validate_candidate(
             if operational_claim.get("fingerprint") != operational_fingerprint:
                 errors.append("source.operational_data_contract.fingerprint 已过期")
 
+    micro_path, micro_process, micro_fingerprint, micro_errors = micro_process_context(source_path)
+    errors.extend(micro_errors)
+    if isinstance(source_claim, dict):
+        micro_claim = source_claim.get("micro_process")
+        if not isinstance(micro_claim, dict):
+            errors.append("source.micro_process must reference the approved micro-process contract")
+        else:
+            try:
+                claimed_micro_path = Path(str(micro_claim.get("artifact", ""))).resolve()
+            except OSError:
+                claimed_micro_path = Path("__invalid__")
+            if claimed_micro_path != micro_path.resolve():
+                errors.append("source.micro_process.artifact is stale or rewritten")
+            if micro_claim.get("fingerprint") != micro_fingerprint:
+                errors.append("source.micro_process.fingerprint is stale")
+            if micro_claim.get("status") != micro_process.get("status"):
+                errors.append("source.micro_process.status is stale")
+
     scenario = claims.get("scenario")
     if not isinstance(scenario, dict):
         errors.append("scenario 必须是对象")
@@ -648,6 +1109,7 @@ def validate_candidate(
         "rule_resolution": "complete_rule_record_before_bulk_query",
         "bulk_data_access": "bounded_read_only_sql",
         "join_policy": "evidence_backed_keys_with_runtime_fanout_validation",
+        "trace_policy": "validated_result_anchor_blueprint_with_runtime_revalidation",
         "agent_direct_file_read": False,
         "unstructured_access": "parse_or_ocr_then_provenance_chunk_search",
     }
@@ -958,6 +1420,7 @@ def validate_candidate(
         validate_string_list(
             f"待确认项 {identifier}.related_stage_ids", question.get("related_stage_ids"), stage_ids, errors
         )
+    errors.extend(open_question_gate_errors(open_questions))
 
     coverage = claims.get("coverage")
     if not isinstance(coverage, dict):
@@ -1303,9 +1766,12 @@ def brief(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
 
 
 def summary(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
-    result = load_json(Path(args.result).resolve(), MAX_SOURCE_BYTES)
+    result_path = Path(args.result).resolve()
+    result = load_json(result_path, MAX_SOURCE_BYTES)
     if result.get("status") != "complete":
         raise ContractError("business-flow.json 尚未 complete")
+    if (result_path.parent / "validation-errors.json").exists():
+        raise ContractError("business-flow 输出目录存在 validation-errors.json；不得交付旧的 complete 流程")
     source_path = Path(args.relations).resolve()
     source, upstream_errors = validate_upstream(source_path)
     if upstream_errors:

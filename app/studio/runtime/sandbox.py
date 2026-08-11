@@ -902,6 +902,7 @@ def _configured_sandbox_manager() -> SandboxManager:
 
 def _skill_sandbox_environment(command: str) -> dict[str, str]:
     from app.studio.capabilities.skill_secrets import skill_secret_store  # noqa: PLC0415
+    from app.core.config import settings  # noqa: PLC0415
 
     normalized = command.replace("\\", "/").casefold()
     inherited_skill_names: tuple[str, ...] = ()
@@ -912,7 +913,72 @@ def _skill_sandbox_environment(command: str) -> dict[str, str]:
         # Finalize is the only phase that materializes complete third-party
         # derivatives of these system Skills.
         inherited_skill_names = ("ocr-parser", "vector-kb")
-    return skill_secret_store.sandbox_environment(command, skill_names=inherited_skill_names)
+    environment = skill_secret_store.sandbox_environment(command, skill_names=inherited_skill_names)
+    if _is_direct_approval_verification_command(command):
+        key = str(
+            os.environ.get("BUSINESS_FLOW_PLATFORM_APPROVAL_HMAC_KEY", "")
+            or getattr(settings, "business_flow_platform_approval_hmac_key", "")
+        ).strip()
+        if key:
+            # The key is deliberately scoped to a direct invocation of the
+            # immutable verification Skills.  It is not made available to prompts,
+            # workspace files, or arbitrary sandbox commands.
+            environment["BUSINESS_FLOW_PLATFORM_APPROVAL_HMAC_KEY"] = key
+    return environment
+
+
+def _is_direct_approval_verification_command(command: str) -> bool:
+    """Recognize a direct immutable Skill command allowed to verify receipts.
+
+    An Agent must not be able to obtain the receipt key by chaining a shell
+    command, redirecting output, or running inline Python.  The command may
+    contain ordinary JSON selector arguments, but must invoke one installed
+    evidence consumer directly.  The key is never granted to an arbitrary
+    Python process or to a package produced inside the workspace.
+    """
+
+    raw = str(command or "")
+    if not raw or any(marker in raw for marker in ("\n", "\r", ";", "|", "&", "<", ">", "`", "$")):
+        return False
+    try:
+        tokens = shlex.split(raw, posix=True)
+    except ValueError:
+        return False
+    if len(tokens) < 3:
+        return False
+    executable = Path(tokens[0]).name.casefold()
+    if executable not in {"python", "python.exe", "py", "py.exe"}:
+        return False
+    script = tokens[1].replace("\\", "/").casefold()
+    actions_by_script = {
+        "/skills/discover-data-relations/scripts/analyze_relations.py": {
+            "analyze", "preflight", "finalize", "micro-process-draft",
+        },
+        "/skills/derive-business-flow/scripts/derive_business_flow.py": {
+            "prepare", "brief", "preflight", "finalize", "summary",
+        },
+        "/skills/distill-business-capability/scripts/distill_capabilities.py": {
+            "prepare", "draft", "brief", "preflight", "finalize", "summary",
+        },
+    }
+    return any(script.endswith(suffix) and tokens[2] in actions for suffix, actions in actions_by_script.items())
+
+
+def _is_direct_relations_verification_command(command: str) -> bool:
+    """Backward-compatible narrow predicate used by relation-runtime tests."""
+
+    raw = str(command or "")
+    try:
+        tokens = shlex.split(raw, posix=True)
+    except ValueError:
+        return False
+    return (
+        _is_direct_approval_verification_command(raw)
+        and len(tokens) >= 3
+        and tokens[1].replace("\\", "/").casefold().endswith(
+            "/skills/discover-data-relations/scripts/analyze_relations.py"
+        )
+    )
 
 
 def _referenced_skill_names(command: str) -> set[str]:

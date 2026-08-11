@@ -7,6 +7,7 @@ from typing import Any
 from app.studio.prompt_loader import render_prompt
 from app.studio.runtime.llm import stream_model_turn
 from app.studio.models import BusinessRecord
+from app.studio.distillation_gates import distillation_runtime_context
 
 
 _EMPTY_CAPABILITY_INDEX = "- Optional Tools: none\n- MCP capabilities: none"
@@ -23,10 +24,11 @@ def _system_prompt(
 ) -> str:
     """Render the stable prompt policy with a bounded runtime routing index."""
 
-    return render_prompt(
+    prompt = render_prompt(
         "agent/core-system.md",
         optional_capability_index=optional_capability_index,
     )
+    return prompt + (distillation_runtime_context(_record) if _record is not None else "")
 
 
 def _safe_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
