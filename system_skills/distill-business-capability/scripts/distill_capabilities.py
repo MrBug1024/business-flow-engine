@@ -20,7 +20,7 @@ from typing import Any, Iterable, Sequence
 
 
 SCHEMA_VERSION = 1
-GENERATOR_CONTRACT_VERSION = 2
+GENERATOR_CONTRACT_VERSION = 3
 RELEASE_CONTRACT_VERSION = 1
 RELATION_CAPABILITY = "discover-data-relations"
 FLOW_CAPABILITY = "derive-business-flow"
@@ -34,6 +34,7 @@ MAX_CANDIDATE_BYTES = 512 * 1024
 MAX_FILES = 500
 MAX_STAGE_SKILLS = 12
 MAX_PROCEDURE_STEPS = 10
+SHA256_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
 TABULAR_EXTENSIONS = {
     ".csv", ".tsv", ".xlsx", ".xls", ".xlsb", ".parquet", ".jsonl", ".ndjson",
@@ -131,12 +132,43 @@ def load_json(path: Path, max_bytes: int) -> dict[str, Any]:
     return payload
 
 
+def load_json_with_digest(path: Path, max_bytes: int) -> tuple[str, dict[str, Any]]:
+    """Read, hash and parse one byte sequence to avoid a check/use race."""
+
+    if not path.is_file():
+        raise ContractError(f"缺少文件：{path}")
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise ContractError(f"无法读取文件：{path}：{exc}") from exc
+    if size > max_bytes:
+        raise ContractError(f"文件超过有界读取上限（{size} > {max_bytes} bytes）：{path}")
+    try:
+        raw = path.read_bytes()
+        if len(raw) > max_bytes:
+            raise ContractError(f"文件超过有界读取上限：{path}")
+        payload = json.loads(raw.decode("utf-8"))
+    except ContractError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ContractError(f"无法读取合法 JSON：{path}：{exc}") from exc
+    if not isinstance(payload, dict):
+        raise ContractError(f"顶层 JSON 必须是对象：{path}")
+    return hashlib.sha256(raw).hexdigest(), payload
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         while chunk := handle.read(64 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def is_sha256_digest(value: Any) -> bool:
+    """Return whether a value is a normalized SHA-256 digest string."""
+
+    return bool(SHA256_DIGEST.fullmatch(str(value or "").strip().casefold()))
 
 
 def platform_approval_signing_payload(envelope: dict[str, Any]) -> bytes:
@@ -1713,8 +1745,21 @@ def prepare(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     flow_fingerprint = sha256_file(flow_path)
     brief = build_brief(relations, flow, relation_path, flow_path, relation_fingerprint, flow_fingerprint)
     template = claims_template(relations, flow, relation_path, flow_path, relation_fingerprint, flow_fingerprint)
+    _, operational, operational_errors = operational_context(relations, relation_path)
+    if operational_errors:
+        # validate_flow already guards this dependency, but keep prepare's
+        # replay template honest if a legacy upstream artifact slips through.
+        replay_contract = {
+            "schema_version": 1,
+            "kind": "compiled_recipe_replay_report",
+            "status": "blocked_missing_operational_contract",
+            "errors": operational_errors,
+        }
+    else:
+        replay_contract = refresh_recipe_replay_contract(output_root, flow, operational)
     atomic_json(output_root / "distillation-brief.json", brief)
     atomic_json(output_root / "capability-plan.template.json", template)
+    atomic_json(output_root / "recipe-replay-contract.json", replay_contract)
     payload = {
         "schema_version": SCHEMA_VERSION,
         "generator_contract_version": GENERATOR_CONTRACT_VERSION,
@@ -1726,7 +1771,12 @@ def prepare(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "inventory_count": len(template["file_inventory"]),
         "brief": str(output_root / "distillation-brief.json"),
         "template": str(output_root / "capability-plan.template.json"),
-        "next_action": "综合并写入 capability-plan.candidate.json，然后运行 preflight。",
+        "recipe_replay_contract": str(output_root / "recipe-replay-contract.json"),
+        "next_action": (
+            "Complete capability-plan.candidate.json, then run preflight. Preflight materializes "
+            "recipe-replay-runtime.json; use that exact runtime with the private signed replay fixture before "
+            "writing recipe-replay-report.json. Without it, finalize remains evidence-only."
+        ),
     }
     atomic_json(output_root / "prepare-status.json", payload)
     return 0, {**payload, "distillation_brief": brief}
@@ -2297,20 +2347,23 @@ def validation_payload(
         }
     _, operational, operational_errors = operational_context(relations, relation_path)
     recipe_verification: dict[str, Any] | None = None
+    recipe_replay_runtime: dict[str, Any] | None = None
     if not operational_errors:
-        recipe_verification = compiled_recipe_verification(output_root, flow, operational)
-        if recipe_verification.get("publishable") is not True:
-            uncovered = recipe_verification.get("uncovered_source_ids", [])
-            reason = str(recipe_verification.get("reason", ""))
-            if uncovered:
-                errors.append(
-                    "compiled-recipes.json 未覆盖已声明的知识判定源：" + ", ".join(map(str, uncovered))
+        # ``compiled-recipes.json`` is reviewed after the generic capability
+        # plan in many scenarios.  Never let a preflight validate a stale,
+        # empty replay contract created by an earlier prepare invocation.
+        refresh_recipe_replay_contract(output_root, flow, operational)
+        if not errors:
+            try:
+                recipe_replay_runtime = materialize_recipe_replay_runtime(
+                    claims, flow, output_root,
                 )
-            elif reason:
-                errors.append(reason)
-            else:
-                errors.append("compiled-recipes.json 未通过可验证发布门禁")
-            reliability_gates["compiled_recipes"] = recipe_verification
+                verification = recipe_replay_runtime.get("recipe_verification")
+                recipe_verification = verification if isinstance(verification, dict) else None
+            except ContractError as exc:
+                errors.append(f"Cannot materialize the private recipe replay runtime: {exc}")
+        else:
+            recipe_verification = compiled_recipe_verification(output_root, flow, operational)
     if not errors:
         return {
             "schema_version": SCHEMA_VERSION,
@@ -2321,7 +2374,12 @@ def validation_payload(
             "stage_skill_count": len(claims.get("stage_skills", [])),
             "total_skill_count": len(claims.get("foundation_skills", [])) + len(claims.get("stage_skills", [])) + 2,
             "recipe_verification": recipe_verification,
-            "next_action": "使用完全相同的候选路径运行 finalize。",
+            "recipe_replay_runtime": recipe_replay_runtime,
+            "next_action": (
+                "If compiled recipes require deterministic results, run recipe_replay_runner.py against "
+                "recipe-replay-runtime.json with a platform-signed private oracle fixture, then rerun preflight and finalize. "
+                "Otherwise finalize produces an evidence-only package."
+            ),
         }
     payload = {
         "schema_version": SCHEMA_VERSION,
@@ -2338,7 +2396,6 @@ def validation_payload(
             "程序步骤必须引用流程阶段、输入输出、控制、状态或交接 ID，不得凭历史记录补微观逻辑。",
             "所有输出 Skill 必须脱离 Studio，资源使用相对路径，秘密只来自环境变量。",
             "未解决问题必须记录可审计 resolution；临时放行必须写 runtime_exception 和用户批准证据。",
-            "每个已声明结构化知识判定源必须有覆盖整类规则的 reviewed family recipe。",
         ],
         "next_action": "一次性修正 repair_target 后重跑 preflight；fingerprint 过期时先重新 prepare。",
     }
@@ -3142,6 +3199,240 @@ def approved_trace_bundle_ids(flow: dict[str, Any]) -> tuple[set[str], str]:
     return {bundle_id}, ""
 
 
+def approved_recipe_replay_context(flow: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """Resolve the signed historical-evidence chain used by a recipe replay.
+
+    The replay runner intentionally never reads the platform HMAC key or
+    serializes the private fixture.  Promotion of its safe, hash-only report
+    is therefore a generator responsibility: this function re-checks the
+    accepted trace/micro-process chain and returns only the fingerprints that
+    a platform receipt must bind.
+    """
+
+    source = flow.get("source") if isinstance(flow.get("source"), dict) else {}
+    micro_claim = source.get("micro_process") if isinstance(source.get("micro_process"), dict) else {}
+    try:
+        micro_path = Path(str(micro_claim.get("artifact", ""))).resolve()
+        micro = load_json(micro_path, MAX_OPERATIONAL_BYTES)
+        review_source = micro.get("source") if isinstance(micro.get("source"), dict) else {}
+        review_path = Path(str(review_source.get("trace_review", ""))).resolve()
+        review = load_json(review_path, MAX_OPERATIONAL_BYTES)
+        trace = review.get("trace") if isinstance(review.get("trace"), dict) else {}
+        trace_path = Path(str(trace.get("artifact", ""))).resolve()
+    except (OSError, ContractError) as exc:
+        return {}, f"accepted recipe replay evidence cannot be read: {exc}"
+
+    if not trace_path.is_file():
+        return {}, "accepted trace review does not reference a readable trace-samples artifact"
+    receipt_errors = platform_evidence_receipt_errors(micro_path.parent)
+    if receipt_errors:
+        return {}, "accepted trace approval receipt is invalid: " + "; ".join(receipt_errors)
+    review_fingerprint = sha256_file(review_path)
+    micro_fingerprint = sha256_file(micro_path)
+    trace_fingerprint = sha256_file(trace_path)
+    if micro_claim.get("fingerprint") != micro_fingerprint:
+        return {}, "accepted micro-process fingerprint changed after flow approval"
+    if review_source.get("trace_review_fingerprint") != review_fingerprint:
+        return {}, "accepted trace review fingerprint changed after micro-process approval"
+    if str(trace.get("fingerprint", "")) != trace_fingerprint:
+        return {}, "accepted trace review does not bind the current trace-samples fingerprint"
+    approval = review.get("approval") if isinstance(review.get("approval"), dict) else {}
+    bundle_id = str(trace.get("bundle_id", "")).strip()
+    if (
+        review.get("schema_version") != SCHEMA_VERSION
+        or review.get("kind") != "trace_review"
+        or review.get("status") != "approved"
+        or approval.get("decision") != "approved"
+        or not bundle_id
+    ):
+        return {}, "accepted trace review is not an approved replay authority"
+    return {
+        "relation_root": micro_path.parent,
+        "trace_fingerprint": trace_fingerprint,
+        "trace_review_fingerprint": review_fingerprint,
+        "trace_bundle_ids": {bundle_id},
+    }, ""
+
+
+def recipe_replay_fixture_receipt_errors(
+    context: dict[str, Any], fixture_fingerprint: str, bindings: dict[str, str],
+) -> list[str]:
+    """Require a platform signature for the private replay oracle fixture.
+
+    The fixture contains the historical request and approved result digest, so
+    it is deliberately not copied into the package.  A signed receipt gives
+    the public report a verifiable authority without disclosing that body.
+    Bind the receipt to every executable byte/contract that the runner used so
+    a prior replay cannot be reused after a recipe or runtime changes.
+    """
+
+    key = os.environ.get(PLATFORM_APPROVAL_KEY_ENV, "")
+    if not key:
+        return [
+            f"Platform approval verifier is unavailable: {PLATFORM_APPROVAL_KEY_ENV} is not configured. "
+            "Recipe replay promotion is fail-closed."
+        ]
+    relation_root = context.get("relation_root")
+    if not isinstance(relation_root, Path):
+        return ["Recipe replay approval context has no relation-root ledger"]
+    ledger_path = platform_approvals_path(relation_root)
+    try:
+        ledger = load_json(ledger_path, MAX_PLATFORM_APPROVAL_BYTES)
+    except ContractError as exc:
+        return [f"Recipe replay approval ledger cannot be read: {exc}"]
+    if (
+        ledger.get("schema_version") != SCHEMA_VERSION
+        or ledger.get("kind") != "platform_approval_envelopes"
+        or ledger.get("issuer") != PLATFORM_APPROVAL_ISSUER
+    ):
+        return ["Recipe replay approval ledger has an unsupported issuer or schema"]
+    approvals = ledger.get("approvals")
+    if not isinstance(approvals, list):
+        return ["Recipe replay approval ledger must contain an approvals array"]
+
+    required = {
+        "artifact_fingerprint": fixture_fingerprint,
+        "trace_fingerprint": str(context.get("trace_fingerprint", "")),
+        "trace_review_fingerprint": str(context.get("trace_review_fingerprint", "")),
+        "recipe_catalog_fingerprint": bindings["recipe_catalog_fingerprint"],
+        "replay_contract_fingerprint": bindings["replay_contract_fingerprint"],
+        "executor_fingerprint": bindings["executor_fingerprint"],
+        "executor_closure_fingerprint": bindings["executor_closure_fingerprint"],
+        "runtime_contract_fingerprint": bindings["runtime_contract_fingerprint"],
+        "flow_contract_fingerprint": bindings["flow_contract_fingerprint"],
+    }
+    matching_receipts = 0
+    invalid_receipts: list[str] = []
+    for index, envelope in enumerate(approvals):
+        if not isinstance(envelope, dict) or envelope.get("artifact_kind") != "recipe_replay_cases":
+            continue
+        if str(envelope.get("artifact_fingerprint", "")).strip() != fixture_fingerprint:
+            continue
+        matching_receipts += 1
+        mismatched = [
+            field for field, expected in required.items()
+            if str(envelope.get(field, "")).strip() != expected
+        ]
+        missing = [
+            field for field in ("approval_id", "subject", "issued_at", "signature")
+            if not str(envelope.get(field, "")).strip()
+        ]
+        if (
+            envelope.get("schema_version") != SCHEMA_VERSION
+            or envelope.get("issuer") != PLATFORM_APPROVAL_ISSUER
+            or envelope.get("decision") != "approved"
+            or mismatched
+            or missing
+        ):
+            detail = ", ".join([*mismatched, *[f"missing {field}" for field in missing]])
+            invalid_receipts.append(f"receipt #{index} has invalid bindings ({detail or 'contract'})")
+            continue
+        signature = str(envelope.get("signature", "")).strip().casefold()
+        expected_signature = platform_approval_signature(envelope, key).casefold()
+        if not hmac.compare_digest(signature, expected_signature):
+            invalid_receipts.append(f"receipt #{index} has an invalid platform signature")
+            continue
+        return []
+    if invalid_receipts:
+        return ["Recipe replay oracle receipt is malformed or stale: " + "; ".join(invalid_receipts)]
+    if matching_receipts:
+        return ["No valid platform-signed recipe_replay_cases receipt matches the current replay bindings."]
+    return ["No platform-signed recipe_replay_cases receipt is present for the private replay fixture."]
+
+
+def recipe_replay_report_receipt_errors(
+    context: dict[str, Any],
+    report_fingerprint: str,
+    fixture_fingerprint: str,
+    bindings: dict[str, str],
+    verified_recipe_ids: Sequence[str],
+) -> list[str]:
+    """Require post-execution approval of the hash-only replay report itself.
+
+    A fixture receipt authorizes the private oracle, but it does not prove a
+    particular public report came from the runner.  The platform signs this
+    second receipt after inspecting the report's hash and its complete binding
+    set.  Both receipts are mandatory before a package may execute a recipe
+    deterministically.
+    """
+
+    key = os.environ.get(PLATFORM_APPROVAL_KEY_ENV, "")
+    if not key:
+        return [
+            f"Platform approval verifier is unavailable: {PLATFORM_APPROVAL_KEY_ENV} is not configured. "
+            "Recipe replay report promotion is fail-closed."
+        ]
+    relation_root = context.get("relation_root")
+    if not isinstance(relation_root, Path):
+        return ["Recipe replay report approval context has no relation-root ledger"]
+    try:
+        ledger = load_json(platform_approvals_path(relation_root), MAX_PLATFORM_APPROVAL_BYTES)
+    except ContractError as exc:
+        return [f"Recipe replay report approval ledger cannot be read: {exc}"]
+    if (
+        ledger.get("schema_version") != SCHEMA_VERSION
+        or ledger.get("kind") != "platform_approval_envelopes"
+        or ledger.get("issuer") != PLATFORM_APPROVAL_ISSUER
+    ):
+        return ["Recipe replay report approval ledger has an unsupported issuer or schema"]
+    approvals = ledger.get("approvals")
+    if not isinstance(approvals, list):
+        return ["Recipe replay report approval ledger must contain an approvals array"]
+    required = {
+        "artifact_fingerprint": report_fingerprint,
+        "fixture_fingerprint": fixture_fingerprint,
+        "trace_fingerprint": str(context.get("trace_fingerprint", "")),
+        "trace_review_fingerprint": str(context.get("trace_review_fingerprint", "")),
+        "recipe_catalog_fingerprint": bindings["recipe_catalog_fingerprint"],
+        "replay_contract_fingerprint": bindings["replay_contract_fingerprint"],
+        "executor_fingerprint": bindings["executor_fingerprint"],
+        "executor_closure_fingerprint": bindings["executor_closure_fingerprint"],
+        "runtime_contract_fingerprint": bindings["runtime_contract_fingerprint"],
+        "flow_contract_fingerprint": bindings["flow_contract_fingerprint"],
+    }
+    wanted_ids = sorted(unique_strings(list(verified_recipe_ids)))
+    matching_receipts = 0
+    invalid_receipts: list[str] = []
+    for index, envelope in enumerate(approvals):
+        if not isinstance(envelope, dict) or envelope.get("artifact_kind") != "recipe_replay_report":
+            continue
+        if str(envelope.get("artifact_fingerprint", "")).strip() != report_fingerprint:
+            continue
+        matching_receipts += 1
+        mismatched = [
+            field for field, expected in required.items()
+            if str(envelope.get(field, "")).strip() != expected
+        ]
+        receipt_ids = unique_strings(envelope.get("verified_recipe_ids"))
+        if receipt_ids != wanted_ids:
+            mismatched.append("verified_recipe_ids")
+        missing = [
+            field for field in ("approval_id", "subject", "issued_at", "signature")
+            if not str(envelope.get(field, "")).strip()
+        ]
+        if (
+            envelope.get("schema_version") != SCHEMA_VERSION
+            or envelope.get("issuer") != PLATFORM_APPROVAL_ISSUER
+            or envelope.get("decision") != "approved"
+            or mismatched
+            or missing
+        ):
+            detail = ", ".join([*mismatched, *[f"missing {field}" for field in missing]])
+            invalid_receipts.append(f"receipt #{index} has invalid bindings ({detail or 'contract'})")
+            continue
+        signature = str(envelope.get("signature", "")).strip().casefold()
+        expected_signature = platform_approval_signature(envelope, key).casefold()
+        if not hmac.compare_digest(signature, expected_signature):
+            invalid_receipts.append(f"receipt #{index} has an invalid platform signature")
+            continue
+        return []
+    if invalid_receipts:
+        return ["Recipe replay report receipt is malformed or stale: " + "; ".join(invalid_receipts)]
+    if matching_receipts:
+        return ["No valid platform-signed recipe_replay_report receipt matches the current replay bindings."]
+    return ["No platform-signed recipe_replay_report receipt is present for the current replay report."]
+
+
 def recipe_coverage_status(
     flow: dict[str, Any], operational: dict[str, Any], recipe_catalog: dict[str, Any],
 ) -> dict[str, Any]:
@@ -3261,26 +3552,644 @@ def recipe_coverage_status(
     }
 
 
-def compiled_recipe_verification(
+def recipe_replay_contract_template(
     output_root: Path, flow: dict[str, Any], operational: dict[str, Any],
 ) -> dict[str, Any]:
-    """Load a reviewed catalog and turn catalog/coverage failures into a release gate."""
+    """Describe, but do not fabricate, the evidence a later replay runner must write."""
+
+    try:
+        catalog = compiled_recipe_catalog(output_root, operational)
+    except ContractError as exc:
+        return {
+            "schema_version": 1,
+            "kind": "compiled_recipe_replay_report",
+            "status": "blocked_invalid_recipe_catalog",
+            "error": str(exc),
+        }
+    recipes = [item for item in catalog.get("recipes", []) if isinstance(item, dict)]
+    recipe_ids = [str(item.get("id", "")) for item in recipes if str(item.get("id", ""))]
+    source = flow.get("source") if isinstance(flow.get("source"), dict) else {}
+    micro = source.get("micro_process") if isinstance(source.get("micro_process"), dict) else {}
+    approved_trace_bundle_ids_, trace_error = approved_trace_bundle_ids(flow)
+    declared_runtime_source_ids = set(unique_strings(operational.get("runtime_source_ids")))
+    required_cases: list[dict[str, Any]] = []
+    for recipe in recipes:
+        recipe_id = str(recipe.get("id", "")).strip()
+        if not recipe_id:
+            continue
+        selector = recipe.get("rule_selector") if isinstance(recipe.get("rule_selector"), dict) else {}
+        recipe_runtime_source_ids = unique_strings([
+            str(recipe.get("source_id", "")),
+            str(selector.get("source_id", "")),
+            *unique_strings(recipe.get("context_source_ids")),
+        ])
+        recipe_runtime_source_ids = [
+            source_id for source_id in recipe_runtime_source_ids
+            if source_id in declared_runtime_source_ids
+        ]
+        assertions = recipe.get("historical_replay_assertions")
+        if not isinstance(assertions, list) or not assertions:
+            # A non-family recipe may not have historical assertions.  Keep an
+            # explicit unresolved case instead of silently emitting an empty
+            # replay contract that could be mistaken for a completed review.
+            required_cases.append({
+                "case_id": f"{recipe_id}:missing-approved-trace-case",
+                "recipe_id": recipe_id,
+                "status": "blocked_missing_approved_trace_case",
+                "trace_bundle_id": "",
+                "runtime_source_ids": recipe_runtime_source_ids,
+                "required_output_node_ids": unique_strings(recipe.get("covered_output_node_ids")),
+                "reason": "A compiled recipe needs an approved trace case before real replay can begin.",
+            })
+            continue
+        for assertion in assertions:
+            if not isinstance(assertion, dict):
+                continue
+            assertion_id = str(assertion.get("id", "")).strip()
+            bundle_id = str(assertion.get("trace_bundle_id", "")).strip()
+            required_cases.append({
+                "case_id": f"{recipe_id}:{assertion_id or 'approved-trace'}",
+                "recipe_id": recipe_id,
+                "assertion_id": assertion_id,
+                "trace_bundle_id": bundle_id,
+                "approved_assertion_ref": str(assertion.get("evidence_ref", "")).strip(),
+                "runtime_source_ids": recipe_runtime_source_ids,
+                "required_output_node_ids": unique_strings(assertion.get("output_node_ids")),
+                "expected_oracle": "Derive the normalized result digest and result-anchor count from the approved trace artifact; never treat this assertion string as the oracle.",
+            })
+    return {
+        "schema_version": 1,
+        "kind": "compiled_recipe_replay_report",
+        "status": "pending_real_replay",
+        "recipe_catalog_fingerprint": (
+            sha256_file(output_root / "compiled-recipes.json")
+            if (output_root / "compiled-recipes.json").is_file() else ""
+        ),
+        "approved_trace": {
+            "artifact": micro.get("artifact", ""),
+            "fingerprint": micro.get("fingerprint", ""),
+            "status": micro.get("status", ""),
+            "bundle_ids": sorted(approved_trace_bundle_ids_),
+            "validation_error": trace_error,
+        },
+        "recipe_ids": recipe_ids,
+        "required_cases": required_cases,
+        "required_evidence": [
+            "one persisted execution artifact per recipe/approved trace case",
+            "expected and actual normalized result digest with an explicit comparison status",
+            "expected and actual result-anchor/row count; zero-row replay is a failure unless the approved oracle is explicitly empty",
+            "runtime source fingerprints, executor dependency-closure fingerprint, and a command/parameter digest without secrets",
+            "a platform-signed recipe_replay_cases receipt for the private oracle fixture and a platform-signed recipe_replay_report receipt for the hash-only result report",
+        ],
+        "private_oracle_contract": {
+            "kind": "compiled_recipe_replay_cases",
+            "distribution": "private_only_never_copy_to_capability_package",
+            "required_receipts": ["recipe_replay_cases", "recipe_replay_report"],
+            "report_runner": "scripts/recipe_replay_runner.py",
+        },
+        "failure_policy": "A recipe assertion or approval string is not a replay. Until a real replay report is supplied and independently validated, the capability is unverified and non-publishable.",
+    }
+
+
+def refresh_recipe_replay_contract(
+    output_root: Path, flow: dict[str, Any], operational: dict[str, Any],
+) -> dict[str, Any]:
+    """Regenerate replay requirements whenever the reviewed recipe catalog changes.
+
+    Recipes are authored after ``prepare`` in many normal workflows.  Refresh
+    at every validation/generation boundary so the replay contract cannot stay
+    empty or keep an obsolete recipe fingerprint after a recipe is added.
+    """
+
+    contract = recipe_replay_contract_template(output_root, flow, operational)
+    atomic_json(output_root / "recipe-replay-contract.json", contract)
+    return contract
+
+
+def recipe_executor_closure_fingerprint(executor_path: Path) -> str:
+    """Hash the package-local executor dependency closure used by a replay."""
+
+    executor_path = executor_path.resolve()
+    scripts_root = executor_path.parent
+    executor_root = scripts_root.parent
+    required = [executor_path, scripts_root / "recipe_runtime.py"]
+    optional = [scripts_root / "query_tabular.py", scripts_root / "extract_documents.py"]
+    if any(not path.is_file() for path in required):
+        raise ContractError("Recipe replay executor is missing execute_scenario.py or recipe_runtime.py")
+    files = [
+        path for path in [*required, *optional, executor_root / "requirements.txt"] if path.is_file()
+    ]
+    digest = hashlib.sha256()
+    for path in sorted(files, key=lambda item: item.relative_to(executor_root).as_posix()):
+        digest.update(path.relative_to(executor_root).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def recipe_replay_runtime_digests(
+    runtime_artifacts: dict[str, Path] | None,
+) -> tuple[dict[str, str], list[str]]:
+    """Hash the exact executable artifacts that a replay report must bind."""
+
+    required = {
+        "catalog": "recipe_catalog_fingerprint",
+        "executor": "executor_fingerprint",
+        "runtime_contract": "runtime_contract_fingerprint",
+        "flow_contract": "flow_contract_fingerprint",
+    }
+    if not isinstance(runtime_artifacts, dict):
+        return {}, ["no exact replay runtime artifacts were supplied"]
+    digests: dict[str, str] = {}
+    errors: list[str] = []
+    for name, output_name in required.items():
+        raw_path = runtime_artifacts.get(name)
+        try:
+            path = Path(raw_path).resolve() if raw_path is not None else None
+        except (OSError, TypeError):
+            path = None
+        if path is None or not path.is_file():
+            errors.append(f"missing replay runtime artifact: {name}")
+            continue
+        digests[output_name] = sha256_file(path)
+    if not errors:
+        try:
+            digests["executor_closure_fingerprint"] = recipe_executor_closure_fingerprint(
+                Path(runtime_artifacts["executor"]),
+            )
+        except (ContractError, OSError, TypeError) as exc:
+            errors.append(f"cannot fingerprint replay executor closure: {exc}")
+    return digests, errors
+
+
+def recipe_required_runtime_source_ids(
+    recipe: dict[str, Any], operational: dict[str, Any],
+) -> set[str]:
+    """Return every declared source the executor can read for a replay.
+
+    This mirrors the replay worker rather than merely listing the recipe's
+    final data source.  Rule selection opens every tabular rule source, and a
+    hybrid request indexes every non-tabular runtime source before the recipe
+    path begins.  Their fingerprints are therefore part of the proof.
+    """
+
+    selector = recipe.get("rule_selector") if isinstance(recipe.get("rule_selector"), dict) else {}
+    values = {
+        str(recipe.get("source_id", "")).strip(),
+        str(selector.get("source_id", "")).strip(),
+        *unique_strings(recipe.get("context_source_ids")),
+    }
+    rule_source_ids = set(unique_strings(operational.get("rule_source_ids")))
+    for source in operational.get("sources", []) if isinstance(operational.get("sources"), list) else []:
+        if not isinstance(source, dict):
+            continue
+        source_id = str(source.get("source_id", "")).strip()
+        kind = str(source.get("kind", "")).casefold()
+        if source_id in rule_source_ids and kind == "tabular":
+            values.add(source_id)
+        if source.get("runtime_required") is True and kind != "tabular":
+            values.add(source_id)
+    values.discard("")
+    return values
+
+
+def compiled_recipe_replay_status(
+    output_root: Path,
+    catalog: dict[str, Any],
+    flow: dict[str, Any] | None = None,
+    runtime_artifacts: dict[str, Path] | None = None,
+) -> dict[str, Any]:
+    """Validate a real, signed replay report before allowing deterministic output.
+
+    A report is only proof when it is produced by the replay runner against
+    the same catalog, executor and two runtime contracts that will be shipped.
+    The report contains hashes rather than historical request/result bodies;
+    a platform-signed receipt authorizes the private oracle fixture that those
+    hashes were compared against.
+    """
+
+    recipes = [item for item in catalog.get("recipes", []) if isinstance(item, dict)]
+    if not recipes:
+        return {
+            "status": "not_required",
+            "passed": True,
+            "verified_recipe_ids": [],
+            "reason": "No compiled deterministic recipe is declared.",
+        }
+    path = output_root / "recipe-replay-report.json"
+    if not path.is_file():
+        return {
+            "status": "missing_real_replay_report",
+            "passed": False,
+            "verified_recipe_ids": [],
+            "required_report": "recipe-replay-report.json",
+            "template": "recipe-replay-contract.json",
+            "reason": "Compiled recipes have no real replay report; approved assertion strings are not replay evidence.",
+        }
+    try:
+        report_fingerprint, report = load_json_with_digest(path, MAX_CANDIDATE_BYTES)
+    except ContractError as exc:
+        return {
+            "status": "invalid_real_replay_report",
+            "passed": False,
+            "verified_recipe_ids": [],
+            "reason": str(exc),
+        }
+
+    # Keep a lightweight, fail-closed status for preflight callers that have
+    # not yet materialized the canonical replay runtime.  A later call from
+    # the preview/final bundle supplies those paths and performs the strict
+    # validation below.
+    source_catalog = output_root / "compiled-recipes.json"
+    basic_shape = (
+        report.get("schema_version") == 1
+        and report.get("kind") == "compiled_recipe_replay_report"
+        and report.get("status") == "passed"
+        and source_catalog.is_file()
+        and report.get("recipe_catalog_fingerprint") == sha256_file(source_catalog)
+        and isinstance(report.get("replays"), list)
+        and bool(report.get("replays"))
+    )
+    if not isinstance(flow, dict) or runtime_artifacts is None:
+        return {
+            "status": "reported_pending_runner_validation" if basic_shape else "invalid_real_replay_report",
+            "passed": False,
+            "verified_recipe_ids": [],
+            "report": "recipe-replay-report.json",
+            "reason": (
+                "A report is present but still needs validation against the exact generated replay runtime and the signed private oracle receipt."
+                if basic_shape
+                else "Replay report is missing the current recipe fingerprint, passed status, or replay records."
+            ),
+        }
+
+    errors: list[str] = []
+    replay_contract_path = output_root / "recipe-replay-contract.json"
+    try:
+        replay_contract_fingerprint, replay_contract = load_json_with_digest(
+            replay_contract_path, MAX_CANDIDATE_BYTES,
+        )
+    except ContractError as exc:
+        return {
+            "status": "invalid_real_replay_report",
+            "passed": False,
+            "verified_recipe_ids": [],
+            "reason": f"Current replay contract cannot be read: {exc}",
+        }
+    runtime_digests, runtime_errors = recipe_replay_runtime_digests(runtime_artifacts)
+    if runtime_errors:
+        return {
+            "status": "invalid_real_replay_runtime",
+            "passed": False,
+            "verified_recipe_ids": [],
+            "reason": "; ".join(runtime_errors),
+        }
+    try:
+        runtime_contract_digest, replay_runtime_contract = load_json_with_digest(
+            Path(runtime_artifacts["runtime_contract"]), MAX_OPERATIONAL_BYTES,
+        )
+    except (ContractError, OSError, TypeError) as exc:
+        return {
+            "status": "invalid_real_replay_runtime",
+            "passed": False,
+            "verified_recipe_ids": [],
+            "reason": f"Replay runtime contract cannot be read: {exc}",
+        }
+    if runtime_contract_digest != runtime_digests["runtime_contract_fingerprint"]:
+        return {
+            "status": "invalid_real_replay_runtime",
+            "passed": False,
+            "verified_recipe_ids": [],
+            "reason": "Replay runtime contract changed while it was being read.",
+        }
+    if replay_contract.get("recipe_catalog_fingerprint") != runtime_digests["recipe_catalog_fingerprint"]:
+        errors.append("current replay contract is not bound to the exact generated recipe catalog")
+    expected_top_level = {
+        "recipe_catalog_fingerprint": runtime_digests["recipe_catalog_fingerprint"],
+        "replay_contract_fingerprint": replay_contract_fingerprint,
+    }
+    for field, expected in expected_top_level.items():
+        if report.get(field) != expected:
+            errors.append(f"replay report {field} does not match the current artifact")
+    if report.get("schema_version") != 1 or report.get("kind") != "compiled_recipe_replay_report":
+        errors.append("replay report has an unsupported schema or kind")
+    if report.get("status") != "passed":
+        errors.append("replay report status is not passed")
+
+    executor = report.get("executor") if isinstance(report.get("executor"), dict) else {}
+    if (
+        executor.get("sha256") != runtime_digests["executor_fingerprint"]
+        or executor.get("closure_sha256") != runtime_digests["executor_closure_fingerprint"]
+        or executor.get("interface") != "execute_scenario.execute"
+    ):
+        errors.append("replay report executor does not match the generated executor")
+    for field, report_name in (
+        ("runtime_contract_fingerprint", "runtime_contract"),
+        ("flow_contract_fingerprint", "flow_contract"),
+    ):
+        bound = report.get(report_name) if isinstance(report.get(report_name), dict) else {}
+        if bound.get("sha256") != runtime_digests[field]:
+            errors.append(f"replay report {report_name} does not match the generated contract")
+
+    context, context_error = approved_recipe_replay_context(flow)
+    if context_error:
+        errors.append(context_error)
+    trace_review = report.get("trace_review") if isinstance(report.get("trace_review"), dict) else {}
+    if context:
+        reported_bundle_ids = {
+            str(item) for item in trace_review.get("trace_bundle_ids", []) if str(item)
+        } if isinstance(trace_review.get("trace_bundle_ids"), list) else set()
+        if (
+            trace_review.get("fingerprint") != context["trace_review_fingerprint"]
+            or trace_review.get("status") != "approved"
+            or reported_bundle_ids != context["trace_bundle_ids"]
+        ):
+            errors.append("replay report trace-review binding is stale or incomplete")
+
+    fixtures = report.get("fixtures") if isinstance(report.get("fixtures"), dict) else {}
+    fixture_fingerprint = str(fixtures.get("sha256", "")).strip().casefold()
+    if not is_sha256_digest(fixture_fingerprint):
+        errors.append("replay report fixture fingerprint is invalid")
+    case_count = fixtures.get("case_count")
+    if isinstance(case_count, bool) or not isinstance(case_count, int) or case_count < 1:
+        errors.append("replay report fixture case_count is invalid")
+
+    required_cases = replay_contract.get("required_cases")
+    if not isinstance(required_cases, list) or not required_cases:
+        errors.append("current replay contract has no required cases")
+        required_by_id: dict[str, dict[str, Any]] = {}
+    else:
+        required_by_id = {}
+        for required in required_cases:
+            if not isinstance(required, dict):
+                errors.append("current replay contract contains an invalid required case")
+                continue
+            case_id = str(required.get("case_id", "")).strip()
+            recipe_id = str(required.get("recipe_id", "")).strip()
+            trace_bundle_id = str(required.get("trace_bundle_id", "")).strip()
+            if not case_id or not recipe_id or not trace_bundle_id or case_id in required_by_id:
+                errors.append("current replay contract contains an incomplete or duplicate required case")
+                continue
+            required_by_id[case_id] = required
+
+    recipes_by_id = {str(recipe.get("id", "")).strip(): recipe for recipe in recipes}
+    replays = report.get("replays")
+    replay_by_case: dict[str, dict[str, Any]] = {}
+    if not isinstance(replays, list) or len(replays) != len(required_by_id):
+        errors.append("replay report does not contain exactly one result for every required case")
+    elif case_count != len(required_by_id):
+        errors.append("replay report fixture case_count does not match the required case set")
+    else:
+        for replay in replays:
+            if not isinstance(replay, dict):
+                errors.append("replay report contains a non-object replay result")
+                continue
+            case_id = str(replay.get("case_id", "")).strip()
+            if not case_id or case_id in replay_by_case:
+                errors.append("replay report contains an empty or duplicate case_id")
+                continue
+            replay_by_case[case_id] = replay
+        if set(replay_by_case) != set(required_by_id):
+            errors.append("replay report case set does not match the current replay contract")
+
+    passed_recipe_ids: set[str] = set()
+    for case_id, required in required_by_id.items():
+        replay = replay_by_case.get(case_id)
+        if replay is None:
+            continue
+        identity = {
+            "recipe_id": str(required.get("recipe_id", "")).strip(),
+            "assertion_id": str(required.get("assertion_id", "")).strip(),
+            "trace_bundle_id": str(required.get("trace_bundle_id", "")).strip(),
+        }
+        if any(str(replay.get(field, "")).strip() != expected for field, expected in identity.items()):
+            errors.append(f"replay report identity does not match required case {case_id}")
+            continue
+        recipe_id = identity["recipe_id"]
+        recipe = recipes_by_id.get(recipe_id)
+        if recipe is None:
+            errors.append(f"replay report refers to a recipe absent from the current catalog: {recipe_id}")
+            continue
+        expected = replay.get("expected") if isinstance(replay.get("expected"), dict) else {}
+        actual = replay.get("actual") if isinstance(replay.get("actual"), dict) else {}
+        comparison = replay.get("comparison") if isinstance(replay.get("comparison"), dict) else {}
+        execution = replay.get("execution") if isinstance(replay.get("execution"), dict) else {}
+        expected_count = expected.get("result_anchor_count")
+        actual_count = actual.get("result_anchor_count")
+        matched_group_count = actual.get("matched_group_count")
+        if (
+            not is_sha256_digest(expected.get("normalized_result_digest"))
+            or not is_sha256_digest(actual.get("normalized_result_digest"))
+            or expected.get("normalized_result_digest") != actual.get("normalized_result_digest")
+            or isinstance(expected_count, bool) or not isinstance(expected_count, int) or expected_count < 0
+            or isinstance(actual_count, bool) or not isinstance(actual_count, int) or actual_count < 0
+            or isinstance(matched_group_count, bool) or not isinstance(matched_group_count, int) or matched_group_count < 0
+            or not isinstance(expected.get("approved_empty_result"), bool)
+            or expected.get("approved_empty_result") != (expected_count == 0)
+            or actual.get("complete") is not True
+            or actual_count != expected_count
+            or comparison.get("status") != "passed"
+            or comparison.get("digest_match") is not True
+            or comparison.get("count_match") is not True
+            or comparison.get("nonempty_policy_match") is not True
+            or comparison.get("complete_match") is not True
+            or execution.get("status") != "completed_deterministically"
+            or execution.get("recipe_execution_status") != "verified_recipe"
+            or str(replay.get("failure_code", "")).strip()
+        ):
+            errors.append(f"replay report result comparison did not pass for required case {case_id}")
+            continue
+        source_fingerprints = replay.get("source_fingerprints")
+        source_ids: set[str] = set()
+        if not isinstance(source_fingerprints, list):
+            errors.append(f"replay report source fingerprints are missing for required case {case_id}")
+            continue
+        source_fingerprints_valid = True
+        for source in source_fingerprints:
+            if not isinstance(source, dict):
+                source_fingerprints_valid = False
+                break
+            source_id = str(source.get("source_id", "")).strip()
+            size_bytes = source.get("size_bytes")
+            if (
+                not source_id or source_id in source_ids
+                or not is_sha256_digest(source.get("sha256"))
+                or isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0
+            ):
+                source_fingerprints_valid = False
+                break
+            source_ids.add(source_id)
+        if not source_fingerprints_valid or source_ids != recipe_required_runtime_source_ids(recipe, replay_runtime_contract):
+            errors.append(f"replay report source fingerprints do not cover the exact recipe sources for case {case_id}")
+            continue
+        passed_recipe_ids.add(recipe_id)
+
+    expected_recipe_ids = {str(required.get("recipe_id", "")).strip() for required in required_by_id.values()}
+    expected_recipe_ids.discard("")
+    # A recipe with more than one approved case is verified only when all of
+    # its cases passed; the preceding loop added an id for each pass, so compare
+    # the report allow-list against the required case grouping explicitly.
+    fully_passed_recipe_ids = {
+        recipe_id for recipe_id in expected_recipe_ids
+        if all(
+            str(required.get("recipe_id", "")).strip() != recipe_id
+            or (
+                replay_by_case.get(case_id, {}).get("comparison", {}).get("status") == "passed"
+                and str(replay_by_case.get(case_id, {}).get("recipe_id", "")).strip() == recipe_id
+            )
+            for case_id, required in required_by_id.items()
+        )
+    }
+    reported_recipe_ids = unique_strings(report.get("verified_recipe_ids"))
+    if (
+        reported_recipe_ids != sorted(fully_passed_recipe_ids)
+        or fully_passed_recipe_ids != expected_recipe_ids
+        or passed_recipe_ids != expected_recipe_ids
+    ):
+        errors.append("replay report verified_recipe_ids are not exactly the recipes whose required cases all passed")
+    failures = report.get("failures")
+    if not isinstance(failures, list) or failures:
+        errors.append("a passed replay report must have an empty failures list")
+
+    if context and is_sha256_digest(fixture_fingerprint):
+        receipt_bindings = {
+            **runtime_digests,
+            "replay_contract_fingerprint": replay_contract_fingerprint,
+        }
+        receipt_errors = recipe_replay_fixture_receipt_errors(
+            context,
+            fixture_fingerprint,
+            receipt_bindings,
+        )
+        errors.extend(receipt_errors)
+        if not errors:
+            errors.extend(recipe_replay_report_receipt_errors(
+                context,
+                report_fingerprint,
+                fixture_fingerprint,
+                receipt_bindings,
+                sorted(fully_passed_recipe_ids),
+            ))
+
+    if errors:
+        return {
+            "status": "invalid_real_replay_report",
+            "passed": False,
+            "verified_recipe_ids": [],
+            "report": "recipe-replay-report.json",
+            "reason": "; ".join(errors),
+        }
+    final_runtime_digests, final_runtime_errors = recipe_replay_runtime_digests(runtime_artifacts)
+    if final_runtime_errors or final_runtime_digests != runtime_digests:
+        return {
+            "status": "invalid_real_replay_runtime",
+            "passed": False,
+            "verified_recipe_ids": [],
+            "report": "recipe-replay-report.json",
+            "reason": "Replay runtime artifacts changed while the report was being validated.",
+        }
+    if sha256_file(path) != report_fingerprint or sha256_file(replay_contract_path) != replay_contract_fingerprint:
+        return {
+            "status": "invalid_real_replay_report",
+            "passed": False,
+            "verified_recipe_ids": [],
+            "report": "recipe-replay-report.json",
+            "reason": "Replay report or replay contract changed while the report was being validated.",
+        }
+    return {
+        "status": "passed_real_replay",
+        "passed": True,
+        "verified_recipe_ids": sorted(fully_passed_recipe_ids),
+        "report": "recipe-replay-report.json",
+        "reason": "Every approved replay case passed against the exact generated executor and signed private oracle fixture.",
+    }
+
+
+def compiled_recipe_verification(
+    output_root: Path,
+    flow: dict[str, Any],
+    operational: dict[str, Any],
+    runtime_artifacts: dict[str, Path] | None = None,
+) -> dict[str, Any]:
+    """Combine recipe coverage with the exact-runtime replay validation gate."""
 
     declared = declared_structured_knowledge_source_ids(flow, operational)
     try:
         catalog = compiled_recipe_catalog(output_root, operational)
     except ContractError as exc:
         return {
-            "status": "unverified",
-            "verifiable": False,
-            "publishable": False,
-            "declared_knowledge_source_ids": declared,
-            "covered_source_ids": [],
-            "uncovered_source_ids": declared,
-            "recipe_count": 0,
+            "status": "unverified", "verifiable": False, "publishable": False,
+            "declared_knowledge_source_ids": declared, "covered_source_ids": [],
+            "uncovered_source_ids": declared, "recipe_count": 0,
             "reason": f"compiled-recipes.json is invalid: {exc}",
         }
-    return recipe_coverage_status(flow, operational, catalog)
+    coverage = recipe_coverage_status(flow, operational, catalog)
+    replay = compiled_recipe_replay_status(output_root, catalog, flow, runtime_artifacts)
+    verified = coverage.get("publishable") is True and replay.get("passed") is True
+    return {
+        **coverage,
+        "status": "verified" if verified else "unverified",
+        "verifiable": verified,
+        "publishable": verified,
+        "verified_recipe_ids": (
+            unique_strings(replay.get("verified_recipe_ids")) if verified else []
+        ),
+        "replay": replay,
+        "reason": " ".join(str(value) for value in (coverage.get("reason"), replay.get("reason")) if str(value)),
+    }
+
+
+def portable_recipe_verification_contract(
+    catalog_path: Path, catalog: dict[str, Any], verification: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind runtime deterministic execution to independently verified recipes.
+
+    A compiled recipe is executable code, not proof that it models a business
+    rule correctly.  The primary executor therefore needs a small, portable
+    policy document that it can inspect without trusting a prose prompt or a
+    hand-authored replay assertion.  Until a real replay runner promotes the
+    catalog, the explicit allow-list is empty and the executor returns bounded
+    evidence for one Agent judgment instead of a false deterministic result.
+    """
+
+    recipes = [item for item in catalog.get("recipes", []) if isinstance(item, dict)]
+    catalog_recipe_ids = {
+        str(item.get("id", "")).strip() for item in recipes if str(item.get("id", "")).strip()
+    }
+    verified = verification.get("verifiable") is True and verification.get("publishable") is True
+    verified_recipe_ids = [
+        recipe_id for recipe_id in unique_strings(verification.get("verified_recipe_ids"))
+        if recipe_id in catalog_recipe_ids
+    ] if verified else []
+    return {
+        "schema_version": 1,
+        "kind": "portable_recipe_runtime_verification",
+        # The runtime intentionally fingerprints the exact package-local
+        # bytes.  The reviewed source catalog may have different whitespace,
+        # so bind this certificate only after the canonical copy has been
+        # written beside execute_scenario.py.
+        "recipe_catalog_fingerprint": sha256_file(catalog_path) if catalog_path.is_file() else "",
+        "status": "verified" if verified else "unverified",
+        "verifiable": verified,
+        "publishable": verified,
+        "verified_recipe_ids": verified_recipe_ids,
+        "verification_summary": {
+            "coverage_status": verification.get("status", "unverified"),
+            "replay_status": (
+                verification.get("replay", {}).get("status", "missing_real_replay_report")
+                if isinstance(verification.get("replay"), dict) else "missing_real_replay_report"
+            ),
+            "verified_recipe_ids": verified_recipe_ids,
+            "reason": verification.get("reason", ""),
+        },
+        "runtime_policy": {
+            "allow_completed_deterministically_only_for_verified_recipe_ids": True,
+            "unverified_recipe_action": "return_bounded_evidence_for_agent_judgment",
+            "replay_contract": "recipe-replay-contract.json",
+            "replay_report": "recipe-replay-report.json",
+        },
+    }
 
 
 def portable_flow_contract(claims: dict[str, Any], flow: dict[str, Any], operational: dict[str, Any]) -> dict[str, Any]:
@@ -3344,8 +4253,8 @@ def render_executor_skill(
     executor_name: str,
 ) -> str:
     scenario = claims.get("scenario", {})
-    runtime_ids = format_list(flow_contract.get("runtime_source_ids", []), "无运行时表格输入")
-    rule_ids = format_list(flow_contract.get("rule_source_ids", []), "未声明结构化规则源")
+    runtime_ids = format_list(flow_contract.get("runtime_source_ids", []), "无运行时输入")
+    rule_ids = format_list(flow_contract.get("rule_source_ids", []), "未声明规则/政策来源")
     stages = flow_contract.get("stages", [])
     stage_lines = [
         f"- `{stage.get('stage_id', '')}`：{stage.get('name', '')}；{stage.get('objective', '')}"
@@ -3368,7 +4277,7 @@ def render_executor_skill(
         "- The `agent_handoff` artifact is the Agent-facing source of truth. Its stdout is intentionally compact; read `agent_handoff` once and use the sibling full `artifact` only when audit detail is explicitly needed.",
         "- Consume `execution_steps` in order. Do not recreate the stage state machine, inspect generator code, or retry the same request after a successful artifact is written.",
         "- A completed deterministic result exposes `result_handle`. For a follow-up that filters or summarizes the same result, invoke only `continue --result <artifact> --filter <result-field>=<value>`; never call `execute`, `search-rules`, `query`, a shell data tool, or a raw source reader again.",
-        "- Read `references/capability-model.json` and `references/execution-plan.json` as the machine-readable business pipeline: resolve scope, locate a governing record when one exists, read ranked runtime sources, validate lineage, apply the accepted flow, then materialize the declared output.",
+        "- Read `references/delivery-contract.json` for the request, evidence, terminal-status, and result fields contract. `references/capability-model.json` and `references/execution-plan.json` are audit metadata, not a call-by-call checklist for the Agent to recreate.",
         "- `references/compiled-recipes.json` contains reviewed declarative rule recipes. When `execute` reports `completed_deterministically`, its `deterministic_result` is the final business fact; report it directly and never reconstruct its SQL or run the rule again.",
         "- `references/dispatch-config.json` and `references/output-specs.json` are executable metadata, not examples. Preserve their rule id, dispatch value, source provenance, and output columns in the final result.",
         "- When status is `ready_for_agent_judgment`, use the governing record when present, the accepted flow, and `candidate_evidence` to make one business-evaluation pass, then fill every field in `result_contract`.",
@@ -3379,13 +4288,13 @@ def render_executor_skill(
         "主执行器先做机器可验证的规则、数据和证据准备，再把有限结果交给 Agent 应用完整规则；它不把原始大表加载进上下文，也不把语义不确定性伪装成确定结论。",
         "", "## 强制调用策略", "",
         "1. 用户请求覆盖整个业务场景时，只先调用本 Skill 的 `execute`；不要先逐个调用阶段 Skill，也不要手工启动状态机。",
-        "2. `execute` 返回 `completed_deterministically` 时，直接使用 `deterministic_result` 交付；同一结果的追问只能复用 `result_handle` 执行 `continue` 投影。返回 `ready_for_agent_judgment` 时，不得用临时 SQL 猜测；应报告该规则尚未有已审阅的确定性规则族并进入平台审阅。",
-        "3. 返回 `blocked_rule_not_found`、`blocked_rule_selection_required` 或 `blocked_missing_or_incompatible_sources` 时，先说明证据缺口；不得循环重试同一请求或猜测规则。",
+        "2. `execute` 返回 `completed_deterministically` 时，直接使用 `deterministic_result` 交付；同一结果的追问只能复用 `result_handle` 执行 `continue` 投影。返回 `ready_for_agent_judgment` 时，读取 handoff 并仅基于其中完整规则/文档章节和有界证据完成一次业务判断，再填满 `result_contract`；不得重新找规则或临时 SQL 猜测。",
+        "3. 返回 `blocked_rule_not_found`、`blocked_rule_selection_required` 或 `blocked_missing_or_incompatible_sources` 时，先说明证据缺口；`blocked_ocr_required` 时只调用已声明 OCR 能力一次、把 JSON 重新绑定到同一 source_id 后再开始一个恢复事务；不得循环重试同一请求或猜测规则。",
         "4. 只有主执行器明确返回可追踪的 SQL/关联缺口时，才使用 `query` 做一次有界补充；阶段 Skill 是降级/人工分步调试入口，不是正常端到端路径。",
         "", "## 固定入口", "",
         "~~~text",
         f"python \"<this-skill>/scripts/execute_scenario.py\" describe",
-        f"python \"<this-skill>/scripts/execute_scenario.py\" produce --request \"<用户完整请求>\" --data-root \"<data-root>\" --output \"<evidence-package.json>\" --bind \"<source-id>=<relative-runtime-file>\"",
+        f"python \"<this-skill>/scripts/execute_scenario.py\" execute --request \"<用户完整请求>\" --data-root \"<data-root>\" --output \"<evidence-package.json>\" --bind \"<source-id>=<relative-runtime-file>\"",
         f"python \"<this-skill>/scripts/execute_scenario.py\" continue --result \"<evidence-package.json>\" --filter \"<已交付结果字段>=<用户限定值>\"",
         f"python \"<this-skill>/scripts/execute_scenario.py\" query --data-root \"<data-root>\" --sql \"<bounded SELECT>\" --link-id \"<validated-link-id>@<key-set-index>\"",
         "~~~", "",
@@ -3396,10 +4305,10 @@ def render_executor_skill(
         *stage_lines,
         "", "## 运行时绑定", "", *source_lines,
         "", "## 输出边界", "",
-        "- 输出必须首先给出业务结论或明确的阻塞原因，然后列出规则完整行、数据源/查询、关联校验和证据定位。",
+        "- 输出必须首先给出业务结论或明确的阻塞原因，然后按 `delivery-contract.json` 列出规则完整行/文档章节、数据源/查询、关联校验（适用时）和证据定位。",
         "- `ready_for_agent_judgment` 只表示证据包完整可供 Agent 应用 accepted flow/controls，不表示脚本替代了业务语义判断。",
         "- 所有行级结果有界；全量结果必须由显式导出请求写入指定文件，不能打印到 Agent 上下文。",
-        "- 运行时缺失、规则多选、关联放大或规则与数据无法对应时，停止并返回可修复的证据缺口。",
+        "- 运行时缺失、规则多选、关联放大、OCR 必需或规则与数据无法对应时，停止并返回可修复的证据缺口。",
         "", "## 非职责", "",
         "- 不修改原始业务文件，不创建临时 Python/SQL/HTTP 客户端，不依赖原平台 Tool、固定挂载目录或持久会话。",
         "- 不使用历史样本代替当前运行时数据，不将设计时输出模板当作运行时输入。",
@@ -3572,6 +4481,146 @@ def copy_template(template_name: str, target: Path) -> None:
     shutil.copytree(source, target, ignore=_source_copy_ignore)
 
 
+def install_primary_executor_runtimes(
+    executor_root: Path, claims: dict[str, Any], operational: dict[str, Any],
+) -> set[str]:
+    """Make the one published executor self-contained for every declared input shape.
+
+    A third-party host may install only ``scenario-main``.  Therefore source
+    kind routing cannot depend on a separately installed reader Skill.  The
+    executor always keeps its bounded tabular adapter; document parser code and
+    its dependencies are copied only for scenarios that declare a non-tabular
+    runtime source (or a document/OCR foundation).
+    """
+
+    assets_root = Path(__file__).resolve().parents[1] / "assets"
+    tabular_reader_root = assets_root / "portable-tabular-reader"
+    document_reader_root = assets_root / "portable-document-reader"
+    reader_template = tabular_reader_root / "scripts" / "query_tabular.py"
+    if not reader_template.is_file():
+        raise ContractError(f"Missing portable tabular runtime: {reader_template}")
+    shutil.copy2(reader_template, executor_root / "scripts" / "query_tabular.py")
+
+    runtime_source_kinds = {
+        str(item.get("kind", "")).casefold()
+        for item in operational.get("sources", [])
+        if isinstance(item, dict) and item.get("runtime_required") is True
+    }
+    foundation_kinds = {
+        str(item.get("kind", "")).casefold()
+        for item in claims.get("foundation_skills", []) if isinstance(item, dict)
+    }
+    installed: set[str] = {"tabular_adapter"}
+    if "tabular" in runtime_source_kinds or "tabular" in foundation_kinds:
+        merge_requirement_files(
+            executor_root / "requirements.txt", tabular_reader_root / "requirements.txt"
+        )
+    if runtime_source_kinds & {"document", "unstructured", "text", "ocr"} or foundation_kinds & {"document", "ocr"}:
+        document_runtime = document_reader_root / "scripts" / "extract_documents.py"
+        if not document_runtime.is_file():
+            raise ContractError(f"Missing portable document runtime: {document_runtime}")
+        # The executor's document loader first looks beside itself.  Copy it
+        # here rather than relying on an independently installed document Skill
+        # or an implementation-specific sibling directory in the host.
+        shutil.copy2(document_runtime, executor_root / "scripts" / "extract_documents.py")
+        merge_requirement_files(
+            executor_root / "requirements.txt", document_reader_root / "requirements.txt"
+        )
+        installed.add("document_adapter")
+    return installed
+
+
+def copy_compiled_recipe_catalog(
+    output_root: Path, target: Path, catalog: dict[str, Any],
+) -> None:
+    """Preserve reviewed recipe bytes so replay and package fingerprints agree."""
+
+    source = output_root / "compiled-recipes.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source.is_file():
+        shutil.copy2(source, target)
+    else:
+        atomic_json(target, catalog)
+
+
+def materialize_recipe_replay_runtime(
+    claims: dict[str, Any], flow: dict[str, Any], output_root: Path,
+) -> dict[str, Any]:
+    """Build a deterministic, non-distributable runtime for private replay.
+
+    `finalize` must be able to validate a report against the same executor it
+    will publish, but a signed package cannot be a prerequisite for gathering
+    that report.  This preview is intentionally local to the distillation
+    output, carries no private replay fixture, and is atomically replaced on
+    every successful preflight.
+    """
+
+    output_root = output_root.resolve()
+    preview_root = output_root / "recipe-replay-runtime"
+    staging_root = output_root / ".recipe-replay-runtime-staging"
+    if staging_root.exists():
+        if not staging_root.resolve().is_relative_to(output_root):
+            raise ContractError("Recipe replay staging directory escapes the capability output root")
+        shutil.rmtree(staging_root)
+    operational = portable_operational_contract(claims)
+    flow_contract = portable_flow_contract(claims, flow, operational)
+    delivery_contract = portable_delivery_contract(claims, flow_contract, operational)
+    catalog = compiled_recipe_catalog(output_root, operational)
+    refresh_recipe_replay_contract(output_root, flow, operational)
+    copy_template("portable-scenario-executor", staging_root)
+    install_primary_executor_runtimes(staging_root, claims, operational)
+    references = staging_root / "references"
+    atomic_json(references / "operational-data-contract.json", operational)
+    atomic_json(references / "flow-contract.json", flow_contract)
+    atomic_json(references / "delivery-contract.json", delivery_contract)
+    copy_compiled_recipe_catalog(output_root, references / "compiled-recipes.json", catalog)
+    runtime_artifacts = {
+        "catalog": references / "compiled-recipes.json",
+        "executor": staging_root / "scripts" / "execute_scenario.py",
+        "runtime_contract": references / "operational-data-contract.json",
+        "flow_contract": references / "flow-contract.json",
+    }
+    verification = compiled_recipe_verification(
+        output_root, flow, operational, runtime_artifacts,
+    )
+    atomic_json(
+        references / "recipe-verification.json",
+        portable_recipe_verification_contract(
+            references / "compiled-recipes.json", catalog, verification,
+        ),
+    )
+    safe_replace_directory(preview_root, staging_root, output_root)
+    preview_references = preview_root / "references"
+    final_artifacts = {
+        "catalog": preview_references / "compiled-recipes.json",
+        "executor": preview_root / "scripts" / "execute_scenario.py",
+        "runtime_contract": preview_references / "operational-data-contract.json",
+        "flow_contract": preview_references / "flow-contract.json",
+    }
+    digests, digest_errors = recipe_replay_runtime_digests(final_artifacts)
+    if digest_errors:
+        raise ContractError("; ".join(digest_errors))
+    metadata = {
+        "schema_version": 1,
+        "kind": "recipe_replay_runtime",
+        "status": "ready",
+        "root": str(preview_root),
+        "executor": str(final_artifacts["executor"]),
+        "catalog": str(final_artifacts["catalog"]),
+        "runtime_contract": str(final_artifacts["runtime_contract"]),
+        "flow_contract": str(final_artifacts["flow_contract"]),
+        "replay_contract": str(output_root / "recipe-replay-contract.json"),
+        "digests": digests,
+        "recipe_verification": verification,
+        "private_fixture_policy": (
+            "Pass a private compiled_recipe_replay_cases fixture directly to recipe_replay_runner.py; "
+            "do not copy it into this output directory or a release package."
+        ),
+    }
+    atomic_json(output_root / "recipe-replay-runtime.json", metadata)
+    return metadata
+
+
 def release_skill_root_document(claims: dict[str, Any], executor_name: str) -> str:
     """Create a standard top-level Skill entrypoint for archive importers."""
 
@@ -3612,9 +4661,8 @@ def render_mcp_installation(server_name: str) -> str:
         "",
         "## Tools",
         "",
-        "- `describe_capability`, `describe_schema`, and `list_outputs` inspect the package contract.",
-        "- `execute` is the primary transaction: it selects the governing record, checks runtime sources, collects bounded linked evidence, and writes an Agent handoff when an output directory is supplied.",
-        "- `list_knowledge`, `search_knowledge`, and `query_data` are diagnostic fallbacks only. Do not use them to recreate a successful `execute` transaction.",
+        "- `execute` is the only tool exposed by default. It selects the governing record, checks runtime sources, collects bounded linked evidence, and writes an Agent handoff when an output directory is supplied.",
+        "- This deliberate one-tool surface prevents a host Agent from rebuilding the transaction with rule searches or ad-hoc SQL. Use a package-local test harness, not the production Agent, for diagnostics.",
         "",
     ])
 
@@ -3637,31 +4685,17 @@ def mcp_tool_definitions(namespace: str) -> list[dict[str, Any]]:
         }
 
     return [
-        tool("describe_capability", "Describe the capability, required runtime inputs, and recommended tool sequence.", {}),
-        tool("describe_schema", "Return declared sources, columns, lifecycle roles, and validated links.", {}),
-        tool("list_outputs", "Return the declared business result contract.", {}),
-        tool("list_knowledge", "List declared knowledge rows before selecting a governing record.", {
+        tool("execute", "Run the one complete business request transaction. Return the terminal status, bounded evidence, artifact handles and Agent handoff; do not manually reconstruct it with rule searches or SQL. An explicit JSON/CSV/XLSX final-result path is honored only after a verified deterministic completion.", {
             **data_location,
-            "limit": {"type": "integer", "default": 50},
-        }, ["data_dir"]),
-        tool("search_knowledge", "Search knowledge rows to locate a complete governing record.", {
-            **data_location,
-            "keyword": {"type": "string"},
-            "limit": {"type": "integer", "default": 20},
-        }, ["data_dir", "keyword"]),
-        tool("execute", "Run one complete business request: select a governing rule, validate bound runtime sources and links, and return the evidence handoff for one business-evaluation pass.", {
-            **data_location,
-            "output_id": {"type": "string", "description": "Output identifier from list_outputs."},
-            "params": {"type": ["string", "object", "null"], "description": "The complete business request, including the original rule context for a follow-up."},
+            "request": {"type": "string", "description": "The complete business request."},
+            "output_id": {"type": "string", "default": "execute_business_request", "description": "Compatibility output id; leave as the declared default."},
+            "params": {"type": ["string", "object", "null"], "description": "Compatibility alias of the complete request when a host cannot send request."},
             "max_rows": {"type": "integer"},
             "out_dir": {"type": "string"},
-        }, ["data_dir"]),
-        tool("query_data", "Diagnostic fallback: run a bounded read-only SELECT only when execute reports one named missing field or relationship.", {
-            **data_location,
-            "sql": {"type": "string"},
-            "save_result": {"type": "boolean", "default": False},
-            "out_dir": {"type": "string"},
-        }, ["data_dir", "sql"]),
+            "delivery_output": {"type": "string", "description": "Explicit final JSON, CSV, or XLSX result path. Requires a persistent evidence output directory."},
+            "delivery_format": {"type": "string", "enum": ["auto", "json", "csv", "xlsx"], "default": "auto"},
+            "delivery_template_id": {"type": "string", "description": "Declared template id; it is materialized only when all columns come directly from a verified recipe."},
+        }, ["data_dir", "request"]),
     ]
 
 
@@ -3710,8 +4744,17 @@ def platform_compatibility_contracts(executor_root: Path, claims: dict[str, Any]
             "output_id": "execute_business_request",
             "name": claims["scenario"].get("business_outcome") or claims["scenario"].get("name", "business result"),
             "format": "scenario_evidence",
-            "description": "Run the primary scenario transaction and return the selected governing rule, validated linked evidence, execution steps and Agent handoff.",
+            "description": "Run the one primary scenario transaction and return the selected governing rule, bounded evidence, terminal status, artifact handles and Agent handoff. The host must preserve this structured response rather than replacing it with a generic row-count summary.",
             "result_contract": execution_plan.get("result_contract", {}),
+            "host_action": {
+                "action": "execute",
+                "default_output_id": "execute_business_request",
+                "response_contract": "portable_business_request_transaction_result",
+                "required_response_fields": [
+                    "status", "selected_rule", "candidate_evidence", "deterministic_result",
+                    "agent_handoff", "next_step", "artifact",
+                ],
+            },
         }],
     }
     domain = {
@@ -3721,7 +4764,17 @@ def platform_compatibility_contracts(executor_root: Path, claims: dict[str, Any]
         "relations": relations,
         "knowledge_table": knowledge_table,
     }
-    dispatch = {"knowledge_table": knowledge_table, "dispatch_key_column": ""}
+    dispatch = {
+        "knowledge_table": knowledge_table,
+        "dispatch_key_column": "",
+        "primary_action": "execute",
+        "normal_action_allowlist": ["execute"],
+        "fallback_actions": ["query_data"],
+        "fallback_policy": "query_data_only_when_execute.next_step_names_a_concrete_missing_field_or_relationship",
+        "default_output_id": "execute_business_request",
+        "response_contract": "portable_business_request_transaction_result",
+        "structured_passthrough_required": True,
+    }
     required_tables = [
         item["table_name"]
         for item in tables
@@ -3732,12 +4785,17 @@ def platform_compatibility_contracts(executor_root: Path, claims: dict[str, Any]
 
 def render_platform_system_prompt(
     claims: dict[str, Any], executor_name: str, required_tables: list[str],
+    delivery_contract: dict[str, Any],
 ) -> str:
     """Render instructions for the reference platform's standard Skill importer."""
     scenario = claims.get("scenario", {})
     scenario_name = str(scenario.get("name", "业务场景"))
     purpose = str(scenario.get("purpose", "完成已声明的业务目标"))
     tables = "、".join(required_tables) or "由 describe_schema 返回的运行时表"
+    delivery_fields = format_list(
+        delivery_contract.get("delivery_contract", {}).get("required_fields", []),
+        "business conclusion, evidence, coverage, and uncertainty",
+    )
     return "\n".join([
         f"# {scenario_name} 子 Agent System Prompt",
         "",
@@ -3747,8 +4805,9 @@ def render_platform_system_prompt(
         "`main_skill/scripts/skill_executor.py`。不得绕过该入口读取包内 JSON/配置文件、"
         "临时创建 Python 或 SQL 脚本，或自行猜测表结构、关联关系和业务规则。",
         "",
-        "可用平台动作：`describe_capability`、`describe_schema`、`list_outputs`、"
-        "`list_knowledge`、`search_knowledge`、`execute`、`query_data`。其中 `execute` 是唯一的正常业务路径；其余动作只用于它报告的明确证据缺口。",
+        "可用平台动作可能还会列出 `describe_capability`、`describe_schema`、`list_outputs`、"
+        "`list_knowledge`、`search_knowledge`、`query_data`；其中 `execute` 是唯一的正常业务路径。其余动作只用于 `execute.next_step` 报告的明确证据缺口，不能作为预处理步骤。",
+        f"唯一交付契约是 `main_skill/references/delivery-contract.json`；完成响应必须包含：{delivery_fields}。",
         "",
         "## 业务职责",
         "",
@@ -3757,8 +4816,8 @@ def render_platform_system_prompt(
         "",
         "## 执行顺序",
         "",
-        "1. 对完整业务请求，首先且只调用一次 `execute`，传入用户的完整请求作为 `params`、宿主提供的 `data_dir`，以及可写的 `out_dir`。不要先分拆为搜索规则、读表、阶段 Skill 或手工 SQL。",
-        "2. 以 `execute` 返回的 `selected_rule`、`candidate_evidence`、`execution_steps`、`result_contract` 和 `agent_handoff` 为唯一业务事实，完成一次判定和交付。零命中、规则不唯一或来源不兼容时，按返回的 blocker 向用户说明，禁止猜测或盲目重试。",
+        "1. 对完整业务请求，首先且只调用一次 `execute`，固定传入 `output_id=execute_business_request`、用户完整请求作为 `params`、宿主提供的 `data_dir`，以及可写的 `out_dir`。不要先分拆为搜索规则、读表、阶段 Skill 或手工 SQL。",
+        "2. 宿主必须保留 `execute` 的结构化事务结果（至少 `status`、`selected_rule`、`candidate_evidence`、`deterministic_result`、`agent_handoff`、`next_step` 与 `artifact`），不得把它缩成“输出 N 行”的通用提示。以这些字段为唯一业务事实完成一次判定和交付。零命中、规则不唯一或来源不兼容时，按返回的 blocker 向用户说明，禁止猜测或盲目重试。",
         "3. 只有 `next_step` 明确指出缺失字段或未解决关联时，才使用一次 `query_data` 做该补充；不得用它重新实现整条审计规则。",
         "4. 用户对刚完成的审计结果提出筛选、统计或追问时，优先基于本轮交付的结果和证据继续回答。确需重新执行时，`params` 必须包含原始规则上下文与新条件，不能只传一句过滤条件。",
         "5. 输出结论时说明所用规则、数据范围、关键字段、证据路径以及未匹配/截断/待确认边界。",
@@ -3773,17 +4832,40 @@ def render_platform_system_prompt(
     ])
 
 
-def render_platform_main_skill_guide(required_tables: list[str]) -> str:
+def render_platform_main_skill_guide(
+    required_tables: list[str], executor_name: str, delivery_contract: dict[str, Any],
+) -> str:
+    """Render the host-facing root Skill without losing the importer contract.
+
+    Some third-party action adapters identify this root by ``scenario-main``;
+    it is intentionally distinct from the generated executor directory name.
+    The compatibility files remain alongside it and are the implementation
+    boundary for the single exposed action.
+    """
+
     tables = "、".join(required_tables) or "由 describe_schema 返回的运行时表"
+    required_fields = format_list(
+        delivery_contract.get("delivery_contract", {}).get("required_fields", []),
+        "业务结论、理由、范围、证据与不确定性",
+    )
     return "\n".join([
+        "---",
+        "name: scenario-main",
+        "description: \"Third-party portable business scenario entrypoint. Execute one complete request through the compatibility action and return its auditable delivery contract.\"",
+        "---",
+        "",
         "# 平台主 Skill 使用说明",
         "",
-        "本目录由平台运行时加载。业务执行入口是 `scripts/skill_executor.py`；"
-        "请通过平台暴露的 `execute`、`query_data` 等动作调用，不要直接读取本目录的配置 JSON。",
+        "本目录由第三方平台运行时加载。唯一正常业务动作是 `execute`，其兼容入口为 `scripts/skill_executor.py`；"
+        "它读取同目录兼容配置并转交 `main_executor`。不要直接读取配置 JSON、绕过该入口或手工调用内部阶段。",
         "",
         f"运行时需提供的数据表：{tables}。",
         "",
-        "标准顺序：`execute` → 依据返回的证据完成一次判定与交付。仅当 `next_step` 指出具体证据缺口时才使用一次 `query_data`。",
+        f"标准单动作契约：对每个新的完整请求只调用一次 `execute(output_id=execute_business_request)` → 读取 `agent_handoff` → 交付 {required_fields}。"
+        "仅当 `next_step` 指出具体证据缺口时才使用一次 `query_data`；同一完成结果的追问复用结果工件，不重跑源数据。",
+        "宿主必须把 `execute` 的结构化事务结果传给 Agent，不能只显示泛化的行数/文件名摘要；兼容响应字段见 `dispatch_config.json`。",
+        "",
+        f"内部主执行器：`{executor_name}`；交付字段与终态规则见同目录 `references/delivery-contract.json`。",
         "",
     ])
 
@@ -3829,6 +4911,10 @@ def build_release_bundle(
             compatibility_root / "scripts" / "skill_executor.py",
             skill_root / "main_skill" / "scripts" / "skill_executor.py",
         )
+        delivery_contract = load_json(
+            skill_root / "main_skill" / "references" / "delivery-contract.json",
+            MAX_CANDIDATE_BYTES,
+        )
         domain_knowledge, output_specs, dispatch_config, required_tables = platform_compatibility_contracts(
             skill_root / "main_skill", claims,
         )
@@ -3837,11 +4923,15 @@ def build_release_bundle(
         atomic_json(skill_root / "main_skill" / "dispatch_config.json", dispatch_config)
         atomic_text(
             skill_root / "system_prompt.md",
-            render_platform_system_prompt(claims, executor_name, required_tables),
+            render_platform_system_prompt(claims, executor_name, required_tables, delivery_contract),
         )
         atomic_text(
             skill_root / "main_skill" / "SKILL.md",
-            render_platform_main_skill_guide(required_tables),
+            render_platform_main_skill_guide(
+                required_tables,
+                executor_name,
+                delivery_contract,
+            ),
         )
 
         mcp_root = staging / "mcp"
@@ -3881,10 +4971,17 @@ def build_release_bundle(
             "args": ["run_mcp.py"],
             "entrypoint": "run_mcp.py",
             "main_executor": executor_name,
+            "delivery_contract": "main_executor/references/delivery-contract.json",
             "transport": "stdio",
             "stdout_contract": "ascii_json_rpc",
             "requires_host_llm_reasoning": True,
             "primary_install_mode": "mcp_stdio",
+            "normal_action_allowlist": ["execute"],
+            "diagnostic_actions": [
+                "describe_capability", "describe_schema", "list_outputs", "list_knowledge",
+                "search_knowledge", "query_data",
+            ],
+            "tool_surface_policy": "expose_execute_only_by_default",
             "tools": tool_definitions,
         })
         atomic_json(mcp_root / "mcp_config.example.json", {
@@ -3904,11 +5001,20 @@ def build_release_bundle(
             "main_executor": executor_name,
             "namespace": namespace,
             "tool_actions": [
-                "describe_capability", "list_outputs", "describe_schema", "list_knowledge",
-                "search_knowledge", "execute", "query_data",
+                "execute",
             ],
             "tool_names": [item["name"] for item in tool_definitions],
             "runtime_dependencies": runtime_dependencies,
+            "reference_contracts": {
+                "delivery_contract": "main_executor/references/delivery-contract.json",
+                "delivery_contract_sha256": sha256_file(
+                    mcp_root / "main_executor" / "references" / "delivery-contract.json"
+                ),
+                "recipe_runtime_verification": "main_executor/references/recipe-verification.json",
+                "recipe_runtime_verification_sha256": sha256_file(
+                    mcp_root / "main_executor" / "references" / "recipe-verification.json"
+                ),
+            },
         })
 
         artifacts_root = staging / "artifacts"
@@ -3946,6 +5052,22 @@ def build_release_bundle(
                 "skill_zip": sha256_file(skill_archive),
                 "mcp_stdio_zip": sha256_file(mcp_archive),
             },
+            "reference_contracts": {
+                "delivery_contract": {
+                    "skill": "skill/main_skill/references/delivery-contract.json",
+                    "mcp_main_executor": "mcp/main_executor/references/delivery-contract.json",
+                    "sha256": sha256_file(
+                        skill_root / "main_skill" / "references" / "delivery-contract.json"
+                    ),
+                },
+                "recipe_runtime_verification": {
+                    "skill": "skill/main_skill/references/recipe-verification.json",
+                    "mcp_main_executor": "mcp/main_executor/references/recipe-verification.json",
+                    "sha256": sha256_file(
+                        skill_root / "main_skill" / "references" / "recipe-verification.json"
+                    ),
+                },
+            },
         }
         atomic_json(staging / "release.json", release_payload)
         target = output_root / "release"
@@ -3965,26 +5087,90 @@ def build_release_bundle(
         raise
 
 
+def archive_source_digest_errors(
+    archive_path: Path, source_root: Path, archive_root: str,
+) -> list[str]:
+    """Require an install archive to be an exact byte-for-byte source snapshot."""
+
+    if not source_root.is_dir():
+        return [f"Release source directory is missing: {source_root}"]
+    expected = {
+        f"{archive_root}/{path.relative_to(source_root).as_posix()}": path
+        for path in source_root.rglob("*")
+        if path.is_file()
+        and "__pycache__" not in path.parts
+        and path.suffix.casefold() not in {".pyc", ".pyo"}
+    }
+    try:
+        with zipfile.ZipFile(archive_path) as opened:
+            members = {
+                item.filename: item
+                for item in opened.infolist()
+                if not item.is_dir()
+            }
+            missing = sorted(set(expected) - set(members))
+            unexpected = sorted(set(members) - set(expected))
+            errors: list[str] = []
+            if missing:
+                errors.append(
+                    f"Release archive {archive_path.name} is missing source members: "
+                    + ", ".join(missing[:8])
+                )
+            if unexpected:
+                errors.append(
+                    f"Release archive {archive_path.name} has members absent from its source tree: "
+                    + ", ".join(unexpected[:8])
+                )
+            for member, source_path in expected.items():
+                info = members.get(member)
+                if info is None:
+                    continue
+                digest = hashlib.sha256()
+                with opened.open(info) as payload:
+                    while chunk := payload.read(1024 * 1024):
+                        digest.update(chunk)
+                if digest.hexdigest() != sha256_file(source_path):
+                    errors.append(
+                        f"Release archive {archive_path.name} content differs from source: {member}"
+                    )
+            return errors
+    except (OSError, zipfile.BadZipFile) as exc:
+        return [f"Invalid release archive {archive_path.name}: {exc}"]
+
+
 def validate_release_bundle(output_root: Path, executor_name: str) -> list[str]:
     root = output_root / "release"
     required = [
         root / "release.json",
         root / "skill" / "system_prompt.md",
         root / "skill" / "main_skill" / "SKILL.md",
+        root / "skill" / "main_skill" / "scripts" / "skill_executor.py",
+        root / "skill" / "main_skill" / "scripts" / "compatibility_runtime.py",
         root / "skill" / "main_skill" / "scripts" / "execute_scenario.py",
         root / "skill" / "main_skill" / "scripts" / "recipe_runtime.py",
+        root / "skill" / "main_skill" / "domain_knowledge.json",
+        root / "skill" / "main_skill" / "output_specs.json",
+        root / "skill" / "main_skill" / "dispatch_config.json",
         root / "skill" / "main_skill" / "references" / "compiled-recipes.json",
+        root / "skill" / "main_skill" / "references" / "recipe-verification.json",
+        root / "skill" / "main_skill" / "references" / "delivery-contract.json",
         root / "mcp" / "run_mcp.py",
         root / "mcp" / "mcp_server.py",
         root / "mcp" / "mcp.json",
+        root / "mcp" / "manifest.json",
         root / "mcp" / "mcp_config.example.json",
         root / "mcp" / "main_executor" / "scripts" / "execute_scenario.py",
         root / "mcp" / "main_executor" / "scripts" / "recipe_runtime.py",
         root / "mcp" / "main_executor" / "references" / "compiled-recipes.json",
+        root / "mcp" / "main_executor" / "references" / "recipe-verification.json",
+        root / "mcp" / "main_executor" / "references" / "delivery-contract.json",
+        root / "mcp" / "main_skill" / "SKILL.md",
         root / "mcp" / "main_skill" / "scripts" / "skill_executor.py",
+        root / "mcp" / "main_skill" / "scripts" / "compatibility_runtime.py",
         root / "mcp" / "main_skill" / "domain_knowledge.json",
         root / "mcp" / "main_skill" / "output_specs.json",
         root / "mcp" / "main_skill" / "dispatch_config.json",
+        root / "mcp" / "main_skill" / "references" / "delivery-contract.json",
         root / "mcp" / "tools" / "knowledge" / "search_knowledge.py",
         root / "mcp" / "tools" / "knowledge" / "list_knowledge.py",
         root / "artifacts" / "skill.zip",
@@ -3996,16 +5182,142 @@ def validate_release_bundle(output_root: Path, executor_name: str) -> list[str]:
     try:
         release = load_json(root / "release.json", MAX_CANDIDATE_BYTES)
         mcp = load_json(root / "mcp" / "mcp.json", MAX_CANDIDATE_BYTES)
+        mcp_manifest = load_json(root / "mcp" / "manifest.json", MAX_CANDIDATE_BYTES)
     except ContractError as exc:
         return [str(exc)]
     if release.get("format") != "portable-business-capability-release":
         errors.append("Release manifest format is invalid")
+    skill_main_root = root / "skill" / "main_skill"
+    main_skill_text = (skill_main_root / "SKILL.md").read_text(encoding="utf-8")
+    frontmatter = re.match(r"\A---\r?\n(?P<body>.*?)\r?\n---\r?\n", main_skill_text, re.DOTALL)
+    if frontmatter is None or not re.search(
+        r"(?m)^name:\s*scenario-main\s*$", frontmatter.group("body") if frontmatter else ""
+    ):
+        errors.append("Release root main_skill/SKILL.md must declare frontmatter name: scenario-main")
+    if "scripts/skill_executor.py" not in main_skill_text or "`execute`" not in main_skill_text:
+        errors.append("Release root main_skill/SKILL.md does not declare the single compatibility execute action")
+    install_modes = release.get("install_modes") if isinstance(release.get("install_modes"), dict) else {}
+    skill_install = install_modes.get("skill_directory") if isinstance(install_modes.get("skill_directory"), dict) else {}
+    if skill_install.get("primary_entrypoint") != "main_skill/scripts/skill_executor.py":
+        errors.append("Release manifest primary entrypoint is not the root compatibility action")
+    try:
+        skill_delivery = load_json(
+            skill_main_root / "references" / "delivery-contract.json", MAX_CANDIDATE_BYTES
+        )
+        skill_recipe_catalog = load_json(
+            skill_main_root / "references" / "compiled-recipes.json", MAX_CANDIDATE_BYTES
+        )
+        skill_recipe_verification = load_json(
+            skill_main_root / "references" / "recipe-verification.json", MAX_CANDIDATE_BYTES
+        )
+        skill_operational = load_json(
+            skill_main_root / "references" / "operational-data-contract.json", MAX_OPERATIONAL_BYTES
+        )
+    except ContractError as exc:
+        errors.append(str(exc))
+        skill_delivery = {}
+        skill_recipe_catalog = {}
+        skill_recipe_verification = {}
+        skill_operational = {}
+    if (
+        skill_delivery.get("contract_kind") != "portable_business_request_transaction"
+        or skill_delivery.get("entrypoint", {}).get("command") != "execute"
+    ):
+        errors.append("Release root delivery-contract is invalid or does not bind execute")
+    skill_catalog_path = skill_main_root / "references" / "compiled-recipes.json"
+    expected_catalog_digest = sha256_file(skill_catalog_path)
+    verified_recipe_ids = skill_recipe_verification.get("verified_recipe_ids")
+    if (
+        skill_recipe_verification.get("kind") != "portable_recipe_runtime_verification"
+        or skill_recipe_verification.get("recipe_catalog_fingerprint") != expected_catalog_digest
+        or not isinstance(verified_recipe_ids, list)
+    ):
+        errors.append("Release root recipe runtime verification is invalid or unbound from compiled recipes")
+    skill_sources = skill_operational.get("sources", [])
+    if not isinstance(skill_sources, list):
+        skill_sources = []
+    declared_document_runtime = any(
+        isinstance(source, dict)
+        and source.get("runtime_required") is True
+        and str(source.get("kind", "")).casefold() in {"document", "unstructured", "text", "ocr"}
+        for source in skill_sources
+    )
+    if declared_document_runtime:
+        if not (skill_main_root / "scripts" / "extract_documents.py").is_file():
+            errors.append("Release root declares document runtime input but omits extract_documents.py")
+        dependency_set = set(python_dependencies(skill_main_root))
+        if not {"pypdf>=5.0.0,<7.0.0", "python-docx>=1.1.0,<2.0.0", "python-pptx>=1.0.0,<2.0.0"}.issubset(dependency_set):
+            errors.append("Release root declares document runtime input but omits document parser requirements")
+    try:
+        dispatch = load_json(skill_main_root / "dispatch_config.json", MAX_CANDIDATE_BYTES)
+        output_specs = load_json(skill_main_root / "output_specs.json", MAX_CANDIDATE_BYTES)
+    except ContractError as exc:
+        errors.append(str(exc))
+        dispatch = {}
+        output_specs = {}
+    host_outputs = output_specs.get("outputs") if isinstance(output_specs.get("outputs"), list) else []
+    primary_output = next(
+        (item for item in host_outputs if isinstance(item, dict) and item.get("output_id") == "execute_business_request"),
+        {},
+    )
+    host_action = primary_output.get("host_action") if isinstance(primary_output.get("host_action"), dict) else {}
+    if (
+        dispatch.get("primary_action") != "execute"
+        or dispatch.get("normal_action_allowlist") != ["execute"]
+        or dispatch.get("structured_passthrough_required") is not True
+        or dispatch.get("default_output_id") != "execute_business_request"
+        or host_action.get("response_contract") != "portable_business_request_transaction_result"
+    ):
+        errors.append("Release compatibility dispatch does not enforce the single structured execute transaction")
+    release_references = release.get("reference_contracts") if isinstance(release.get("reference_contracts"), dict) else {}
+    release_delivery = release_references.get("delivery_contract") if isinstance(release_references.get("delivery_contract"), dict) else {}
+    expected_delivery_paths = {
+        "skill": "skill/main_skill/references/delivery-contract.json",
+        "mcp_main_executor": "mcp/main_executor/references/delivery-contract.json",
+    }
+    if any(release_delivery.get(key) != value for key, value in expected_delivery_paths.items()):
+        errors.append("Release manifest does not wire the canonical delivery-contract paths")
+    skill_delivery_digest = sha256_file(skill_main_root / "references" / "delivery-contract.json")
+    mcp_delivery_path = root / "mcp" / "main_executor" / "references" / "delivery-contract.json"
+    if (
+        release_delivery.get("sha256") != skill_delivery_digest
+        or sha256_file(mcp_delivery_path) != skill_delivery_digest
+    ):
+        errors.append("Release delivery-contract copies or digest differ")
+    release_recipe = release_references.get("recipe_runtime_verification") if isinstance(
+        release_references.get("recipe_runtime_verification"), dict
+    ) else {}
+    expected_recipe_paths = {
+        "skill": "skill/main_skill/references/recipe-verification.json",
+        "mcp_main_executor": "mcp/main_executor/references/recipe-verification.json",
+    }
+    skill_recipe_digest = sha256_file(skill_main_root / "references" / "recipe-verification.json")
+    mcp_recipe_path = root / "mcp" / "main_executor" / "references" / "recipe-verification.json"
+    if (
+        any(release_recipe.get(key) != value for key, value in expected_recipe_paths.items())
+        or release_recipe.get("sha256") != skill_recipe_digest
+        or sha256_file(mcp_recipe_path) != skill_recipe_digest
+    ):
+        errors.append("Release recipe runtime verification copies or digest differ")
     if mcp.get("protocol") != "mcp" or mcp.get("transport") != "stdio":
         errors.append("MCP package does not declare standard stdio transport")
     if mcp.get("main_executor") != executor_name:
         errors.append("MCP package primary executor differs from the capability manifest")
     if mcp.get("stdout_contract") != "ascii_json_rpc":
         errors.append("MCP package does not declare an ASCII-safe stdout contract")
+    if mcp.get("delivery_contract") != "main_executor/references/delivery-contract.json":
+        errors.append("MCP descriptor does not wire the main executor delivery-contract")
+    mcp_references = mcp_manifest.get("reference_contracts") if isinstance(mcp_manifest.get("reference_contracts"), dict) else {}
+    if (
+        mcp_references.get("delivery_contract") != "main_executor/references/delivery-contract.json"
+        or mcp_references.get("delivery_contract_sha256") != skill_delivery_digest
+    ):
+        errors.append("MCP manifest delivery-contract reference or digest is invalid")
+    if (
+        mcp_references.get("recipe_runtime_verification") != "main_executor/references/recipe-verification.json"
+        or mcp_references.get("recipe_runtime_verification_sha256") != skill_recipe_digest
+    ):
+        errors.append("MCP manifest recipe runtime verification reference or digest is invalid")
     namespace = str(mcp.get("namespace", ""))
     tools = mcp.get("tools", [])
     if not namespace or not isinstance(tools, list) or not tools:
@@ -4023,14 +5335,31 @@ def validate_release_bundle(output_root: Path, executor_name: str) -> list[str]:
         errors.append("MCP server does not enforce an ASCII-safe wire format")
     expected_members = {
         "skill/system_prompt.md": root / "artifacts" / "skill.zip",
+        "skill/main_skill/SKILL.md": root / "artifacts" / "skill.zip",
+        "skill/main_skill/scripts/skill_executor.py": root / "artifacts" / "skill.zip",
+        "skill/main_skill/scripts/compatibility_runtime.py": root / "artifacts" / "skill.zip",
         "skill/main_skill/scripts/execute_scenario.py": root / "artifacts" / "skill.zip",
         "skill/main_skill/scripts/recipe_runtime.py": root / "artifacts" / "skill.zip",
+        "skill/main_skill/requirements.txt": root / "artifacts" / "skill.zip",
+        "skill/main_skill/domain_knowledge.json": root / "artifacts" / "skill.zip",
+        "skill/main_skill/output_specs.json": root / "artifacts" / "skill.zip",
+        "skill/main_skill/dispatch_config.json": root / "artifacts" / "skill.zip",
         "skill/main_skill/references/compiled-recipes.json": root / "artifacts" / "skill.zip",
+        "skill/main_skill/references/recipe-verification.json": root / "artifacts" / "skill.zip",
+        "skill/main_skill/references/delivery-contract.json": root / "artifacts" / "skill.zip",
         "mcp/run_mcp.py": root / "artifacts" / "mcp-stdio.zip",
         "mcp/mcp_server.py": root / "artifacts" / "mcp-stdio.zip",
         "mcp/mcp.json": root / "artifacts" / "mcp-stdio.zip",
+        "mcp/manifest.json": root / "artifacts" / "mcp-stdio.zip",
+        "mcp/main_skill/SKILL.md": root / "artifacts" / "mcp-stdio.zip",
         "mcp/main_skill/scripts/skill_executor.py": root / "artifacts" / "mcp-stdio.zip",
+        "mcp/main_skill/scripts/compatibility_runtime.py": root / "artifacts" / "mcp-stdio.zip",
+        "mcp/main_skill/references/delivery-contract.json": root / "artifacts" / "mcp-stdio.zip",
         "mcp/main_executor/scripts/recipe_runtime.py": root / "artifacts" / "mcp-stdio.zip",
+        "mcp/main_executor/requirements.txt": root / "artifacts" / "mcp-stdio.zip",
+        "mcp/requirements.txt": root / "artifacts" / "mcp-stdio.zip",
+        "mcp/main_executor/references/recipe-verification.json": root / "artifacts" / "mcp-stdio.zip",
+        "mcp/main_executor/references/delivery-contract.json": root / "artifacts" / "mcp-stdio.zip",
     }
     archive_names: dict[Path, set[str]] = {}
     for archive in set(expected_members.values()):
@@ -4042,6 +5371,17 @@ def validate_release_bundle(output_root: Path, executor_name: str) -> list[str]:
     for member, archive in expected_members.items():
         if member not in archive_names.get(archive, set()):
             errors.append(f"Release archive {archive.name} is missing {member}")
+    artifact_digests = release.get("artifact_digests") if isinstance(release.get("artifact_digests"), dict) else {}
+    if artifact_digests.get("skill_zip") != sha256_file(root / "artifacts" / "skill.zip"):
+        errors.append("Release manifest skill archive digest differs from the archive")
+    if artifact_digests.get("mcp_stdio_zip") != sha256_file(root / "artifacts" / "mcp-stdio.zip"):
+        errors.append("Release manifest MCP archive digest differs from the archive")
+    errors.extend(
+        archive_source_digest_errors(root / "artifacts" / "skill.zip", root / "skill", "skill")
+    )
+    errors.extend(
+        archive_source_digest_errors(root / "artifacts" / "mcp-stdio.zip", root / "mcp", "mcp")
+    )
     return errors
 
 
@@ -4324,8 +5664,123 @@ def portable_operational_contract(claims: dict[str, Any]) -> dict[str, Any]:
     return portable
 
 
+def portable_delivery_contract(
+    claims: dict[str, Any], flow_contract: dict[str, Any], operational: dict[str, Any],
+) -> dict[str, Any]:
+    """Describe the single-request transaction that a third-party Agent must complete.
+
+    The capability model already carries stages and data-access facts, but it
+    did not give an external host one compact answer to three practical
+    questions: what can be supplied at runtime, what evidence comes back from
+    the first call, and what a finished business response must contain.  Keep
+    this contract data-only and domain-neutral so it is valid for a tabular,
+    document, OCR, or mixed scenario without embedding an example scenario.
+    """
+
+    sources = [item for item in operational.get("sources", []) if isinstance(item, dict)]
+    runtime_sources = [
+        item for item in sources
+        if item.get("runtime_required") is True and str(item.get("source_id", ""))
+    ]
+    sources_by_kind: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for source in runtime_sources:
+        kind = str(source.get("kind", "document") or "document")
+        sources_by_kind[kind].append(source)
+
+    input_modes = []
+    for kind, items in sorted(sources_by_kind.items()):
+        source_ids = [str(item.get("source_id", "")) for item in items]
+        extensions = sorted({
+            str(item.get("extension") or extension_for(str(item.get("path", ""))))
+            for item in items
+            if str(item.get("extension") or extension_for(str(item.get("path", ""))))
+        })
+        if kind == "tabular":
+            access = "bounded_read_only_sql_and_validated_links"
+            evidence = "rows_with_query_digest_and_join_validation"
+        else:
+            access = "parse_or_ocr_then_provenance_chunk_search"
+            evidence = "chunks_with_source_digest_locator_chunk_id_and_text_digest"
+        input_modes.append({
+            "kind": kind,
+            "source_ids": source_ids,
+            "extensions": extensions,
+            "runtime_binding": "--bind <source-id>=<relative-runtime-file>",
+            "access": access,
+            "evidence": evidence,
+        })
+
+    declared_output = flow_contract.get("output_contract")
+    if not isinstance(declared_output, dict):
+        declared_output = {}
+    required_fields = list(dict.fromkeys([
+        *[
+            str(value) for value in declared_output.get("required_result_fields", [])
+            if str(value)
+        ],
+        "business_conclusion",
+        "decision_reason",
+        "scope_or_measure",
+        "rule_provenance",
+        "data_provenance",
+        "coverage",
+        "uncertainties",
+    ]))
+    return {
+        "schema_version": 1,
+        "contract_kind": "portable_business_request_transaction",
+        "scenario": claims.get("scenario", flow_contract.get("scenario", {})),
+        "entrypoint": {
+            "command": "execute",
+            "policy": "one_primary_execution_per_new_complete_business_request",
+            "successor_policy": "read_agent_handoff_once_then_deliver_or_report_the_named_blocker",
+            "follow_up_policy": "reuse_result_handle_with_continue_when_the_result_is_complete",
+            "host_response_policy": "preserve_structured_transaction_fields_instead_of_converting_to_a_generic_row_count_message",
+            "required_host_response_fields": [
+                "status", "selected_rule", "candidate_evidence", "deterministic_result",
+                "agent_handoff", "next_step", "artifact",
+            ],
+        },
+        "runtime_input_contract": {
+            "modes": input_modes,
+            "design_time_templates": "schema_metadata_only_not_runtime_inputs",
+            "schema_compatibility": "validate_only_sources_referenced_by_the_current_transaction",
+        },
+        "evidence_contract": {
+            "structured": "bounded_rows_with_source_and_query_provenance",
+            "unstructured": "parsed_or_ocr_text_chunks_with_source_digest_locator_chunk_id_and_text_digest",
+            "merge_policy": "merge_structured_and_unstructured_evidence_only_when_an_accepted_business_key_or_explicit_link_exists",
+            "raw_content_policy": "do_not_place_full_large_tables_or_full_documents_in_agent_context",
+        },
+        "delivery_contract": {
+            "required_fields": required_fields,
+            "response_order": [
+                "business_conclusion",
+                "decision_reason",
+                "scope_or_measure",
+                "rule_provenance",
+                "data_provenance",
+                "coverage",
+                "uncertainties",
+            ],
+            "declared_output_templates": declared_output.get("templates", []),
+            "full_result_policy": "export_only_when_explicitly_requested_and_return_the_artifact_reference_not_all_rows",
+        },
+        "terminal_statuses": {
+            "completed_deterministically": "deliver_deterministic_result_without_requery",
+            "ready_for_agent_judgment": "apply_the_accepted_flow_to_the_handoff_evidence_once_then_fill_delivery_contract",
+            "blocked_rule_not_found": "request_the_missing_or_disambiguating_rule_information",
+            "blocked_rule_selection_required": "ask_the_user_to_select_or_narrow_the_complete_governing_record",
+            "blocked_missing_or_incompatible_sources": "report_the_named_source_or_schema_gap",
+            "blocked_ocr_required": "run_the_declared_ocr_capability_once_and_rebind_its_json_output",
+            "blocked_uncompiled_rule_family": "report_that_no_reviewed_deterministic_recipe_covers_the_selected_rule_family",
+        },
+    }
+
+
 def render_agent_prompts(
-    claims: dict[str, Any], flow: dict[str, Any], operational: dict[str, Any], skills: list[dict[str, Any]]
+    claims: dict[str, Any], flow: dict[str, Any], operational: dict[str, Any], skills: list[dict[str, Any]],
+    delivery_contract: dict[str, Any],
 ) -> str:
     scenario = claims.get("scenario", {})
     orchestrator = claims["orchestrator"]
@@ -4366,54 +5821,47 @@ def render_agent_prompts(
         f"- {item.get('question', '')}（影响：{item.get('impact', '')}）"
         for item in flow.get("open_questions", []) if isinstance(item, dict)
     ] or ["- 当前没有已声明的开放问题；运行时发现契约缺口仍须停止并说明。"]
-    if "document" in foundation_kinds:
-        document_step = (
-            "TXT、Markdown、Word、可搜索 PDF 先由文档基础 Skill 建分块索引再检索；"
-            + (
-                "图片和扫描 PDF 先由 OCR Skill 使用 `--output` 落结构化 JSON，再由文档 Skill `index-ocr` 建索引。"
-                if "ocr" in foundation_kinds
-                else "当前包未包含 OCR；遇到图片或扫描 PDF 时停止并要求重新发现、蒸馏或安装已声明的 OCR 能力。"
-            )
-        )
-        provenance_step = "非结构化命中必须携带原始 source_digest、页码/段落/幻灯片/行号（若解析器可提供）、chunk_id 和 text_digest。OCR 若缺页块、坐标或置信度元数据，必须明确标记这一不确定性。语义相似只能用于寻找证据；没有明确业务主键时，不能把文档命中强行归到某条结构化记录。"
-    else:
-        document_step = "当前数据契约没有 TXT、Markdown、Word、PDF 或图片来源，也没有安装文档/OCR 基础 Skill。运行时若出现这些契约外格式，停止并要求从数据关系发现重新生成能力包；不得让 Agent 临时直接打开全文或假装已有解析能力。"
-        provenance_step = "不得把契约外文档的语义命中强行归到结构化记录；只有重新发现后生成了带 source_digest、locator、chunk_id 与 text_digest 的检索路径，才能把非结构化证据纳入判定。"
+    input_modes = delivery_contract.get("runtime_input_contract", {}).get("modes", [])
+    input_mode_lines = [
+        f"- `{item.get('kind', '')}`：来源 {format_list(item.get('source_ids', []))}；"
+        f"格式 {format_list(item.get('extensions', []), '由来源契约声明')}；"
+        f"访问 `{item.get('access', '')}`；证据 `{item.get('evidence', '')}`。"
+        for item in input_modes if isinstance(item, dict)
+    ] or ["- 当前没有已验收的运行时输入；只可报告该契约缺口。"]
+    delivery = delivery_contract.get("delivery_contract", {})
+    delivery_fields = format_list(delivery.get("required_fields", []), "业务结论、证据和不确定性")
     lines = [
         "## Third-party execution contract",
         "",
-        "For a complete business request, call the generated main executor exactly once first. Continue from its `execution_steps` and `next_step`; do not manually call stage skills in sequence.",
-        "A successful artifact is not a failure even when stdout is short. Read the `agent_handoff` file once, apply the selected complete rule to its `candidate_evidence.records`, and produce the declared result contract.",
-        "If `candidate_evidence.coverage.complete_for_all_matching_runtime_rows` is false, disclose the bounded preview and truncation in the result; never claim that the preview is exhaustive and never blind-retry the executor.",
+        "For each new complete business request, call the generated main executor exactly once first, with `--output`. Read its `agent_handoff` exactly once and follow `next_step`; do not manually fan out to stage skills, readers, join validators, or SQL tools.",
+        "A compact stdout response is successful when it contains an artifact handle. For `ready_for_agent_judgment`, use the handoff evidence for one business-evaluation pass and fill the delivery contract. For `completed_deterministically`, report the deterministic result without re-querying. If the user explicitly requests a file, request `delivery_output` only for a JSON/CSV/XLSX result after `recipe_execution.verified=true`; `--output` itself is always the audit evidence package.",
+        "Use another tool only when `next_step` names a concrete missing field, relationship, or OCR recovery. Never blind-retry the same executor request. If coverage is bounded, disclose the limit and never call the preview exhaustive.",
         f"# {scenario.get('name', '')} Agent 系统提示词", "",
         f"你是“{scenario.get('name', '')}”业务 Agent。你的目标是：{scenario.get('purpose', flow.get('scenario', {}).get('business_outcome', '完成场景业务目标'))}。",
-        "你只负责理解用户意图、选择业务阶段、根据完整业务证据推理并组织结果。文件解析、OCR、索引、大表扫描和 SQL 执行必须交给已安装 Skill，禁止把原始大文件或整篇文档直接读入上下文。", "",
-        "禁止临时创建 Python、SQL 执行器、HTTP 客户端或文件解析脚本。每个已安装 Skill 都提供 `scripts/` CLI；完整请求先调用主执行 Skill，只有降级或单阶段请求才启动总控状态机和阶段运行器。", "",
+        "你只负责理解用户意图、依据主执行器返回的完整规则/有界证据进行一次业务判断，并按交付契约组织结果。文件解析、OCR、索引、大表扫描、连接验证和 SQL 执行必须交给已安装 Skill；禁止把原始大文件或整篇文档直接读入上下文。", "",
+        "禁止临时创建 Python、SQL 执行器、HTTP 客户端或文件解析脚本。完整请求优先走主执行器的单事务入口；总控与阶段 Skill 仅用于主执行器明确降级、用户明确只要求单阶段，或修复已命名的证据缺口。", "",
         "## 已安装能力", "",
         *[
-            f"- **首选端到端入口**：`{item.get('name', '')}`。完整业务请求必须先调用其 `execute`；一次返回规则、运行时数据、关联校验和证据包。"
+            f"- **首选端到端入口**：`{item.get('name', '')}`。完整业务请求必须先调用其 `execute`；一次返回规则、结构化/非结构化证据、关联校验（适用时）和交付 handoff。"
             for item in main_executors
         ],
         f"- 场景总控：`{orchestrator.get('skill_name', '')}`。仅在主执行器阻塞、用户明确指定阶段或需要降级调试时调用。",
         *stage_lines,
         *foundation_lines,
         "", "## 数据来源契约", "", *source_lines,
-        "", "所有基础 Skill 都携带 `references/operational-data-contract.json`。运行时由调用方提供 `<data-root>`；文件名变化时只能用基础 Skill 的 `--bind <source-id>=<relative-path>` 显式绑定，不得猜测路径。`design_time_template` 只提供输出字段/类型/格式约束，缺少其历史原文件不是运行阻塞。", "",
-        "## 强制执行顺序", "",
-        "1. 完整业务请求优先调用主执行 Skill 的 `execute`，不要先逐个读取或调用阶段 Skill；仅在主执行器阻塞、用户明确指定阶段或需要降级调试时选择总控/阶段 Skill。",
-        "2. 若任务受结构化规则或政策约束，必须先取得完整适用记录。表格来源返回完整一行，文档来源先建索引并取得完整适用章节及定位；记录标识、选择字段、叙述字段及同一行其他字段均保留。零命中时报告缺失；多条命中时先按用户条件缩小，仍有实质不同候选则列出记录标识并请求选择，禁止拼接成一条。不得只摘一句或一个命中片段。",
-        "3. 根据用户需求和完整规则行，结合 operational-data-contract 的 trace_evidence 蓝图选择已验证的来源角色、投影字段和连接路径，再推导本次过滤条件、分组、比较逻辑、结果字段及非结构化检索词。蓝图只证明设计期真实实例能够贯通；运行时必须用当前数据重新验证键值、基数和规则适用性。历史结果只保留模板结构和可选脱敏示例，其原文件不是运行输入，也不能成为规则。",
-        "4. 对每条结构化关联先运行 `validate-join`。单键出现无法解释的多对多时，只能按 operational-data-contract 中已有的 `candidate_key_sets` 继续验证复合键；查询时用 `<link-id>@<key-set-index>` 绑定已通过的键组。连接为零、未匹配异常或所有候选仍放大时停止并报告，禁止猜测替代键。",
-        "5. 大型 Excel/CSV/Parquet 等只能通过契约化只读 SQL 访问。只预检和注册当前规则/SQL 引用的 runtime_input；运行数据按字段兼容性校验，不要求与蒸馏样本的大小或内容摘要相同。预览和核验使用 `query-contract`；用户要求全部结果时使用 `export-contract` 写 CSV/Parquet，并只把行数、查询摘要和文件摘要返回上下文。Agent 不得直接打开、全量 sample 或把全部记录放入上下文。",
-        f"6. {document_step}",
-        f"7. {provenance_step}",
-        "8. 若已安装 knowledge 基础 Skill，只有相关流程节点或完整规则明确需要外部知识时才调用 `scenario_kb.py`；由 Agent 根据完整规则决定检索内容。规则声明为必需时使用 `--required`，知识库、爬虫或其他已声明外部能力全部不可用/零命中则必须返回 `manual_intervention_required` 并要求人工处理；不得凭空补齐。知识切片必须带来源，不能替代规则和业务事实。",
-        "9. 仅在主执行器要求降级或用户明确指定阶段时，用阶段 Skill 的 `run_stage.py start/finish` 生成工作单和交接文件，并由总控 Skill 的 `orchestrate.py` 记录顺序；正常端到端请求不要手工推进状态机。",
-        "10. 输出前对照规则完整行、SQL 谓词、连接校验、结果字段和证据定位。若输入或证据不足，明确说明缺口，不补造事实。", "",
+        "", "所有基础 Skill 都携带 `references/operational-data-contract.json`；主执行器另携带 `references/delivery-contract.json`。运行时由调用方提供 `<data-root>`；文件名变化时只能用 `--bind <source-id>=<relative-path>` 显式绑定。`design_time_template` 只提供输出字段/类型/格式约束，缺少其历史原文件不是运行阻塞。", "",
+        "## 本次事务可接受的输入", "", *input_mode_lines,
+        "", "## 单事务执行顺序", "",
+        "1. 对新的完整业务请求：调用主执行器 `execute --request ... --data-root ... --output ...` 一次。不要先执行 `describe`、规则搜索、文档索引、`validate-join`、`query`、总控或阶段 Skill。",
+        "2. 读取生成的 `agent_handoff` 一次，并按 `status` 行动：`completed_deterministically` 直接交付 `deterministic_result`；`ready_for_agent_judgment` 仅基于 handoff 的完整规则与证据执行一次业务判断；`blocked_rule_not_found` / `blocked_rule_selection_required` / `blocked_missing_or_incompatible_sources` 只报告具名缺口或向用户索取消歧条件。",
+        "3. `blocked_ocr_required` 是唯一的文档恢复路径：调用已声明 OCR Skill 一次生成 JSON，将 JSON 绑定到同一 source_id，再作为新的恢复事务调用主执行器一次。未命中、歧义、缺字段或连接异常不是重试理由。",
+        "4. 只有 `next_step.query_allowed_only_if` 指出具体缺失字段或关系时，才做一次有界补充查询；查询必须使用已声明的来源、键组和只读入口。用户明确要求结果文件时，只有已验证的确定性结果可用 `delivery_output` 生成 JSON/CSV/XLSX；模板列必须由 recipe 直接提供。任何待 Agent 判断、OCR 阻塞或未验证结果只交付证据/阻塞说明，不能伪造结果文件。",
+        "5. 非结构化证据必须保留 source_digest、locator、chunk_id 和 text_digest；没有已验收业务键或显式关系时，不得与结构化记录强行合并。外部知识仅在完整规则或流程明确要求时调用，服务不可用/零命中时返回 `manual_intervention_required`。", "",
         "## 输出要求", "",
-        "- 先回答业务结论或交付物，再说明所用规则、数据范围和关键证据。",
-        "- 每条判定应能追溯到规则行、结构化来源/查询与文档/OCR 定位（若使用）。",
-        "- 明确列出未匹配、截断、OCR 不确定、连接放大和待确认边界。",
+        f"- 必填交付字段：{delivery_fields}。先给业务结论或明确阻塞原因，再给理由、范围、规则/数据证据、覆盖范围和不确定性。",
+        "- 每条判定应能追溯到规则完整行或文档章节、结构化来源/查询与文档/OCR 定位（适用时）。",
+        "- 明确列出未匹配、截断、OCR 不确定、连接放大、待确认项和未覆盖范围。",
+        "- `--output` 是审计证据包；JSON/CSV/XLSX 结果文件仅从 `completed_deterministically` 且 `recipe_execution.verified=true` 的输出物化。XLSX 仅写入一个无公式的数据工作表，列必须由 recipe 直接提供；历史 DOCX/PDF 模板在没有专用渲染器和已验证字段映射时仅是格式契约，不能假称已生成。",
         "- 除非用户明确要求，不展示大段原文、全量数据或内部执行日志。", "",
         "## 已知待确认边界", "", *open_questions,
         "", "不得声称本提示词或 Skills 能消除现实数据中的全部不确定性；质量门禁失败时，正确行为是阻断并给出可修复的证据缺口。", "",
@@ -4441,6 +5889,35 @@ def python_dependencies(skill_root: Path) -> list[str]:
         for line in requirements.read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     })
+
+
+def merge_requirement_files(target: Path, *sources: Path) -> None:
+    """Merge portable runtime requirements without making a sibling Skill a dependency.
+
+    The primary executor is intentionally installable by itself.  A generated
+    package may route a single request through both its table and document
+    adapters, so copying one template's requirements over the other would make
+    a hybrid package pass generation but fail only after installation.  Keep
+    the file deterministic and retain comments only from neither source: the
+    manifest uses the normalized dependency set as its portable contract.
+    """
+
+    lines: set[str] = set()
+    if target.is_file():
+        lines.update(
+            line.strip()
+            for line in target.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+    for source in sources:
+        if not source.is_file():
+            raise ContractError(f"Missing portable runtime requirements: {source}")
+        lines.update(
+            line.strip()
+            for line in source.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+    atomic_text(target, "\n".join(sorted(lines)) + ("\n" if lines else ""))
 
 
 def validate_generated_skills(skills_root: Path) -> list[str]:
@@ -4479,12 +5956,31 @@ def validate_generated_skills(skills_root: Path) -> list[str]:
                 flow_contract = load_json(
                     skill_dir / "references" / "flow-contract.json", MAX_CANDIDATE_BYTES
                 )
+                delivery_contract = load_json(
+                    skill_dir / "references" / "delivery-contract.json", MAX_CANDIDATE_BYTES
+                )
+                recipe_catalog_path = skill_dir / "references" / "compiled-recipes.json"
+                recipe_runtime_verification = load_json(
+                    skill_dir / "references" / "recipe-verification.json", MAX_CANDIDATE_BYTES
+                )
                 if contract.get("status") != "ready":
                     errors.append(f"{skill_dir.name}/references/operational-data-contract.json is not ready")
                 if not str(flow_contract.get("execution_mode", "")).strip():
                     errors.append(f"{skill_dir.name}/references/flow-contract.json is missing execution_mode")
                 if not isinstance(flow_contract.get("main_flow"), list):
                     errors.append(f"{skill_dir.name}/references/flow-contract.json is missing main_flow")
+                if (
+                    delivery_contract.get("contract_kind") != "portable_business_request_transaction"
+                    or delivery_contract.get("entrypoint", {}).get("command") != "execute"
+                    or not isinstance(delivery_contract.get("delivery_contract", {}).get("required_fields"), list)
+                ):
+                    errors.append(f"{skill_dir.name}/references/delivery-contract.json is invalid")
+                if (
+                    recipe_runtime_verification.get("kind") != "portable_recipe_runtime_verification"
+                    or recipe_runtime_verification.get("recipe_catalog_fingerprint") != sha256_file(recipe_catalog_path)
+                    or not isinstance(recipe_runtime_verification.get("verified_recipe_ids"), list)
+                ):
+                    errors.append(f"{skill_dir.name}/references/recipe-verification.json is invalid or unbound")
             except ContractError as exc:
                 errors.append(str(exc))
         elif stage_entrypoint.is_file():
@@ -4631,42 +6127,45 @@ def generate_bundle(
     skill_manifest: list[dict[str, Any]] = []
     operational = portable_operational_contract(claims)
     flow_contract = portable_flow_contract(claims, flow, operational)
+    delivery_contract = portable_delivery_contract(claims, flow_contract, operational)
     recipe_catalog = compiled_recipe_catalog(output_root, operational)
-    recipe_verification = recipe_coverage_status(flow, operational, recipe_catalog)
-    if recipe_verification.get("publishable") is not True:
-        uncovered = ", ".join(map(str, recipe_verification.get("uncovered_source_ids", [])))
-        raise ContractError(
-            "compiled-recipes.json 未覆盖已声明的知识判定源"
-            + (f"：{uncovered}" if uncovered else "")
-        )
+    refresh_recipe_replay_contract(output_root, flow, operational)
     executor_name = scenario_executor_skill_name(str(claims["bundle"]["name"]))
     if executor_name in {str(item["skill_name"]) for item in [*claims["foundation_skills"], *claims["stage_skills"]]}:
         raise ContractError(f"生成的主执行 Skill 名称冲突：{executor_name}")
 
     executor_root = staging / executor_name
     copy_template("portable-scenario-executor", executor_root)
-    # Keep the bounded contract reader beside the primary entrypoint. This
-    # makes the primary Skill usable when a third-party platform installs only
-    # one Skill directory instead of exposing sibling Skill paths.
-    reader_template = (
-        Path(__file__).resolve().parents[1]
-        / "assets" / "portable-tabular-reader" / "scripts" / "query_tabular.py"
-    )
-    shutil.copy2(reader_template, executor_root / "scripts" / "query_tabular.py")
-    if any(item.get("kind") == "tabular" for item in claims.get("foundation_skills", [])):
-        shutil.copy2(
-            reader_template.parent.parent / "requirements.txt",
-            executor_root / "requirements.txt",
-        )
+    install_primary_executor_runtimes(executor_root, claims, operational)
     atomic_json(executor_root / "references" / "operational-data-contract.json", operational)
     atomic_json(executor_root / "references" / "flow-contract.json", flow_contract)
+    atomic_json(executor_root / "references" / "delivery-contract.json", delivery_contract)
     execution_plan = flow_contract.get("execution_plan", {})
     atomic_json(
         executor_root / "references" / "capability-model.json",
         execution_plan.get("capability_model", {}),
     )
     atomic_json(executor_root / "references" / "execution-plan.json", execution_plan)
-    atomic_json(executor_root / "references" / "compiled-recipes.json", recipe_catalog)
+    copy_compiled_recipe_catalog(
+        output_root, executor_root / "references" / "compiled-recipes.json", recipe_catalog,
+    )
+    replay_runtime_artifacts = {
+        "catalog": executor_root / "references" / "compiled-recipes.json",
+        "executor": executor_root / "scripts" / "execute_scenario.py",
+        "runtime_contract": executor_root / "references" / "operational-data-contract.json",
+        "flow_contract": executor_root / "references" / "flow-contract.json",
+    }
+    recipe_verification = compiled_recipe_verification(
+        output_root, flow, operational, replay_runtime_artifacts,
+    )
+    recipe_runtime_verification = portable_recipe_verification_contract(
+        executor_root / "references" / "compiled-recipes.json",
+        recipe_catalog,
+        recipe_verification,
+    )
+    atomic_json(
+        executor_root / "references" / "recipe-verification.json", recipe_runtime_verification
+    )
     atomic_json(
         executor_root / "references" / "dispatch-config.json",
         execution_plan.get("dispatch_config", {}),
@@ -4700,8 +6199,10 @@ def generate_bundle(
         "execution_modes": ["describe", "search-rules", "produce", "execute", "query"],
         "reference_contracts": [
             "references/capability-model.json",
+            "references/delivery-contract.json",
             "references/execution-plan.json",
             "references/compiled-recipes.json",
+            "references/recipe-verification.json",
             "references/operational-data-contract.json",
             "references/flow-contract.json",
         ],
@@ -4813,7 +6314,10 @@ def generate_bundle(
     for item in skill_manifest:
         item["digest"] = tree_digest(target / item["name"])
     agent_prompt_path = output_root / "agent_prompts.md"
-    atomic_text(agent_prompt_path, render_agent_prompts(claims, flow, operational, skill_manifest))
+    atomic_text(
+        agent_prompt_path,
+        render_agent_prompts(claims, flow, operational, skill_manifest, delivery_contract),
+    )
     agent_prompt_digest = sha256_file(agent_prompt_path)
     release = build_release_bundle(claims, output_root, target, executor_name, skill_manifest)
     release_errors = validate_release_bundle(output_root, executor_name)
@@ -4906,6 +6410,8 @@ def generate_bundle(
             "plan": "capability-plan.json",
             "agent_prompts": "agent_prompts.md",
             "capability_model": f"skills/{executor_name}/references/capability-model.json",
+            "delivery_contract": f"skills/{executor_name}/references/delivery-contract.json",
+            "recipe_runtime_verification": f"skills/{executor_name}/references/recipe-verification.json",
             "release": "release/release.json",
             "skill_archive": "release/artifacts/skill.zip",
             "mcp_stdio_archive": "release/artifacts/mcp-stdio.zip",
@@ -4918,6 +6424,12 @@ def generate_bundle(
             "portable_operational_contract": hashlib.sha256(
                 (json.dumps(operational, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
             ).hexdigest(),
+            "delivery_contract": hashlib.sha256(
+                (json.dumps(delivery_contract, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+            ).hexdigest(),
+            "recipe_runtime_verification": sha256_file(
+                target / executor_name / "references" / "recipe-verification.json"
+            ),
         },
     }
     return manifest
@@ -4996,6 +6508,22 @@ def compact_summary(manifest: dict[str, Any], offset: int, limit: int) -> dict[s
     }
 
 
+def human_package_publication_is_approved(publication: dict[str, Any]) -> bool:
+    """Return whether the platform approved a distributable capability package.
+
+    ``verification`` is deliberately not part of this check: it controls
+    whether a compiled recipe may return a deterministic business conclusion.
+    An evidence-only capability remains safe to review and publish because its
+    executor keeps unverified recipes on the human-judgment path.
+    """
+
+    return (
+        publication.get("verifiable") is True
+        and publication.get("status") == "approved"
+        and publication.get("publishable") is True
+    )
+
+
 def finalize(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     (
         output_root, relation_path, flow_path, relations, flow, relation_fingerprint,
@@ -5061,13 +6589,8 @@ def summary(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         raise ContractError("能力蒸馏输出目录存在 validation-errors.json；不得交付旧的 complete 能力包")
     if manifest.get("generator_contract_version") != GENERATOR_CONTRACT_VERSION:
         raise ContractError("能力蒸馏产物的生成器契约版本已过期；必须重新 prepare/finalize，禁止交付旧源码")
-    verification = manifest.get("verification") if isinstance(manifest.get("verification"), dict) else {}
     publication = manifest.get("publication") if isinstance(manifest.get("publication"), dict) else {}
-    if (
-        verification.get("verifiable") is not True
-        or publication.get("status") != "approved"
-        or publication.get("publishable") is not True
-    ):
+    if not human_package_publication_is_approved(publication):
         raise ContractError(
             "能力蒸馏产物尚未获得平台人工能力包审批；不得交付源码或发布能力包"
         )
@@ -5096,6 +6619,22 @@ def summary(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         generation_errors.append("缺少可复制的 agent_prompts.md")
     elif artifact_digests.get("agent_prompts") != sha256_file(prompt_path):
         generation_errors.append("agent_prompts.md 内容摘要已变化")
+    artifacts = manifest.get("artifacts") if isinstance(manifest.get("artifacts"), dict) else {}
+    delivery_relative = str(artifacts.get("delivery_contract", "")).strip()
+    delivery_path = Path(args.result).resolve().parent / delivery_relative if delivery_relative else None
+    if delivery_path is None or not delivery_path.is_file():
+        generation_errors.append("缺少主执行器 delivery-contract.json")
+    elif artifact_digests.get("delivery_contract") != sha256_file(delivery_path):
+        generation_errors.append("delivery-contract.json 内容摘要已变化")
+    recipe_verification_relative = str(artifacts.get("recipe_runtime_verification", "")).strip()
+    recipe_verification_path = (
+        Path(args.result).resolve().parent / recipe_verification_relative
+        if recipe_verification_relative else None
+    )
+    if recipe_verification_path is None or not recipe_verification_path.is_file():
+        generation_errors.append("缺少主执行器 recipe-verification.json")
+    elif artifact_digests.get("recipe_runtime_verification") != sha256_file(recipe_verification_path):
+        generation_errors.append("recipe-verification.json 内容摘要已变化")
     for item in manifest.get("skills", []):
         if not isinstance(item, dict):
             generation_errors.append("manifest.skills 包含非对象项")

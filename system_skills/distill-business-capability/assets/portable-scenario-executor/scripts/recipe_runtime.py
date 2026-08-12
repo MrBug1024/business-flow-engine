@@ -25,6 +25,7 @@ SUPPORTED_KINDS = {
     "grouped_cooccurrence_from_rule_text",
 }
 SUPPORTED_OPERATORS = {"contains", "equals"}
+RECIPE_VERIFICATION_SCHEMA_VERSION = 1
 
 
 def canonical_rule_fingerprint(row: dict[str, Any]) -> str:
@@ -53,6 +54,200 @@ def load_recipes(path: Path) -> list[dict[str, Any]]:
     if not isinstance(recipes, list):
         raise RecipeError("Compiled recipe catalog recipes must be a list")
     return [item for item in recipes if isinstance(item, dict)]
+
+
+def recipe_catalog_fingerprint(path: Path) -> str:
+    """Return the byte-level fingerprint used to bind replay evidence to a catalog.
+
+    A replay approval is meaningful only for the exact catalog that was
+    exercised.  Fingerprinting the original bytes (rather than a parsed JSON
+    projection) also catches an otherwise invisible change to a selector,
+    predicate, or output projection.
+    """
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise RecipeError(f"Could not fingerprint compiled recipe catalog: {exc}") from exc
+
+
+def _unverified_recipe_catalog_status(
+    status: str, reason: str, *, verification_path: Path | None = None,
+    verified_recipe_ids: Sequence[str] = (), catalog_fingerprint: str = "",
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "verified": False,
+        "certificate_validated": False,
+        "reason": reason,
+        "verification_path": str(verification_path) if verification_path is not None else "",
+        "catalog_fingerprint": catalog_fingerprint,
+        "verified_recipe_ids": sorted({str(item) for item in verified_recipe_ids if str(item)}),
+    }
+
+
+def inspect_recipe_verification(
+    verification_path: Path | None, catalog_path: Path, recipes: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Load a fail-closed replay-verification certificate for this catalog.
+
+    ``compiled-recipes.json`` says what *could* be executed.  It is not proof
+    that the generated predicates reproduce an approved business result.
+    Deterministic execution therefore needs a separately generated, catalog-
+    bound certificate with an explicit per-recipe allow-list.  Old packages
+    have no such file and deliberately remain on the evidence-handoff path.
+
+    This validates only package-local integrity and shape.  The distillation
+    runner is responsible for producing the certificate after real replay;
+    this runtime never upgrades a hand-written replay report by itself.
+    """
+    if not recipes:
+        try:
+            catalog_fingerprint = recipe_catalog_fingerprint(catalog_path)
+        except RecipeError:
+            # ``load_recipes`` intentionally treats a missing optional catalog
+            # as an empty one.  Preserve that backwards-compatible path for
+            # document-only and evidence-only packages.
+            catalog_fingerprint = ""
+        return {
+            "status": "not_required",
+            "verified": True,
+            "certificate_validated": True,
+            "reason": "No compiled deterministic recipe is declared.",
+            "verification_path": str(verification_path) if verification_path is not None else "",
+            "catalog_fingerprint": catalog_fingerprint,
+            "verified_recipe_ids": [],
+        }
+    if verification_path is None or not verification_path.is_file():
+        return _unverified_recipe_catalog_status(
+            "missing_recipe_verification",
+            "No catalog-bound real-replay verification certificate is present; compiled recipes may only provide evidence for human judgment.",
+            verification_path=verification_path,
+        )
+    try:
+        payload = json.loads(verification_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return _unverified_recipe_catalog_status(
+            "invalid_recipe_verification",
+            f"Recipe verification certificate cannot be read safely: {exc}",
+            verification_path=verification_path,
+        )
+    if not isinstance(payload, dict):
+        return _unverified_recipe_catalog_status(
+            "invalid_recipe_verification",
+            "Recipe verification certificate must be a JSON object.",
+            verification_path=verification_path,
+        )
+    catalog_fingerprint = recipe_catalog_fingerprint(catalog_path)
+    supplied_fingerprint = str(payload.get("recipe_catalog_fingerprint", ""))
+    verified_ids_raw = payload.get("verified_recipe_ids", [])
+    verified_ids = (
+        [str(item) for item in verified_ids_raw if isinstance(item, (str, int, float)) and str(item)]
+        if isinstance(verified_ids_raw, list) else []
+    )
+    if payload.get("schema_version") != RECIPE_VERIFICATION_SCHEMA_VERSION:
+        return _unverified_recipe_catalog_status(
+            "invalid_recipe_verification",
+            f"Recipe verification certificate schema_version must be {RECIPE_VERIFICATION_SCHEMA_VERSION}.",
+            verification_path=verification_path,
+            verified_recipe_ids=verified_ids,
+            catalog_fingerprint=catalog_fingerprint,
+        )
+    if supplied_fingerprint != catalog_fingerprint:
+        return _unverified_recipe_catalog_status(
+            "recipe_verification_catalog_mismatch",
+            "Recipe verification certificate belongs to a different compiled recipe catalog.",
+            verification_path=verification_path,
+            verified_recipe_ids=verified_ids,
+            catalog_fingerprint=catalog_fingerprint,
+        )
+    verified_claim = (
+        payload.get("status") == "verified"
+        and payload.get("verifiable") is True
+        and payload.get("publishable") is True
+    )
+    if not verified_claim:
+        return _unverified_recipe_catalog_status(
+            "unverified_recipe_catalog",
+            "The catalog has not been marked verified by the real replay runner.",
+            verification_path=verification_path,
+            verified_recipe_ids=verified_ids,
+            catalog_fingerprint=catalog_fingerprint,
+        )
+    declared_ids = {
+        str(recipe.get("id", "")) for recipe in recipes
+        if isinstance(recipe, dict) and str(recipe.get("id", ""))
+    }
+    unknown_ids = sorted(set(verified_ids) - declared_ids)
+    if unknown_ids:
+        return _unverified_recipe_catalog_status(
+            "invalid_recipe_verification",
+            "Recipe verification certificate names recipe id(s) absent from this catalog: " + ", ".join(unknown_ids),
+            verification_path=verification_path,
+            verified_recipe_ids=verified_ids,
+            catalog_fingerprint=catalog_fingerprint,
+        )
+    if not verified_ids:
+        return _unverified_recipe_catalog_status(
+            "unverified_recipe_catalog",
+            "The real replay runner did not explicitly verify any compiled recipe id.",
+            verification_path=verification_path,
+            verified_recipe_ids=verified_ids,
+            catalog_fingerprint=catalog_fingerprint,
+        )
+    return {
+        "status": "verified",
+        "verified": True,
+        "certificate_validated": True,
+        "reason": "Catalog-bound real replay verification is present for the listed recipe ids.",
+        "verification_path": str(verification_path),
+        "catalog_fingerprint": catalog_fingerprint,
+        "verified_recipe_ids": sorted(set(verified_ids)),
+    }
+
+
+def recipe_execution_gate(recipe: dict[str, Any], verification: dict[str, Any] | None) -> dict[str, Any]:
+    """Decide whether a selected compiled recipe may produce a final fact.
+
+    Fail closed for a missing, stale, malformed, or catalog-level-only
+    certificate.  The caller can still use its bounded evidence path; it just
+    must not label an un-replayed recipe result as deterministic.
+    """
+    recipe_id = str(recipe.get("id", ""))
+    status = verification if isinstance(verification, dict) else {}
+    verified_ids = {
+        str(item) for item in status.get("verified_recipe_ids", [])
+        if isinstance(item, (str, int, float)) and str(item)
+    }
+    if (
+        status.get("status") == "verified"
+        and status.get("verified") is True
+        and status.get("certificate_validated") is True
+        and recipe_id
+        and recipe_id in verified_ids
+    ):
+        return {
+            "status": "verified_recipe",
+            "verified": True,
+            "recipe_id": recipe_id,
+            "catalog_fingerprint": status.get("catalog_fingerprint", ""),
+            "verification_path": status.get("verification_path", ""),
+            "reason": "This recipe id is explicitly covered by catalog-bound real replay verification.",
+        }
+    if not recipe_id:
+        reason = "Compiled recipe has no stable id and cannot be matched to replay verification evidence."
+    elif recipe_id not in verified_ids:
+        reason = f"Compiled recipe {recipe_id} is not explicitly covered by real replay verification."
+    else:
+        reason = str(status.get("reason") or "Compiled recipe verification is unavailable.")
+    return {
+        "status": "unverified_recipe_evidence_only",
+        "verified": False,
+        "recipe_id": recipe_id,
+        "catalog_fingerprint": status.get("catalog_fingerprint", ""),
+        "verification_path": status.get("verification_path", ""),
+        "verification_status": status.get("status", "missing_recipe_verification"),
+        "reason": reason,
+    }
 
 
 def _selector_matches(selector: dict[str, Any], selected_rule: dict[str, Any]) -> bool:

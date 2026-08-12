@@ -7,7 +7,7 @@
 ~~~json
 {
   "schema_version": 1,
-  "generator_contract_version": 2,
+  "generator_contract_version": 3,
   "source": {
     "relations": {"capability": "discover-data-relations", "artifact": "...", "fingerprint": "..."},
     "flow": {"capability": "derive-business-flow", "artifact": "...", "fingerprint": "..."},

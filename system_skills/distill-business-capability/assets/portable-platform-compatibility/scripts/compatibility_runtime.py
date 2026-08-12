@@ -51,6 +51,76 @@ def request_text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _artifact_path(value: Any) -> str:
+    """Normalize executor artifact metadata for legacy package hosts.
+
+    The modern executor returns a provenance-bearing artifact object. Older
+    hosts expect ``artifact`` to be a string and otherwise raise while trying
+    to call ``Path(artifact)``. Keep the rich object under a separate field so
+    an updated host can pass the full transaction through unchanged.
+    """
+
+    if isinstance(value, dict):
+        return str(value.get("path", "")).strip()
+    return str(value or "").strip()
+
+
+def host_action_envelope(payload: dict[str, Any]) -> dict[str, Any]:
+    """Add a stable response bridge without losing the executor transaction.
+
+    ``scenario_execution`` is intentionally not a legacy tabular export: a
+    positive count means bounded evidence groups/chunks are available, not a
+    final business conclusion. The host must pass ``agent_handoff`` (or its
+    artifact) to the Agent before it delivers an answer. This bridge prevents
+    old hosts from crashing on an artifact dictionary while making that
+    requirement machine-readable for newer adapters.
+    """
+
+    evidence_artifact = payload.get("artifact")
+    handoff_artifact = payload.get("agent_handoff")
+    deterministic = payload.get("deterministic_result")
+    candidate = payload.get("candidate_evidence")
+    documents = payload.get("document_evidence")
+    row_count = 0
+    row_semantics = "no_materialized_business_rows"
+    if isinstance(deterministic, dict) and isinstance(deterministic.get("rows"), list):
+        row_count = len(deterministic["rows"])
+        row_semantics = "deterministic_business_result_rows"
+    elif isinstance(candidate, dict) and isinstance(candidate.get("records"), list):
+        row_count = len(candidate["records"])
+        row_semantics = "bounded_evidence_record_groups_not_final_business_rows"
+    elif isinstance(documents, dict):
+        sources = documents.get("sources") if isinstance(documents.get("sources"), list) else []
+        row_count = sum(
+            int(source.get("hit_count_returned", 0))
+            for source in sources if isinstance(source, dict)
+        )
+        if row_count:
+            row_semantics = "bounded_document_evidence_hits_not_final_business_rows"
+
+    result = dict(payload)
+    result.update({
+        "mode": "scenario_execution",
+        # Compatibility with hosts that expect a numeric result count and a
+        # string artifact path. Never erase the modern metadata below.
+        "rows": row_count,
+        "row_semantics": row_semantics,
+        "artifact": _artifact_path(evidence_artifact),
+        "evidence_artifact": evidence_artifact,
+        "agent_handoff_artifact": handoff_artifact,
+        "host_response_contract": {
+            "kind": "portable_business_request_transaction_result",
+            "status": result.get("status", ""),
+            "normal_next_action": "read_agent_handoff_then_deliver_once",
+            "agent_handoff_path": _artifact_path(handoff_artifact),
+            "evidence_artifact_path": _artifact_path(evidence_artifact),
+            "requires_structured_passthrough": True,
+            "legacy_row_semantics": row_semantics,
+        },
+    })
+    return result
+
+
 def search(keyword: str, limit: int, data_dir: str) -> list[dict[str, Any]]:
     module = executor()
     terms = module.unique_terms(keyword)
@@ -234,4 +304,4 @@ def produce(
         "next_step as one execution transaction. Do not restart rule search unless "
         "next_step explicitly reports a concrete missing input.",
     )
-    return payload
+    return host_action_envelope(payload)

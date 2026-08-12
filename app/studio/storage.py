@@ -3197,10 +3197,15 @@ class StudioStore:
         manifest_path = paths["capability_manifest"]
         manifest = _load_json_artifact(manifest_path, CAPABILITY_MANIFEST_RELATIVE)
         publication = manifest.get("publication") if isinstance(manifest.get("publication"), dict) else {}
-        verification = manifest.get("verification") if isinstance(manifest.get("verification"), dict) else {}
         if (
             manifest.get("status") != "complete"
-            or verification.get("verifiable") is not True
+            # ``verification`` governs whether a compiled recipe may produce
+            # a deterministic business conclusion.  It is intentionally
+            # allowed to be unverified for an evidence-only capability: the
+            # portable executor will then stay on the human-judgment path.
+            # Package publication is a separate, human-controlled axis and
+            # must use the generator's explicit publication candidate flag.
+            or publication.get("verifiable") is not True
             or publication.get("status") != "pending_human_platform_package_approval"
             or publication.get("publishable") is not False
         ):
@@ -3456,6 +3461,29 @@ class StudioStore:
         if not artifact.is_file():
             return contract
         contract["fingerprint"] = _sha256_file(artifact)
+        if phase == "package":
+            # The final review action must be offered only for the same
+            # candidate the approval endpoint can publish.  Checking only
+            # that skill.zip exists used to create an approval question for
+            # evidence-only packages and then reject it at submission time.
+            try:
+                self._capability_package_candidate(
+                    record,
+                    skill_archive_fingerprint=contract["fingerprint"],
+                )
+            except ValueError as exc:
+                contract.update({
+                    "status": "not_current_package_review_candidate",
+                    "reviewable": False,
+                    "detail": str(exc),
+                })
+            else:
+                contract.update({
+                    "status": "pending_human_platform_package_approval",
+                    "reviewable": True,
+                    "detail": "Canonical package candidate is ready for human platform review.",
+                })
+            return contract
         if allowed_statuses is None:
             contract.update({
                 "status": "available",

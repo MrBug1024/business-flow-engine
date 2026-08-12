@@ -26,6 +26,7 @@ metadata:
       - outputs/capability-distillation/capability-map.mmd
       - outputs/capability-distillation/distillation-report.md
       - outputs/capability-distillation/agent_prompts.md
+      - outputs/capability-distillation/recipe-replay-runtime.json
     forbidden_artifacts:
       - outputs/capability-distillation/validation-errors.json
     status_checks:
@@ -34,7 +35,7 @@ metadata:
         allowed: [complete]
       - artifact: outputs/capability-distillation/capability-manifest.json
         field: generator_contract_version
-        allowed: [2]
+        allowed: [3]
     fingerprints:
       - artifact: outputs/capability-distillation/capability-manifest.json
         field: source.relation_fingerprint
@@ -78,6 +79,7 @@ metadata:
 - 表格基础 Skill 必须使用只读 DuckDB 路径、有界预览和大文件策略；全量结果只能由 `export-contract` 写入调用方指定的 CSV/Parquet，不能塞入 Agent 上下文。
 - 表格基础 Skill 必须携带上游 `operational-data-contract.json` 的可移植副本，支持完整规则行检索、来源摘要预检、跨来源只读 SQL，以及单键/复合键的空值、未匹配、基数和放大校验；SQL 必须绑定并实际使用通过校验的键组，不得自行猜表头或连接键。
 - 可移植契约必须保留 `trace_evidence` 的来源角色、投影字段和键组蓝图，但移除设计期具体行值；第三方 Agent 以蓝图选路，并在当前批次重新验证规则、键值、基数和连接放大。
+- 任何可确定性执行的 `compiled-recipes.json` 都必须有同版本、真实执行得到的 `recipe-replay-report.json`：它必须绑定当前配方、执行器依赖闭包、运行时契约和已批准 trace review，对每个配方/追踪用例比较结果锚点数与规范化结果摘要。私有 `compiled_recipe_replay_cases` 夹具保存请求和已批准 oracle，绝不进入能力包；平台须分别签发该夹具和生成后报告的 HMAC receipt。仅有 `historical_replay_assertions` 的字符串状态不构成回放；缺任一 receipt、零行或摘要不一致时，包只能作为 `unverified` 的证据型候选生成，运行时不得执行该 recipe、不得给出确定性结论或物化最终结果文件。平台可在人工审批后发布此类证据型包，但不得将其标记为已验证的确定性能力。
 - 可移植契约必须把来源分为 `runtime_input`、`design_time_template`、`design_time_evidence`，把外部知识声明为 `optional_enrichment`。历史结果模板只保留结构元数据和可选脱敏示例，缺失原文件不得阻塞查询；所有格式均适用这一规则。
 - 表格运行器只注册当前规则、阶段或 SQL 实际引用的 `runtime_input`，支持 `--bind <source-id>=<relative-path>` 绑定新批次文件，并校验字段兼容而不是历史大小/内容摘要。未引用的运行源或任何设计期模板缺失不得阻塞当前查询。
 - TXT、Markdown、Word、可搜索 PDF 等必须先分块建索引再有界检索；图片和扫描 PDF 先 OCR 到 JSON，再进入同一证据索引。命中必须保留来源摘要、页码/段落/行号、chunk id 和文本摘要。
@@ -115,6 +117,8 @@ python /skills/distill-business-capability/scripts/distill_capabilities.py prepa
 结果为 `blocked_missing_or_invalid_upstream` 时，报告需要修复的上游并停止。本 Skill 不代办关系发现或流程推导。
 
 结果为 `ready_for_distillation` 时，直接使用返回的有界 `distillation_brief`。它已包含流程节点、控制、待确认项、文件格式、文件角色和应生成的基础能力。
+
+`prepare` 同时生成 `recipe-replay-contract.json`；成功 `preflight` 还会生成不含私有数据的 `recipe-replay-runtime.json`。若场景需要让 `compiled-recipes.json` 产生确定性结论或最终结果文件，使用该 runtime 和私有、已审批的 `compiled_recipe_replay_cases` 夹具运行 `scripts/recipe_replay_runner.py`，再由平台对夹具和 `recipe-replay-report.json` 分别写入 HMAC receipt。报告不含样本业务正文、路径或结果行，只含配方、trace review、执行闭包、来源和结果摘要。未完成时仍可生成证据型候选包，但该 recipe 只能走人工判断路径。该门禁阻止“声明已回放但实际结果为零行”的伪确定性能力包。
 
 上下文恢复时只执行：
 
@@ -227,4 +231,5 @@ python /skills/distill-business-capability/scripts/distill_capabilities.py summa
 - `capability-map.mmd`：基础能力、阶段能力和场景总控依赖图。
 - `distillation-report.md`：节点覆盖、格式覆盖、可移植性与交付边界。
 - `agent_prompts.md`：可直接复制为第三方场景 Agent 系统提示词的完整内容。
+- `recipe-replay-contract.json`、`recipe-replay-runtime.json`：确定性配方需要执行的真实历史回放用例、精确运行时和比较契约；对应的 `recipe-replay-report.json` 是经私有 oracle / 报告双签名后的预检与发布门禁证据。
 - `distillation-brief.json`、`prepare-status.json`：有界简报和恢复检查点。

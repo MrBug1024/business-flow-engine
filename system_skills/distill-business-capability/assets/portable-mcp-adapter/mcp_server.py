@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,36 @@ def package_metadata() -> dict[str, Any]:
 
 PACKAGE_METADATA = package_metadata()
 NAMESPACE = str(PACKAGE_METADATA.get("namespace", "portable_capability")).strip() or "portable_capability"
+
+
+def package_tool_policy() -> dict[str, Any]:
+    """Read the generated one-transaction tool policy without host state."""
+    try:
+        payload = json.loads((ROOT / "mcp.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def exposed_actions() -> set[str]:
+    """Expose only the primary transaction unless an operator enables diagnostics.
+
+    Merely labelling SQL and rule-search tools as "fallback" still lets an
+    LLM call them first.  Production packages deliberately advertise one
+    action.  A controlled diagnostic switch exists for local package tests;
+    it is never required for a business request.
+    """
+
+    policy = package_tool_policy()
+    normal = policy.get("normal_action_allowlist", ["execute"])
+    actions = {str(item) for item in normal if str(item)}
+    if not actions:
+        actions = {"execute"}
+    if os.environ.get("BFE_EXPOSE_DIAGNOSTIC_TOOLS", "").strip().casefold() in {"1", "true", "yes"}:
+        diagnostics = policy.get("diagnostic_actions", [])
+        if isinstance(diagnostics, list):
+            actions.update(str(item) for item in diagnostics if str(item))
+    return actions
 
 
 def qualified_tool_name(action: str) -> str:
@@ -185,8 +216,21 @@ def execute_business_request(arguments: dict[str, Any]) -> dict[str, Any]:
     output = str(arguments.get("output", "")).strip()
     if not output and str(arguments.get("out_dir", "")).strip():
         output = str(Path(str(arguments["out_dir"])).expanduser() / "scenario-evidence.json")
+    delivery_output = str(arguments.get("delivery_output", "")).strip()
+    if delivery_output and not output:
+        raise AdapterError(
+            "delivery_output requires output or out_dir so the JSON evidence package remains available for audit"
+        )
     if output:
         argv.extend(["--output", output])
+    if delivery_output:
+        argv.extend(["--delivery-output", delivery_output])
+        delivery_format = str(arguments.get("delivery_format", "auto")).strip()
+        if delivery_format:
+            argv.extend(["--delivery-format", delivery_format])
+        template_id = str(arguments.get("delivery_template_id", "")).strip()
+        if template_id:
+            argv.extend(["--delivery-template-id", template_id])
     if arguments.get("validate_joins") is False:
         argv.append("--no-join-validation")
     argv += repeat("--bind", bindings(arguments))
@@ -290,15 +334,18 @@ TOOL_HANDLERS = {
     "export_runtime_result": export_runtime_result,
 }
 
-TOOLS = [
+_ALL_TOOLS = [
     {"name": "describe_capability", "description": "Describe the packaged capability and its required runtime inputs.", "inputSchema": {"type": "object", "properties": {}}},
     {"name": "describe_schema", "description": "Return declared sources, columns, lifecycle roles, and validated links.", "inputSchema": {"type": "object", "properties": {}}},
     {"name": "list_outputs", "description": "Return the declared business result contract.", "inputSchema": {"type": "object", "properties": {}}},
     {"name": "list_knowledge", "description": "List knowledge rows before selecting one governing record.", "inputSchema": {"type": "object", "properties": {"data_root": {"type": "string"}, "limit": {"type": "integer"}, "bindings": {"type": "object"}}, "required": ["data_root"]}},
     {"name": "search_knowledge", "description": "Search knowledge rows for a governing record.", "inputSchema": {"type": "object", "properties": {"data_root": {"type": "string"}, "keyword": {"type": "string"}, "limit": {"type": "integer"}, "bindings": {"type": "object"}}, "required": ["data_root", "keyword"]}},
-    {"name": "execute", "description": "Resolve a business request into bounded rule and evidence results.", "inputSchema": {"type": "object", "properties": {"data_root": {"type": "string"}, "output_id": {"type": "string"}, "params": {"type": ["string", "object", "null"]}, "request": {"type": "string"}, "max_rows": {"type": "integer"}, "out_dir": {"type": "string"}, "bindings": {"type": "object"}}, "required": ["data_root"]}},
+    {"name": "execute", "description": "Run the one complete business request transaction and return its terminal status, bounded evidence, artifact handles and Agent handoff. delivery_output is allowed only for an explicitly requested JSON/CSV/XLSX final result after a verified deterministic completion.", "inputSchema": {"type": "object", "properties": {"data_root": {"type": "string"}, "output_id": {"type": "string", "default": "execute_business_request"}, "params": {"type": ["string", "object", "null"]}, "request": {"type": "string"}, "max_rows": {"type": "integer"}, "out_dir": {"type": "string"}, "delivery_output": {"type": "string", "description": "Explicit final JSON, CSV, or XLSX output path; requires out_dir or output."}, "delivery_format": {"type": "string", "enum": ["auto", "json", "csv", "xlsx"], "default": "auto"}, "delivery_template_id": {"type": "string", "description": "Declared template id; materializes only when every column comes directly from the verified recipe."}, "bindings": {"type": "object"}}, "required": ["data_root", "request"]}},
     {"name": "query_data", "description": "Run a bounded read-only SELECT against declared runtime sources.", "inputSchema": {"type": "object", "properties": {"data_root": {"type": "string"}, "sql": {"type": "string"}, "link_ids": {"type": "array", "items": {"type": "string"}}, "bindings": {"type": "object"}, "max_rows": {"type": "integer"}}, "required": ["data_root", "sql"]}},
 ]
+
+EXPOSED_ACTIONS = exposed_actions()
+TOOLS = [tool for tool in _ALL_TOOLS if str(tool.get("name", "")) in EXPOSED_ACTIONS]
 
 for tool in TOOLS:
     schema = tool.get("inputSchema", {})
@@ -315,6 +362,11 @@ for tool in TOOLS:
 
 def tool_result(name: str, arguments: Any) -> dict[str, Any]:
     action = action_from_tool_name(name)
+    if action not in EXPOSED_ACTIONS:
+        raise AdapterError(
+            "This package exposes only the primary execute transaction in production; "
+            "diagnostic actions require an operator-enabled local test environment."
+        )
     handler = TOOL_HANDLERS.get(action)
     if handler is None:
         raise AdapterError(f"Unknown tool: {name}")
@@ -324,7 +376,18 @@ def tool_result(name: str, arguments: Any) -> dict[str, Any]:
 def tool_response(name: str, arguments: Any) -> dict[str, Any]:
     try:
         result = tool_result(name, arguments)
-        failed = str(result.get("status", "")).casefold() in {"error", "blocked"}
+        # A business executor uses explicit terminal statuses rather than
+        # raising for every recoverable business gap.  On an MCP transport
+        # those statuses must still be surfaced as errors: otherwise a host
+        # treats (for example) ``blocked_rule_not_found`` as a successful
+        # intermediate observation and encourages the model to keep probing
+        # tools/SQL until it exhausts its call budget.
+        status = str(result.get("status", "")).casefold()
+        failed = (
+            status in {"error", "blocked", "manual_intervention_required"}
+            or status.startswith("blocked_")
+            or status.startswith("unsupported_")
+        )
         return {
             "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=True, indent=2)}],
             "structuredContent": result,

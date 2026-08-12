@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -16,10 +18,23 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONTRACT = SCRIPT_DIR.parent / "references" / "operational-data-contract.json"
 DEFAULT_FLOW = SCRIPT_DIR.parent / "references" / "flow-contract.json"
 DEFAULT_RECIPES = SCRIPT_DIR.parent / "references" / "compiled-recipes.json"
+DEFAULT_RECIPE_VERIFICATION = SCRIPT_DIR.parent / "references" / "recipe-verification.json"
 MAX_OUTPUT_ROWS = 200
 MAX_OUTPUT_CHARS = 512_000
 MAX_SEARCH_TERMS = 96
 MAX_CONTINUATION_FILTERS = 8
+MAX_DOCUMENT_SOURCES = 16
+MAX_DOCUMENT_SOURCE_BYTES = 128 * 1024 * 1024
+MAX_DOCUMENT_SEARCH_TERMS = 32
+MAX_DOCUMENT_INDEX_CHUNKS_PER_SOURCE = 400
+MAX_DOCUMENT_INDEX_CHARS_PER_SOURCE = 600_000
+MAX_DOCUMENT_CHUNK_CHARS = 1_500
+MAX_DOCUMENT_HITS = 40
+MIN_PDF_TEXT_CHARS = 80
+DELIVERY_FORMATS = {"auto", "json", "csv", "xlsx"}
+XLSX_MAX_CELL_CHARS = 32_767
+XLSX_INVALID_SHEET_TITLE = re.compile(r"[\\\\/*?:\[\]]")
+XLSX_INVALID_TEXT = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 SEARCH_SEPARATORS = r"[\s,，;；。.!！?？:：/\\|()（）\[\]【】\-—_]+"
 STOP_TERMS = {
     "执行", "审核", "请", "帮我", "处理", "分析", "判断", "一下", "需要", "进行",
@@ -233,6 +248,109 @@ def recipe_runtime():
     return recipes
 
 
+def document_runtime():
+    """Load the bundled document runtime only when a document is declared.
+
+    Generated releases place ``extract_documents.py`` beside this script.
+    The sibling paths retain source-tree compatibility for development without
+    making the final package depend on a separately installed Skill.
+    """
+    candidate_dirs = [
+        SCRIPT_DIR,
+        SCRIPT_DIR.parents[1] / "portable-document-reader" / "scripts",
+        SCRIPT_DIR.parents[2] / "portable-document-reader" / "scripts",
+    ]
+    for candidate in candidate_dirs:
+        if candidate.is_dir() and str(candidate) not in sys.path:
+            sys.path.insert(0, str(candidate))
+    try:
+        import extract_documents
+    except ImportError as exc:  # pragma: no cover - exercised in target runtime
+        raise ExecutorError(
+            "The bundled document runtime is unavailable; include extract_documents.py with the main executor"
+        ) from exc
+    return extract_documents
+
+
+def parse_source_bindings(values: Sequence[str]) -> dict[str, str]:
+    """Parse safe source overrides without importing the tabular runtime."""
+    bindings: dict[str, str] = {}
+    for raw in values:
+        source_id, separator, relative = str(raw).partition("=")
+        source_id = source_id.strip()
+        relative = relative.strip()
+        if not separator or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{1,127}", source_id):
+            raise ExecutorError(f"Invalid source binding; expected <source-id>=<relative-path>: {raw}")
+        path = Path(relative)
+        if not relative or path.is_absolute() or ".." in path.parts:
+            raise ExecutorError(f"Source binding must be a safe path relative to data-root: {raw}")
+        if source_id in bindings:
+            raise ExecutorError(f"Duplicate source binding: {source_id}")
+        bindings[source_id] = relative
+    return bindings
+
+
+def source_is_runtime_input(source: dict[str, Any]) -> bool:
+    return (
+        str(source.get("lifecycle", "runtime_input")) == "runtime_input"
+        and source.get("runtime_required", True) is not False
+    )
+
+
+def runtime_document_path(
+    source: dict[str, Any], data_root: Path, bindings: dict[str, str],
+) -> Path:
+    """Resolve a document binding under data_root using the tabular safety model."""
+    source_id = str(source.get("source_id", ""))
+    if not source_is_runtime_input(source):
+        raise ExecutorError(
+            f"Contract source {source_id or '<unnamed>'} is not a runtime document input"
+        )
+    relative = Path(str(bindings.get(source_id) or source.get("path", "")))
+    if not str(relative) or relative.is_absolute() or ".." in relative.parts:
+        raise ExecutorError(f"Document source path must be safe and relative: {source_id or '<unnamed>'}")
+    resolved_root = data_root.resolve()
+    path = (resolved_root / relative).resolve()
+    if not path.is_relative_to(resolved_root):
+        raise ExecutorError(f"Document source escapes data root: {relative}")
+    if not path.is_file():
+        raise ExecutorError(f"Referenced runtime document does not exist: {source_id} -> {relative}")
+    if path.stat().st_size > MAX_DOCUMENT_SOURCE_BYTES:
+        raise ExecutorError(
+            f"Runtime document exceeds the {MAX_DOCUMENT_SOURCE_BYTES // (1024 * 1024)} MiB bounded-index limit: {source_id}"
+        )
+    return path
+
+
+def non_tabular_source_ids(
+    contract: dict[str, Any], *, include_rule_sources: bool = True,
+) -> list[str]:
+    """Return all declared non-tabular inputs in deterministic contract order."""
+    sources = source_map(contract)
+    requested = [str(item) for item in contract.get("runtime_source_ids", []) if str(item)]
+    if include_rule_sources:
+        requested.extend(str(item) for item in contract.get("rule_source_ids", []) if str(item))
+    values: list[str] = []
+    for source_id in requested:
+        source = sources.get(source_id)
+        if (
+            source is not None
+            and str(source.get("kind", "")).casefold() != "tabular"
+            and source_id not in values
+        ):
+            values.append(source_id)
+    return values
+
+
+def non_tabular_rule_source_ids(contract: dict[str, Any]) -> list[str]:
+    sources = source_map(contract)
+    return [
+        source_id
+        for source_id in (str(item) for item in contract.get("rule_source_ids", []) if str(item))
+        if source_id in sources and str(sources[source_id].get("kind", "")).casefold() != "tabular"
+    ]
+
+
 def contract_summary(contract: dict[str, Any], flow: dict[str, Any]) -> dict[str, Any]:
     sources = source_map(contract)
     execution_plan = flow.get("execution_plan") if isinstance(flow.get("execution_plan"), dict) else {}
@@ -392,6 +510,404 @@ def write_artifact(
         "sha256": hashlib.sha256(encoded).hexdigest(),
         "size_bytes": len(encoded),
     }
+
+
+def file_artifact_descriptor(path: Path, kind: str) -> dict[str, Any]:
+    """Return a content-addressed descriptor for an already-persisted file."""
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise ExecutorError(f"Artifact file does not exist: {path}")
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return {
+        "kind": kind,
+        "path": str(path),
+        "format": path.suffix.casefold().lstrip("."),
+        "sha256": digest.hexdigest(),
+        "size_bytes": path.stat().st_size,
+    }
+
+
+def _delivery_format(path: Path, requested: str) -> tuple[str | None, str | None]:
+    """Resolve the deliberately small verified-result file surface."""
+    selected = str(requested or "auto").strip().casefold() or "auto"
+    if selected not in DELIVERY_FORMATS:
+        return None, f"Unsupported delivery format {selected!r}; supported formats are json, csv, and xlsx."
+    suffix_format = {
+        ".json": "json",
+        ".csv": "csv",
+        ".xlsx": "xlsx",
+    }.get(path.suffix.casefold())
+    if not suffix_format:
+        return None, "Delivery output must use a .json, .csv, or .xlsx filename."
+    if selected != "auto" and selected != suffix_format:
+        return None, (
+            f"Delivery format {selected!r} does not match output filename extension {path.suffix!r}."
+        )
+    return suffix_format, None
+
+
+def _deterministic_delivery_columns(result: dict[str, Any]) -> tuple[list[str], list[dict[str, Any]]]:
+    rows = [item for item in result.get("rows", []) if isinstance(item, dict)]
+    declared = [str(item) for item in result.get("columns", []) if str(item)]
+    columns: list[str] = []
+    for column in declared:
+        if column not in columns:
+            columns.append(column)
+    for row in rows:
+        for column in row:
+            name = str(column)
+            if name and name not in columns:
+                columns.append(name)
+    return columns, rows
+
+
+def delivery_plan(
+    payload: dict[str, Any], output_path: Path, requested_format: str = "auto",
+    template_id: str = "",
+) -> dict[str, Any]:
+    """Validate whether an executor artifact can become a user-facing result.
+
+    A bounded evidence package is useful for Agent adjudication, but it is not
+    a final result.  Only the existing replay gate may cross that boundary.
+    This function intentionally performs no rule interpretation or source IO.
+    """
+    if payload.get("status") != "completed_deterministically":
+        return {
+            "status": "blocked_delivery_requires_verified_result",
+            "message": (
+                "No final result file was written because this request is an evidence package, "
+                "not a completed deterministic result. Preserve the evidence package and let the "
+                "Agent perform the declared judgment instead."
+            ),
+            "source_status": payload.get("status"),
+            "recipe_execution": payload.get("recipe_execution"),
+        }
+    recipe_execution = payload.get("recipe_execution")
+    if not isinstance(recipe_execution, dict) or recipe_execution.get("verified") is not True:
+        return {
+            "status": "blocked_delivery_requires_verified_result",
+            "message": (
+                "No final result file was written because the completed result lacks an explicitly "
+                "verified recipe-execution record."
+            ),
+            "source_status": payload.get("status"),
+            "recipe_execution": recipe_execution,
+        }
+    result = payload.get("deterministic_result")
+    if not isinstance(result, dict):
+        return {
+            "status": "blocked_delivery_missing_deterministic_result",
+            "message": "No final result file was written because deterministic_result is missing.",
+        }
+    columns, rows = _deterministic_delivery_columns(result)
+    if not columns:
+        return {
+            "status": "blocked_delivery_missing_result_columns",
+            "message": "No final result file was written because the verified result has no exportable columns.",
+        }
+    output_path = output_path.expanduser().resolve()
+    delivery_format, format_error = _delivery_format(output_path, requested_format)
+    if format_error:
+        return {
+            "status": "blocked_unsupported_delivery_format",
+            "message": format_error,
+        }
+    result_contract = payload.get("result_contract") if isinstance(payload.get("result_contract"), dict) else {}
+    templates = [
+        item for item in result_contract.get("design_time_templates", [])
+        if isinstance(item, dict)
+    ]
+    requested_template = str(template_id or "").strip()
+    template_materialization: dict[str, Any] = {
+        "status": "canonical_recipe_columns",
+        "template_id": None,
+        "selected_columns": columns,
+        "message": (
+            "No design-time template was requested. The delivery preserves the exact columns "
+            "emitted by the verified recipe."
+        ),
+    }
+    if requested_template:
+        matched = [
+            item for item in templates
+            if str(item.get("template_id", "")) == requested_template
+        ]
+        if not matched:
+            return {
+                "status": "blocked_unknown_delivery_template",
+                "message": f"No design-time output template has id {requested_template!r}.",
+                "available_template_ids": [str(item.get("template_id", "")) for item in templates],
+            }
+        template = matched[0]
+        template_format = str(template.get("format", "")).strip().casefold().lstrip(".")
+        if template_format and template_format != delivery_format:
+            return {
+                "status": "blocked_delivery_format_requires_renderer",
+                "message": (
+                    f"Template {requested_template!r} declares {template_format!r}, but this portable "
+                    f"runtime can only materialize a matching {delivery_format!r} result file. "
+                    "It will not pretend to have created a different document format."
+                ),
+                "template_id": requested_template,
+                "template_format": template_format,
+                "requested_delivery_format": delivery_format,
+            }
+        template_columns: list[str] = []
+        for item in template.get("columns", []):
+            column = str(item)
+            if column and column not in template_columns:
+                template_columns.append(column)
+        if not template_columns:
+            return {
+                "status": "blocked_delivery_template_not_materializable",
+                "message": f"Template {requested_template!r} has no declared output columns.",
+                "template_id": requested_template,
+            }
+        missing = [column for column in template_columns if column not in columns]
+        if missing:
+            return {
+                "status": "blocked_delivery_template_not_materializable",
+                "message": (
+                    "The verified recipe does not emit every required design-time template column; "
+                    "no values were invented and no result file was written."
+                ),
+                "template_id": requested_template,
+                "missing_columns": missing,
+                "recipe_columns": columns,
+            }
+        columns = template_columns
+        template_materialization = {
+            "status": "materialized_exact_columns",
+            "template_id": requested_template,
+            "name": template.get("name"),
+            "format": delivery_format,
+            "selected_columns": columns,
+            "message": "Every requested template column is emitted directly by the verified recipe.",
+        }
+    return {
+        "status": "ready",
+        "format": delivery_format,
+        "output_path": output_path,
+        "columns": columns,
+        "rows": rows,
+        "result": result,
+        "result_contract": result_contract,
+        "template_materialization": template_materialization,
+    }
+
+
+def _spreadsheet_text(value: Any) -> str:
+    """Render a text value without allowing spreadsheet formula injection.
+
+    CSV is commonly opened directly in spreadsheet software, so it needs the
+    same literal-text boundary as XLSX.  Numeric values remain numeric-looking
+    strings; only text capable of being parsed as a formula receives Excel's
+    text marker.
+    """
+    if isinstance(value, (dict, list, tuple)):
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    else:
+        text = str(value)
+    if text.lstrip(" \t\r\n")[:1] in {"=", "+", "-", "@"}:
+        return "'" + text
+    return text
+
+
+def _csv_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (bool, int, float)):
+        return str(value)
+    return _spreadsheet_text(value)
+
+
+def safe_xlsx_sheet_name(value: Any) -> str:
+    """Return one Excel-compatible worksheet title without trusting template text."""
+    candidate = XLSX_INVALID_SHEET_TITLE.sub("_", str(value or "").strip())
+    candidate = candidate[:31].strip("'")
+    return candidate or "Result"
+
+
+def _xlsx_cell(value: Any) -> Any:
+    """Return a data-only Excel cell value from verified recipe output.
+
+    A workbook is a user-facing artifact, so never let a recipe value become
+    an Excel formula merely because it begins with a formula sigil.  The
+    apostrophe is Excel's string marker and is not a business transformation:
+    spreadsheet viewers display the original value while retaining a text
+    cell.  Values outside Excel's cell-text limits are blocked instead of
+    silently truncated.
+    """
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    text = _spreadsheet_text(value)
+    if XLSX_INVALID_TEXT.search(text):
+        raise ExecutorError("Verified result contains an Excel-invalid control character; no XLSX file was written.")
+    if len(text) > XLSX_MAX_CELL_CHARS:
+        raise ExecutorError(
+            f"Verified result contains an Excel cell longer than {XLSX_MAX_CELL_CHARS} characters; no XLSX file was written."
+        )
+    if text.lstrip(" \t\r\n")[:1] in {"=", "+", "-", "@"}:
+        return "'" + text
+    return text
+
+
+def write_csv_artifact(path: Path, columns: Sequence[str], rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Atomically write a UTF-8 CSV projection without adding a spreadsheet dependency."""
+    path = path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(columns), extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({column: _csv_cell(row.get(column)) for column in columns})
+    temporary.replace(path)
+    return file_artifact_descriptor(path, "verified_deterministic_result_rows")
+
+
+def write_xlsx_artifact(
+    path: Path, columns: Sequence[str], rows: Sequence[dict[str, Any]], sheet_name: str,
+) -> dict[str, Any]:
+    """Atomically write a single data-only XLSX worksheet from verified rows.
+
+    This deliberately has no styling, formula generation, template mutation,
+    macro support, or inferred columns.  The caller has already proved that
+    every selected column came directly from the verified recipe.
+    """
+    try:
+        from openpyxl import Workbook
+    except ImportError as exc:  # pragma: no cover - exercised in target runtime
+        raise ExecutorError("openpyxl is required for XLSX delivery; install this Skill's requirements.txt") from exc
+
+    path = path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    title = safe_xlsx_sheet_name(sheet_name)
+    temporary = path.with_name(f"{path.stem}.tmp{path.suffix}")
+    try:
+        workbook = Workbook(write_only=True)
+        worksheet = workbook.create_sheet(title=title)
+        worksheet.append([_xlsx_cell(column) for column in columns])
+        for row in rows:
+            worksheet.append([_xlsx_cell(row.get(column)) for column in columns])
+        workbook.save(temporary)
+        temporary.replace(path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    descriptor = file_artifact_descriptor(path, "verified_deterministic_result_workbook")
+    return {
+        **descriptor,
+        "sheet_name": title,
+        "columns": list(columns),
+        "row_count": len(rows),
+    }
+
+
+def deterministic_delivery_document(
+    payload: dict[str, Any], plan: dict[str, Any], evidence_package: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Create a self-describing final-file manifest from verified recipe output."""
+    result = plan["result"]
+    recipe_execution = payload.get("recipe_execution") if isinstance(payload.get("recipe_execution"), dict) else {}
+    result_handle = payload.get("result_handle") if isinstance(payload.get("result_handle"), dict) else {
+        "kind": "deterministic_result_handle",
+        "result_id": _stable_result_id(payload),
+    }
+    return {
+        "schema_version": 1,
+        "kind": "verified_deterministic_result_delivery",
+        "status": "completed_deterministically",
+        "delivery_status": "verified_deterministic_result",
+        "request": payload.get("request"),
+        "result_handle": result_handle,
+        "verification": {
+            "recipe_id": recipe_execution.get("recipe_id") or result.get("recipe_id"),
+            "status": recipe_execution.get("status"),
+            "verified": True,
+            "catalog_fingerprint": recipe_execution.get("catalog_fingerprint"),
+            "verification_path": recipe_execution.get("verification_path"),
+        },
+        "selected_rule": payload.get("selected_rule"),
+        "deterministic_result": {
+            **result,
+            "columns": plan["columns"],
+            "rows": [{column: row.get(column) for column in plan["columns"]} for row in plan["rows"]],
+        },
+        "template_materialization": plan["template_materialization"],
+        "result_contract": {
+            "required_fields": plan["result_contract"].get("required_fields", []),
+            "declared_output_contract": plan["result_contract"].get("declared_output_contract", {}),
+        },
+        "evidence_package": evidence_package,
+        "delivery_boundary": {
+            "evidence_package_role": "The evidence package remains the complete bounded audit trace.",
+            "result_file_role": "This file contains only rows and summaries emitted by an explicitly verified deterministic recipe.",
+            "agent_semantic_judgment_used": False,
+            "not_materialized": ["unverified evidence", "Agent-only conclusions", "unsupported document formats"],
+            "coverage_must_be_read_from": "deterministic_result.coverage",
+        },
+    }
+
+
+def materialize_verified_delivery(
+    payload: dict[str, Any], output_path: Path, requested_format: str = "auto",
+    template_id: str = "", evidence_package: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Write a result file only after the catalog-bound deterministic gate passed."""
+    plan = delivery_plan(payload, output_path, requested_format, template_id)
+    if plan.get("status") != "ready":
+        return plan
+    document = deterministic_delivery_document(payload, plan, evidence_package)
+    if plan["format"] == "json":
+        result_file = write_artifact(plan["output_path"], document, "verified_deterministic_result_delivery")
+        manifest = result_file
+    elif plan["format"] == "csv":
+        result_file = write_csv_artifact(plan["output_path"], plan["columns"], plan["rows"])
+        manifest_path = plan["output_path"].with_name(plan["output_path"].stem + ".delivery.json")
+        manifest = write_artifact(manifest_path, document, "verified_deterministic_result_delivery_manifest")
+    else:
+        template = plan["template_materialization"]
+        result_file = write_xlsx_artifact(
+            plan["output_path"],
+            plan["columns"],
+            plan["rows"],
+            str(template.get("name") or "Result") if isinstance(template, dict) else "Result",
+        )
+        manifest_path = plan["output_path"].with_name(plan["output_path"].stem + ".delivery.json")
+        manifest = write_artifact(manifest_path, document, "verified_deterministic_result_delivery_manifest")
+    return {
+        "status": "delivered_deterministically",
+        "format": plan["format"],
+        "result_file": result_file,
+        "manifest": manifest,
+        "result_handle": document["result_handle"],
+        "template_materialization": plan["template_materialization"],
+        "evidence_package": evidence_package,
+        "coverage": (plan["result"].get("coverage") if isinstance(plan["result"].get("coverage"), dict) else {}),
+        "message": "A verified deterministic result file was materialized without reopening runtime sources.",
+    }
+
+
+def deliver_saved_result(
+    result_path: Path, output_path: Path, requested_format: str = "auto", template_id: str = "",
+) -> dict[str, Any]:
+    """Materialize a result file from an existing evidence package without re-execution."""
+    result_path = result_path.expanduser().resolve()
+    if result_path == output_path.expanduser().resolve():
+        return {
+            "status": "blocked_delivery_output_conflicts_with_evidence",
+            "message": "Delivery output must not overwrite the JSON evidence package.",
+            "evidence_path": str(result_path),
+        }
+    payload = load_json(result_path)
+    evidence_package = file_artifact_descriptor(result_path, "scenario_evidence_package")
+    return materialize_verified_delivery(
+        payload, output_path, requested_format, template_id, evidence_package=evidence_package,
+    )
 
 
 def _stable_result_id(payload: dict[str, Any]) -> str:
@@ -557,6 +1073,228 @@ def blocked_execution_payload(
         },
         "next_action": "resolve_blocking_evidence_gap",
     }
+
+
+def bounded_document_segments(document: Any, path: Path) -> tuple[Iterable[tuple[str, str]], dict[str, Any]]:
+    """Expose a finite document stream to the indexer without buffering a file.
+
+    The index is an implementation detail of one ``execute`` transaction.
+    This cap applies independently of the host model's context window and is
+    recorded in the response so a partial document cannot look exhaustive.
+    """
+    state = {
+        "chunk_count": 0,
+        "character_count": 0,
+        "truncated": False,
+    }
+
+    def stream() -> Iterable[tuple[str, str]]:
+        for locator, raw_text in document.iter_segments(path, MAX_DOCUMENT_CHUNK_CHARS):
+            text = str(raw_text or "").strip()
+            if not text:
+                continue
+            if state["chunk_count"] >= MAX_DOCUMENT_INDEX_CHUNKS_PER_SOURCE:
+                state["truncated"] = True
+                break
+            remaining = MAX_DOCUMENT_INDEX_CHARS_PER_SOURCE - int(state["character_count"])
+            if remaining <= 0:
+                state["truncated"] = True
+                break
+            value = text[:remaining]
+            state["chunk_count"] = int(state["chunk_count"]) + 1
+            state["character_count"] = int(state["character_count"]) + len(value)
+            yield str(locator), value
+            if len(value) < len(text):
+                state["truncated"] = True
+                break
+
+    return stream(), state
+
+
+def collect_document_evidence(
+    request: str,
+    data_root: Path,
+    contract: dict[str, Any],
+    bindings: dict[str, str],
+    source_ids: Sequence[str],
+    max_rows: int,
+) -> dict[str, Any]:
+    """Index and search every declared document source inside one bounded call.
+
+    Document matching is retrieval, not an inferred semantic join.  Each hit
+    carries the source digest and physical locator needed for a reviewer to
+    recover the precise text.  OCR is a first-class terminal blocker: a sparse
+    PDF never degrades into an empty text search that the Agent may mistake for
+    a negative result.
+    """
+    documents = document_runtime()
+    sources = source_map(contract)
+    selected_ids = list(dict.fromkeys(str(item) for item in source_ids if str(item)))
+    terms = unique_terms(request)[:MAX_DOCUMENT_SEARCH_TERMS]
+    if not terms and str(request).strip():
+        # A one-character code may be a valid document anchor. Keep it bounded
+        # rather than turning an otherwise valid request into a parser error.
+        terms = [str(request).strip()[:80]]
+    result: dict[str, Any] = {
+        "status": "success",
+        "search_terms": terms,
+        "preflight": {
+            "status": "success",
+            "requested_source_ids": selected_ids,
+            "registrations": [],
+            "errors": [],
+            "message": "Declared document sources were bound and indexed in bounded temporary storage.",
+        },
+        "sources": [],
+        "coverage": {
+            "mode": "bounded_document_search",
+            "source_count": len(selected_ids),
+            "matched_source_ids": [],
+            "index_truncated_source_ids": [],
+            "search_truncated_source_ids": [],
+            "complete_for_indexed_content": False,
+            "agent_boundary": (
+                "Document hits are retrieval evidence only. Combine them with structured rows only through an accepted business key or explicit contract link."
+            ),
+        },
+        "evidence_contract": "Every document hit retains source_digest, locator, chunk_id, and text_digest.",
+    }
+    if not selected_ids:
+        result["status"] = "not_found"
+        result["preflight"]["message"] = "No document source is declared for this transaction."
+        return result
+    if len(selected_ids) > MAX_DOCUMENT_SOURCES:
+        result["status"] = "blocked_missing_or_incompatible_sources"
+        result["preflight"]["status"] = "blocked"
+        result["preflight"]["errors"].append({
+            "message": f"At most {MAX_DOCUMENT_SOURCES} document sources may be indexed in one transaction.",
+        })
+        return result
+
+    remaining_hits = MAX_DOCUMENT_HITS
+    with tempfile.TemporaryDirectory(prefix="scenario-document-index-") as temporary:
+        index_root = Path(temporary)
+        for position, source_id in enumerate(selected_ids, start=1):
+            source = sources.get(source_id)
+            source_result: dict[str, Any] = {
+                "source_id": source_id,
+                "kind": str(source.get("kind", "")) if source else "",
+                "status": "success",
+                "hits": [],
+                "hit_count_returned": 0,
+                "index": {},
+                "errors": [],
+            }
+            if source is None:
+                source_result["status"] = "blocked_missing_or_incompatible_source"
+                source_result["errors"].append("Unknown source_id in document routing contract")
+                result["preflight"]["errors"].append({"source_id": source_id, "message": source_result["errors"][0]})
+                result["sources"].append(source_result)
+                continue
+            kind = str(source.get("kind", "")).casefold()
+            if kind not in {"document", "unstructured", "text", "ocr"}:
+                source_result["status"] = "blocked_unsupported_non_tabular_source"
+                source_result["errors"].append(
+                    f"Unsupported non-tabular source kind '{kind or '<empty>'}'; declare a document/ocr runtime source or an explicit adapter."
+                )
+                result["preflight"]["errors"].append({"source_id": source_id, "message": source_result["errors"][0]})
+                result["sources"].append(source_result)
+                continue
+            try:
+                path = runtime_document_path(source, data_root, bindings)
+                path = documents.validate_file(str(path))
+                source_digest = documents.file_digest(path)
+                segments, bounds = bounded_document_segments(documents, path)
+                index_path = index_root / f"{position:02d}-{hashlib.sha256(source_id.encode('utf-8')).hexdigest()[:16]}.sqlite"
+                index = documents.create_index(index_path, str(path), source_digest, segments)
+                index_summary = {
+                    "chunk_count": int(index.get("chunk_count", 0)),
+                    "character_count": int(index.get("character_count", 0)),
+                    "bounded_by": {
+                        "max_chunks": MAX_DOCUMENT_INDEX_CHUNKS_PER_SOURCE,
+                        "max_characters": MAX_DOCUMENT_INDEX_CHARS_PER_SOURCE,
+                    },
+                    "truncated": bool(bounds["truncated"]),
+                }
+                source_result.update({
+                    "path": str(source.get("path", "")),
+                    "source_digest": source_digest,
+                    "index": index_summary,
+                })
+                result["preflight"]["registrations"].append({
+                    "source_id": source_id,
+                    "path": str(path),
+                    "kind": kind,
+                    "source_digest": source_digest,
+                    "index_chunk_count": index_summary["chunk_count"],
+                    "index_character_count": index_summary["character_count"],
+                    "index_truncated": index_summary["truncated"],
+                })
+                if path.suffix.casefold() == ".pdf" and index_summary["character_count"] < MIN_PDF_TEXT_CHARS:
+                    source_result["status"] = "blocked_ocr_required"
+                    source_result["ocr"] = {
+                        "required": True,
+                        "reason": "The PDF text layer is sparse; no text search result can be treated as evidence of absence.",
+                        "next_action": "run_declared_ocr_capability_once_then_rebind_its_JSON_output",
+                        "source_digest": source_digest,
+                    }
+                else:
+                    if remaining_hits <= 0:
+                        source_result.update({
+                            "search_terms": terms,
+                            "search_truncated": True,
+                            "warnings": ["Global document-hit budget exhausted after earlier declared sources."],
+                        })
+                        result["coverage"]["search_truncated_source_ids"].append(source_id)
+                        if index_summary["truncated"]:
+                            result["coverage"]["index_truncated_source_ids"].append(source_id)
+                        result["sources"].append(source_result)
+                        continue
+                    sources_left = max(1, len(selected_ids) - position + 1)
+                    hit_limit = max(1, min(max_rows, remaining_hits // sources_left))
+                    searched = documents.search_index(str(index_path), terms, hit_limit + 1)
+                    hits = searched.get("hits", []) if isinstance(searched.get("hits"), list) else []
+                    search_truncated = len(hits) > hit_limit
+                    hits = hits[:hit_limit]
+                    source_result.update({
+                        "search_terms": terms,
+                        "hits": hits,
+                        "hit_count_returned": len(hits),
+                        "search_truncated": search_truncated,
+                        "evidence_contract": searched.get("evidence_contract"),
+                    })
+                    remaining_hits = max(0, remaining_hits - len(hits))
+                    if hits:
+                        result["coverage"]["matched_source_ids"].append(source_id)
+                    if search_truncated:
+                        result["coverage"]["search_truncated_source_ids"].append(source_id)
+                if index_summary["truncated"]:
+                    result["coverage"]["index_truncated_source_ids"].append(source_id)
+            except Exception as exc:
+                source_result["status"] = "blocked_missing_or_incompatible_source"
+                source_result["errors"].append(str(exc))
+                result["preflight"]["errors"].append({"source_id": source_id, "message": str(exc)})
+            result["sources"].append(source_result)
+
+    scanned = [item for item in result["sources"] if item.get("status") == "blocked_ocr_required"]
+    errors = [item for item in result["sources"] if str(item.get("status", "")).startswith("blocked_") and item.get("status") != "blocked_ocr_required"]
+    if scanned:
+        result["status"] = "blocked_ocr_required"
+        result["preflight"]["status"] = "blocked"
+        result["preflight"]["message"] = "At least one declared PDF requires OCR before document evidence can be evaluated."
+    elif errors:
+        result["status"] = "blocked_missing_or_incompatible_sources"
+        result["preflight"]["status"] = "blocked"
+        result["preflight"]["message"] = "At least one declared document source could not be indexed safely."
+    elif not result["coverage"]["matched_source_ids"]:
+        result["status"] = "not_found"
+        result["preflight"]["message"] = "All declared document sources were indexed, but no bounded chunk matched the request anchors."
+    result["coverage"]["complete_for_indexed_content"] = bool(
+        result["status"] == "success"
+        and not result["coverage"]["index_truncated_source_ids"]
+        and not result["coverage"]["search_truncated_source_ids"]
+    )
+    return result
 
 
 def source_columns(contract: dict[str, Any], source_id: str) -> list[str]:
@@ -881,6 +1619,7 @@ def deterministic_execution_payload(
     selected_rule: dict[str, Any],
     rule_constraints: dict[str, Any],
     result: dict[str, Any],
+    recipe_execution: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return one terminal handoff when a reviewed recipe evaluated the rule."""
     output_contract = result_contract(flow)
@@ -940,6 +1679,11 @@ def deterministic_execution_payload(
             "status": "deterministic_result",
             "instruction": "Use deterministic_result as the business fact. Do not issue a second rule search or source query for this completed request.",
             "coverage": coverage,
+        },
+        "recipe_execution": recipe_execution or {
+            "status": "verified_recipe",
+            "verified": True,
+            "reason": "The caller supplied a deterministic result from the reviewed recipe path.",
         },
         "deterministic_result": result,
         "execution_steps": execution_steps,
@@ -1569,10 +2313,11 @@ def execute_evidence_pipeline(
     }
 
 
-def execute(
+def execute_structured(
     request: str, data_root: Path, contract: dict[str, Any], flow: dict[str, Any],
     bindings: dict[str, str], max_rows: int, validate_joins: bool,
     compiled_recipes: Sequence[dict[str, Any]] = (),
+    recipe_verification: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not str(request or "").strip():
         raise ExecutorError("A non-empty business request is required")
@@ -1694,76 +2439,129 @@ def execute(
     )
     selected_rule = ranked_rule_candidates[0] if rule_selection == "unique" else None
     rule_constraints = derive_rule_constraints(selected_rule, contract, request)
+    recipe_execution: dict[str, Any] = {
+        "status": "not_applicable",
+        "verified": False,
+        "reason": "No governing rule was selected, so no deterministic recipe was considered.",
+    }
     if selected_rule is not None:
         recipes = recipe_runtime()
+        recipe: dict[str, Any] | None = None
+        recipe_selection_error = ""
         try:
             recipe = recipes.select_recipe(compiled_recipes, selected_rule)
-            required_ids = recipes.required_source_ids(recipe) if recipe is not None else set()
         except Exception as exc:
-            return blocked_execution_payload(
-                request,
-                terms,
-                flow,
-                selected_ids,
-                f"Compiled recipe selection could not run safely: {exc}",
-            )
+            # A bad or ambiguous compiled catalog must not turn a valid
+            # governing-rule match into a retry loop.  It only loses the right
+            # to produce a deterministic result; the evidence route remains
+            # useful and exposes the precise release defect for repair.
+            recipe_selection_error = str(exc)
+            recipe_execution = {
+                "status": "recipe_selection_failed_evidence_only",
+                "verified": False,
+                "verification_status": "recipe_selection_failed",
+                "reason": f"Compiled recipe selection is unavailable for deterministic execution: {exc}",
+            }
         if recipe is not None:
-            declared_runtime_ids = set(str(item) for item in runtime_ids)
-            undeclared = sorted(required_ids - declared_runtime_ids)
-            if undeclared:
-                return blocked_execution_payload(
-                    request,
-                    terms,
-                    flow,
-                    sorted(required_ids),
-                    "Compiled recipe references non-runtime source(s): " + ", ".join(undeclared),
-                )
-            try:
-                recipe_connection, recipe_registrations = reader.open_contract_connection(
-                    contract, data_root, required_ids, bindings,
-                )
-            except Exception as exc:
-                return blocked_execution_payload(request, terms, flow, sorted(required_ids), str(exc))
-            try:
-                columns_by_source = {
-                    source_id: source_columns(contract, source_id)
-                    for source_id in required_ids
-                }
-                deterministic_result = recipes.execute_recipe(
-                    recipe,
-                    reader,
-                    contract,
-                    recipe_connection,
-                    columns_by_source,
-                    max_rows,
-                    selected_rule,
-                )
-            except Exception as exc:
-                return blocked_execution_payload(
-                    request,
-                    terms,
-                    flow,
-                    sorted(required_ids),
-                    f"Compiled recipe could not run safely: {exc}",
-                )
-            finally:
-                recipe_connection.close()
-            preflight["requested_source_ids"] = sorted(set(selected_ids) | required_ids)
-            preflight["registrations"] = [*registrations, *recipe_registrations]
-            preflight["message"] = "The governing rule and only the deterministic recipe sources are available and schema-compatible."
-            return deterministic_execution_payload(
-                request,
-                terms,
-                flow,
-                preflight,
-                rule_matches,
-                selected_rule,
-                rule_constraints,
-                deterministic_result,
+            recipe_execution = recipes.recipe_execution_gate(recipe, recipe_verification)
+            # A declarative recipe is an implementation candidate, not proof
+            # that its predicates preserve the reviewed business result.  Do
+            # not even execute it until the packaged real-replay certificate
+            # explicitly covers this exact recipe id.  The normal bounded
+            # evidence path below remains available for one human judgment.
+            if not recipe_execution.get("verified"):
+                try:
+                    recipe_execution["required_source_ids"] = sorted(recipes.required_source_ids(recipe))
+                except Exception as exc:
+                    recipe_execution["required_source_ids"] = []
+                    recipe_execution["reason"] = (
+                        f"{recipe_execution.get('reason', '')} "
+                        f"The unverified recipe's declared sources could not be trusted: {exc}"
+                    ).strip()
+            else:
+                try:
+                    required_ids = recipes.required_source_ids(recipe)
+                except Exception as exc:
+                    recipe_execution = {
+                        **recipe_execution,
+                        "status": "recipe_execution_failed_evidence_only",
+                        "verified": False,
+                        "reason": f"Verified recipe cannot declare a safe runtime source set: {exc}",
+                    }
+                    required_ids = set()
+                if not recipe_execution.get("verified"):
+                    # Let the normal bounded evidence route below distinguish
+                    # a genuine source blocker from a recipe implementation
+                    # defect.  It must never emit a false deterministic zero.
+                    pass
+                else:
+                    declared_runtime_ids = set(str(item) for item in runtime_ids)
+                    undeclared = sorted(required_ids - declared_runtime_ids)
+                    if undeclared:
+                        recipe_execution = {
+                            **recipe_execution,
+                            "status": "recipe_execution_failed_evidence_only",
+                            "verified": False,
+                            "required_source_ids": sorted(required_ids),
+                            "reason": "Verified recipe references non-runtime source(s): " + ", ".join(undeclared),
+                        }
+                    if recipe_execution.get("verified"):
+                        try:
+                            recipe_connection, recipe_registrations = reader.open_contract_connection(
+                                contract, data_root, required_ids, bindings,
+                            )
+                        except Exception as exc:
+                            recipe_execution = {
+                                **recipe_execution,
+                                "status": "recipe_execution_failed_evidence_only",
+                                "verified": False,
+                                "required_source_ids": sorted(required_ids),
+                                "reason": f"Verified recipe runtime sources could not be opened: {exc}",
+                            }
+                        else:
+                            try:
+                                columns_by_source = {
+                                    source_id: source_columns(contract, source_id)
+                                    for source_id in required_ids
+                                }
+                                deterministic_result = recipes.execute_recipe(
+                                    recipe,
+                                    reader,
+                                    contract,
+                                    recipe_connection,
+                                    columns_by_source,
+                                    max_rows,
+                                    selected_rule,
+                                )
+                            except Exception as exc:
+                                recipe_execution = {
+                                    **recipe_execution,
+                                    "status": "recipe_execution_failed_evidence_only",
+                                    "verified": False,
+                                    "required_source_ids": sorted(required_ids),
+                                    "reason": f"Verified recipe could not run safely: {exc}",
+                                }
+                            finally:
+                                recipe_connection.close()
+                            if recipe_execution.get("verified"):
+                                preflight["requested_source_ids"] = sorted(set(selected_ids) | required_ids)
+                                preflight["registrations"] = [*registrations, *recipe_registrations]
+                                preflight["message"] = "The governing rule and only the deterministic recipe sources are available and schema-compatible."
+                                return deterministic_execution_payload(
+                                    request,
+                                    terms,
+                                    flow,
+                                    preflight,
+                                    rule_matches,
+                                    selected_rule,
+                                    rule_constraints,
+                                    deterministic_result,
+                                    recipe_execution,
+                                )
+        elif not recipe_selection_error:
+            return uncompiled_rule_family_payload(
+                request, flow, preflight, selected_rule,
             )
-        return uncompiled_rule_family_payload(
-            request, flow, preflight, selected_rule,
-        )
     data_matches: list[dict[str, Any]] = []
     join_results: list[dict[str, Any]] = []
     data_connection: Any | None = None
@@ -1888,6 +2686,19 @@ def execute(
     output_contract = result_contract(flow)
     result_shell = {"preflight": preflight}
     steps = execution_steps(flow, status, rule_selection, candidate_evidence, result_shell)
+    if (
+        recipe_execution.get("recipe_id") or recipe_execution.get("status", "").endswith("evidence_only")
+    ) and not recipe_execution.get("verified"):
+        steps.insert(2, {
+            "order": 3,
+            "stage_id": "runtime.recipe_replay_gate",
+            "name": "verify_compiled_recipe_replay",
+            "state": "blocked",
+            "action": "use_bounded_evidence_instead_of_unverified_recipe",
+                "detail": str(recipe_execution.get("reason", "")),
+        })
+        for index, step in enumerate(steps, start=1):
+            step["order"] = index
     next_step = next_step_for_agent(status, candidate_evidence, output_contract, rule_selection)
     return {
         "status": status,
@@ -1905,6 +2716,7 @@ def execute(
         "data_matches": data_matches,
         "join_validations": join_results,
         "candidate_evidence": candidate_evidence,
+        "recipe_execution": recipe_execution,
         "execution_steps": steps,
         "result_contract": output_contract,
         "flow": {
@@ -1919,7 +2731,13 @@ def execute(
             "source_provenance_included": True,
             "raw_source_files_not_loaded": True,
             "requires_agent_judgment": True,
-            "semantic_decision_boundary": "This executable prepares evidence; the Agent must apply the complete selected rule and report uncertainty.",
+            "semantic_decision_boundary": (
+                "The selected compiled recipe lacks verified real replay evidence; this executable prepares bounded evidence only, and the Agent must apply the complete selected rule and report uncertainty."
+                if not recipe_execution.get("verified") and (
+                    recipe_execution.get("recipe_id") or recipe_execution.get("status", "").endswith("evidence_only")
+                ) else
+                "This executable prepares evidence; the Agent must apply the complete selected rule and report uncertainty."
+            ),
         },
         "next_action": (
             "apply_complete_rule_to_bounded_evidence"
@@ -1929,11 +2747,328 @@ def execute(
     }
 
 
+def document_only_execution_payload(
+    request: str,
+    terms: Sequence[str],
+    flow: dict[str, Any],
+    document_evidence: dict[str, Any],
+    document_rule_source_ids: Sequence[str],
+) -> dict[str, Any]:
+    """Return a one-call evidence handoff for a document-only scenario."""
+    document_status = str(document_evidence.get("status", ""))
+    preflight = document_evidence.get("preflight", {}) if isinstance(document_evidence.get("preflight"), dict) else {}
+    coverage = document_evidence.get("coverage", {}) if isinstance(document_evidence.get("coverage"), dict) else {}
+    hits = sum(
+        int(item.get("hit_count_returned", 0))
+        for item in document_evidence.get("sources", []) if isinstance(item, dict)
+    )
+    if document_status == "blocked_ocr_required":
+        status = "blocked_ocr_required"
+        next_action = "run_declared_ocr_and_rebind_document"
+        next_step = {
+            "id": "run_declared_ocr_and_rebind_document",
+            "actor": "third_party_agent_or_declared_ocr_capability",
+            "action": "run_ocr_once_then_execute_with_the_ocr_JSON_binding",
+            "read": ["document_evidence.sources"],
+            "do_not_repeat": ["execute_with_the_same_sparse_pdf", "raw_pdf_text_guessing"],
+            "completion": "Bind an OCR JSON result that preserves the original source digest, then re-run this request once.",
+        }
+    elif document_status == "blocked_missing_or_incompatible_sources":
+        status = "blocked_missing_or_incompatible_sources"
+        next_action = "resolve_blocking_evidence_gap"
+        next_step = {
+            "id": "resolve_document_binding",
+            "actor": "third_party_agent_or_human",
+            "action": "provide_the_named_document_or_adapter",
+            "read": ["preflight", "document_evidence.sources"],
+            "do_not_repeat": ["blind_retry_same_request"],
+            "completion": "Supply a compatible declared document source, then run the request once.",
+        }
+    elif hits:
+        status = "ready_for_agent_judgment"
+        next_action = "apply_accepted_procedure_to_bounded_document_evidence"
+        next_step = {
+            "id": "adjudicate_and_deliver",
+            "actor": "third_party_agent",
+            "action": "apply_accepted_procedure_to_document_evidence_once",
+            "read": ["candidate_evidence.document_sources", "execution_plan", "execution_steps", "result_contract"],
+            "required_fields": result_contract(flow).get("required_fields", []),
+            "query_allowed_only_if": "the bounded evidence identifies a concrete missing section or source",
+            "do_not_repeat": ["execute", "raw_source_file_read"],
+            "coverage": "complete_for_indexed_content" if coverage.get("complete_for_indexed_content") else "bounded_document_preview_requires_scope_disclosure",
+            "completion": "Deliver the requested business result with document provenance and uncertainty disclosure.",
+        }
+    else:
+        status = "blocked_rule_not_found" if document_rule_source_ids else "blocked_document_evidence_not_found"
+        next_action = "resolve_blocking_evidence_gap"
+        next_step = {
+            "id": "resolve_document_evidence_gap",
+            "actor": "third_party_agent_or_human",
+            "action": "request_a_more_specific_anchor_or_missing_document",
+            "read": ["document_evidence", "execution_steps"],
+            "do_not_repeat": ["blind_retry_same_request"],
+            "completion": "Provide a disambiguating term or the missing governing document.",
+        }
+    candidate_status = "document_evidence_ready" if hits else "no_document_chunk"
+    if status.startswith("blocked_"):
+        candidate_status = "blocked_ocr_required" if status == "blocked_ocr_required" else candidate_status
+    return {
+        "status": status,
+        "request": request,
+        "search_terms": list(terms),
+        "rule_selection": "document_evidence" if document_rule_source_ids else "not_applicable",
+        "selected_rule": None,
+        "rule_matches": [],
+        "data_matches": [],
+        "join_validations": [],
+        "preflight": preflight,
+        "document_evidence": document_evidence,
+        "candidate_evidence": {
+            "status": candidate_status,
+            "anchor": None,
+            "sources": [],
+            "records": [],
+            "document_sources": document_evidence.get("sources", []),
+            "coverage": coverage,
+            "instruction": (
+                "Use the returned provenance-bearing document chunks once. Do not infer a structured join or missing policy text from semantic similarity."
+            ),
+        },
+        "execution_steps": [
+            {
+                "order": 1,
+                "stage_id": "runtime.document_index",
+                "name": "bind_and_index_declared_documents",
+                "state": "blocked" if status in {"blocked_ocr_required", "blocked_missing_or_incompatible_sources"} else "completed",
+                "action": "index_bounded_document_chunks",
+                "detail": preflight.get("message", ""),
+            },
+            {
+                "order": 2,
+                "stage_id": "runtime.document_retrieval",
+                "name": "retrieve_provenance_bearing_chunks",
+                "state": "completed" if hits else "blocked",
+                "action": "search_index_once",
+                "detail": "Each candidate retains source_digest, locator, chunk_id and text_digest.",
+            },
+            {
+                "order": 3,
+                "stage_id": "runtime.output",
+                "name": "materialize_auditable_result",
+                "state": "pending_agent_conclusion" if status == "ready_for_agent_judgment" else "blocked",
+                "action": "write_result_contract",
+                "detail": "Return the conclusion, reason, scope or measure, document provenance, coverage and uncertainties.",
+            },
+        ],
+        "result_contract": result_contract(flow),
+        "flow": {
+            "execution_mode": flow.get("execution_mode", "evidence_pipeline"),
+            "main_flow": flow.get("main_flow", []),
+            "stages": flow.get("stages", []),
+            "controls": flow.get("controls", []),
+        },
+        "execution_plan": flow.get("execution_plan", {}),
+        "evidence_policy": {
+            "all_rows_bounded": True,
+            "source_provenance_included": True,
+            "raw_source_files_not_loaded": True,
+            "requires_agent_judgment": status == "ready_for_agent_judgment",
+            "unstructured_evidence_contract": "source_digest + locator + chunk_id + text_digest",
+            "semantic_decision_boundary": "Document retrieval is not a semantic decision or an implicit structured-data join.",
+        },
+        "next_action": next_action,
+        "next_step": next_step,
+    }
+
+
+def attach_document_evidence(
+    payload: dict[str, Any],
+    document_evidence: dict[str, Any],
+    flow: dict[str, Any],
+    document_rule_source_ids: Sequence[str],
+) -> dict[str, Any]:
+    """Attach document evidence to a tabular transaction without inventing a join.
+
+    A main executor is allowed to retrieve both shapes in one call, but it is
+    never allowed to claim that an unstructured chunk belongs to a table row
+    merely because both mention similar words.  The handoff makes that boundary
+    explicit and promotes a former deterministic table-only result to one
+    agent adjudication when document chunks are relevant.
+    """
+    document_status = str(document_evidence.get("status", ""))
+    sources = document_evidence.get("sources", []) if isinstance(document_evidence.get("sources"), list) else []
+    coverage = document_evidence.get("coverage", {}) if isinstance(document_evidence.get("coverage"), dict) else {}
+    hit_count = sum(int(item.get("hit_count_returned", 0)) for item in sources if isinstance(item, dict))
+    payload["document_evidence"] = document_evidence
+    preflight = payload.get("preflight") if isinstance(payload.get("preflight"), dict) else {}
+    document_preflight = document_evidence.get("preflight", {}) if isinstance(document_evidence.get("preflight"), dict) else {}
+    requested = [str(item) for item in preflight.get("requested_source_ids", []) if str(item)]
+    requested.extend(str(item) for item in document_preflight.get("requested_source_ids", []) if str(item))
+    preflight["requested_source_ids"] = list(dict.fromkeys(requested))
+    preflight["document_registrations"] = document_preflight.get("registrations", [])
+    payload["preflight"] = preflight
+    candidate = payload.get("candidate_evidence") if isinstance(payload.get("candidate_evidence"), dict) else {}
+    candidate["document_sources"] = sources
+    candidate["document_coverage"] = coverage
+    prior_instruction = str(candidate.get("instruction", "")).strip()
+    candidate["instruction"] = " ".join(item for item in [
+        prior_instruction,
+        "Document chunks are separate provenance-bearing evidence. Merge them with structured rows only through an accepted business key or explicit contract link; semantic similarity is not a join.",
+    ] if item)
+    payload["candidate_evidence"] = candidate
+    policy = payload.get("evidence_policy") if isinstance(payload.get("evidence_policy"), dict) else {}
+    policy.update({
+        "unstructured_evidence_contract": "source_digest + locator + chunk_id + text_digest",
+        "structured_unstructured_merge": "accepted_business_key_or_explicit_contract_link_required",
+        "raw_source_files_not_loaded": True,
+    })
+    payload["evidence_policy"] = policy
+    steps = payload.get("execution_steps") if isinstance(payload.get("execution_steps"), list) else []
+    steps.append({
+        "order": len(steps) + 1,
+        "stage_id": "runtime.document_evidence",
+        "name": "index_and_retrieve_declared_document_evidence",
+        "state": "blocked" if document_status.startswith("blocked_") else "completed",
+        "action": "index_bounded_document_chunks_and_search_once",
+        "detail": document_preflight.get("message", ""),
+    })
+    payload["execution_steps"] = steps
+
+    if document_status == "blocked_ocr_required":
+        preflight["status"] = "blocked"
+        payload["status"] = "blocked_ocr_required"
+        payload["next_action"] = "run_declared_ocr_and_rebind_document"
+        payload["next_step"] = {
+            "id": "run_declared_ocr_and_rebind_document",
+            "actor": "third_party_agent_or_declared_ocr_capability",
+            "action": "run_ocr_once_then_execute_with_the_ocr_JSON_binding",
+            "read": ["document_evidence.sources"],
+            "do_not_repeat": ["blind_retry_same_sparse_pdf", "raw_source_file_read"],
+            "completion": "Bind OCR JSON preserving the original source digest, then execute the same business request once.",
+        }
+        return payload
+    if document_status == "blocked_missing_or_incompatible_sources":
+        preflight["status"] = "blocked"
+        preflight.setdefault("errors", []).extend(document_preflight.get("errors", []))
+        payload["status"] = "blocked_missing_or_incompatible_sources"
+        payload["next_action"] = "resolve_blocking_evidence_gap"
+        payload["next_step"] = {
+            "id": "resolve_document_binding",
+            "actor": "third_party_agent_or_human",
+            "action": "provide_the_named_document_or_adapter",
+            "read": ["preflight", "document_evidence.sources"],
+            "do_not_repeat": ["blind_retry_same_request"],
+            "completion": "Supply the named compatible source and execute the request once.",
+        }
+        return payload
+    if document_rule_source_ids and not hit_count:
+        payload["status"] = "blocked_rule_not_found"
+        payload["next_action"] = "resolve_blocking_evidence_gap"
+        payload["next_step"] = {
+            "id": "resolve_document_rule_gap",
+            "actor": "third_party_agent_or_human",
+            "action": "request_a_more_specific_anchor_or_missing_governing_document",
+            "read": ["document_evidence", "rule_matches"],
+            "do_not_repeat": ["blind_retry_same_request"],
+            "completion": "Provide a disambiguating anchor or the governing document, then execute once.",
+        }
+        return payload
+    can_deliver_with_document_evidence = (
+        payload.get("status") in {"completed_deterministically", "ready_for_agent_judgment"}
+        or (
+            bool(document_rule_source_ids)
+            and payload.get("status") in {"blocked_runtime_evidence_not_found", "blocked_rule_not_found"}
+        )
+    )
+    if hit_count and can_deliver_with_document_evidence:
+        payload["status"] = "ready_for_agent_judgment"
+        policy["requires_agent_judgment"] = True
+        policy["semantic_decision_boundary"] = (
+            "The structured recipe remains auditable, but document chunks require one explicit evidence merge and delivery judgment."
+        )
+        payload["next_action"] = "apply_accepted_procedure_to_bounded_hybrid_evidence"
+        payload["next_step"] = {
+            "id": "adjudicate_and_deliver_hybrid_evidence",
+            "actor": "third_party_agent",
+            "action": "apply_accepted_procedure_to_structured_and_document_evidence_once",
+            "read": ["selected_rule", "deterministic_result", "candidate_evidence.document_sources", "result_contract"],
+            "required_fields": result_contract(flow).get("required_fields", []),
+            "query_allowed_only_if": "a returned evidence item identifies a concrete missing field, section, or accepted link",
+            "do_not_repeat": ["execute", "search-rules", "raw_source_file_read"],
+            "completion": "Deliver one result with explicit structured/document provenance and any unmerged-evidence uncertainty.",
+        }
+    return payload
+
+
+def execute(
+    request: str, data_root: Path, contract: dict[str, Any], flow: dict[str, Any],
+    bindings: dict[str, str], max_rows: int, validate_joins: bool,
+    compiled_recipes: Sequence[dict[str, Any]] = (),
+    recipe_verification: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Route a request once across tabular, document, or hybrid input shapes."""
+    if not str(request or "").strip():
+        raise ExecutorError("A non-empty business request is required")
+    sources = source_map(contract)
+    document_ids = non_tabular_source_ids(contract)
+    document_rule_ids = non_tabular_rule_source_ids(contract)
+    if not document_ids:
+        return execute_structured(
+            request, data_root, contract, flow, bindings, max_rows, validate_joins,
+            compiled_recipes, recipe_verification,
+        )
+
+    document_evidence = collect_document_evidence(
+        request, data_root, contract, bindings, document_ids, max_rows,
+    )
+    # A sparse PDF or a missing required document invalidates a hybrid result as
+    # well. Stop before opening tables: retrying the structured half cannot
+    # recover the named unstructured input gap.
+    if str(document_evidence.get("status", "")).startswith("blocked_"):
+        return document_only_execution_payload(
+            request, unique_terms(request), flow, document_evidence, document_rule_ids,
+        )
+
+    tabular_rule_ids = [
+        source_id for source_id in contract.get("rule_source_ids", [])
+        if str(source_id) in sources and str(sources[str(source_id)].get("kind", "")).casefold() == "tabular"
+    ]
+    tabular_runtime_ids = [
+        source_id for source_id in contract.get("runtime_source_ids", [])
+        if str(source_id) in sources and str(sources[str(source_id)].get("kind", "")).casefold() == "tabular"
+    ]
+    if tabular_rule_ids:
+        payload = execute_structured(
+            request, data_root, contract, flow, bindings, max_rows, validate_joins,
+            compiled_recipes, recipe_verification,
+        )
+        return attach_document_evidence(payload, document_evidence, flow, document_rule_ids)
+    if tabular_runtime_ids:
+        payload = execute_evidence_pipeline(
+            request, data_root, contract, flow, bindings, max_rows, validate_joins,
+        )
+        attached = attach_document_evidence(payload, document_evidence, flow, document_rule_ids)
+        if (
+            document_rule_ids
+            and document_evidence.get("status") == "success"
+            and any(int(item.get("hit_count_returned", 0)) > 0 for item in document_evidence.get("sources", []))
+            and attached.get("status") in {"blocked_runtime_evidence_not_found", "blocked_rule_not_found"}
+        ):
+            attached["status"] = "ready_for_agent_judgment"
+            attached["rule_selection"] = "document_evidence"
+            attached["next_action"] = "apply_accepted_procedure_to_bounded_hybrid_evidence"
+        return attached
+    return document_only_execution_payload(
+        request, unique_terms(request), flow, document_evidence, document_rule_ids,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--contract", default=str(DEFAULT_CONTRACT))
     parser.add_argument("--flow-contract", default=str(DEFAULT_FLOW))
     parser.add_argument("--recipes", default=str(DEFAULT_RECIPES))
+    parser.add_argument("--recipe-verification", default=str(DEFAULT_RECIPE_VERIFICATION))
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("describe")
     search = commands.add_parser("search-rules")
@@ -1948,7 +3083,15 @@ def build_parser() -> argparse.ArgumentParser:
     execute_parser.add_argument("--bind", action="append", default=[])
     execute_parser.add_argument("--max-rows", type=int, default=50)
     execute_parser.add_argument("--output", default="")
+    execute_parser.add_argument("--delivery-output", default="")
+    execute_parser.add_argument("--delivery-format", default="auto", choices=sorted(DELIVERY_FORMATS))
+    execute_parser.add_argument("--delivery-template-id", default="")
     execute_parser.add_argument("--no-join-validation", action="store_true")
+    delivery = commands.add_parser("deliver")
+    delivery.add_argument("--result", required=True)
+    delivery.add_argument("--output", required=True)
+    delivery.add_argument("--format", default="auto", choices=sorted(DELIVERY_FORMATS))
+    delivery.add_argument("--template-id", default="")
     continuation = commands.add_parser("continue")
     continuation.add_argument("--result", required=True)
     continuation.add_argument("--filter", action="append", default=[])
@@ -1964,21 +3107,32 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run(argv: Sequence[str] | None = None) -> dict[str, Any]:
     args = build_parser().parse_args(argv)
+    command = str(args.command)
+    if command == "deliver":
+        return deliver_saved_result(
+            Path(args.result), Path(args.output), args.format, args.template_id,
+        )
     contract = load_json(resolve_contract(args.contract, DEFAULT_CONTRACT))
     flow = load_json(resolve_contract(args.flow_contract, DEFAULT_FLOW))
-    compiled_recipes = recipe_runtime().load_recipes(resolve_contract(args.recipes, DEFAULT_RECIPES))
-    command = str(args.command)
+    recipes_path = resolve_contract(args.recipes, DEFAULT_RECIPES)
+    recipes = recipe_runtime()
+    compiled_recipes = recipes.load_recipes(recipes_path)
+    recipe_verification = recipes.inspect_recipe_verification(
+        resolve_contract(args.recipe_verification, DEFAULT_RECIPE_VERIFICATION),
+        recipes_path,
+        compiled_recipes,
+    )
     if command == "describe":
         return contract_summary(contract, flow)
     if command == "continue":
         return continue_deterministic_result(Path(args.result), args.filter, args.max_rows)
-    reader = tabular_runtime()
     data_root = Path(args.data_root).expanduser().resolve()
     if not data_root.is_dir():
         raise ExecutorError(f"Data root does not exist: {data_root}")
-    bindings = reader.parse_source_bindings(args.bind)
+    bindings = parse_source_bindings(args.bind)
     limit = max(1, min(int(args.max_rows), MAX_OUTPUT_ROWS))
     if command == "search-rules":
+        reader = tabular_runtime()
         source_ids = [str(item) for item in args.source_id if str(item)] or [
             str(item) for item in contract.get("rule_source_ids", []) if str(item)
         ]
@@ -1994,10 +3148,23 @@ def run(argv: Sequence[str] | None = None) -> dict[str, Any]:
             ],
         }
     if command == "query":
+        reader = tabular_runtime()
         return reader.query_contract(contract, data_root, args.sql, limit, args.link_id, bindings)
+    if args.delivery_output:
+        if not args.output:
+            raise ExecutorError(
+                "--delivery-output requires --output so the complete JSON evidence package remains available for audit."
+            )
+        evidence_path = Path(args.output).expanduser().resolve()
+        delivery_path = Path(args.delivery_output).expanduser().resolve()
+        if evidence_path == delivery_path:
+            raise ExecutorError("--delivery-output must not overwrite the JSON evidence package.")
+        if evidence_path.suffix.casefold() != ".json":
+            raise ExecutorError("--output must use a .json filename when --delivery-output is requested.")
     payload = execute(
         args.request, data_root, contract, flow, bindings, limit,
         validate_joins=not bool(args.no_join_validation), compiled_recipes=compiled_recipes,
+        recipe_verification=recipe_verification,
     )
     if args.output:
         artifact_path = Path(args.output)
@@ -2005,6 +3172,14 @@ def run(argv: Sequence[str] | None = None) -> dict[str, Any]:
         if handle is not None:
             payload["result_handle"] = handle
         payload["artifact"] = write_artifact(artifact_path, payload)
+        if args.delivery_output:
+            payload["delivery"] = materialize_verified_delivery(
+                payload,
+                Path(args.delivery_output),
+                args.delivery_format,
+                args.delivery_template_id,
+                evidence_package=payload.get("artifact") if isinstance(payload.get("artifact"), dict) else None,
+            )
         handoff_path = artifact_path.with_name(artifact_path.stem + ".agent.json")
         payload["agent_handoff"] = write_artifact(
             handoff_path,
@@ -2020,6 +3195,8 @@ def compact_stdout_payload(payload: dict[str, Any]) -> dict[str, Any]:
     candidate = payload.get("candidate_evidence") if isinstance(payload.get("candidate_evidence"), dict) else {}
     sources = candidate.get("sources") if isinstance(candidate.get("sources"), list) else []
     deterministic = payload.get("deterministic_result") if isinstance(payload.get("deterministic_result"), dict) else {}
+    documents = payload.get("document_evidence") if isinstance(payload.get("document_evidence"), dict) else {}
+    document_sources = documents.get("sources") if isinstance(documents.get("sources"), list) else []
     return {
         "status": payload.get("status", "success"),
         "rule_selection": payload.get("rule_selection"),
@@ -2048,12 +3225,27 @@ def compact_stdout_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "coverage": deterministic.get("coverage", {}),
             "row_count_returned": len(deterministic.get("rows", [])) if isinstance(deterministic.get("rows"), list) else 0,
         } if deterministic else None,
+        "recipe_execution": payload.get("recipe_execution"),
+        "document_evidence": {
+            "status": documents.get("status"),
+            "source_count": len(document_sources),
+            "matched_source_ids": (documents.get("coverage") or {}).get("matched_source_ids", [])
+            if isinstance(documents.get("coverage"), dict) else [],
+            "hit_count_returned": sum(
+                int(item.get("hit_count_returned", 0)) for item in document_sources if isinstance(item, dict)
+            ),
+            "ocr_required_source_ids": [
+                str(item.get("source_id", "")) for item in document_sources
+                if isinstance(item, dict) and item.get("status") == "blocked_ocr_required"
+            ],
+        } if documents else None,
         "execution_steps": payload.get("execution_steps", []),
         "next_action": payload.get("next_action"),
         "next_step": payload.get("next_step"),
         "artifact": payload.get("artifact"),
         "agent_handoff": payload.get("agent_handoff"),
         "result_handle": payload.get("result_handle"),
+        "delivery": payload.get("delivery"),
     }
 
 
@@ -2061,6 +3253,7 @@ def agent_handoff_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Project only decision-grade evidence into the file an Agent should read."""
     candidate = payload.get("candidate_evidence") if isinstance(payload.get("candidate_evidence"), dict) else {}
     deterministic = payload.get("deterministic_result") if isinstance(payload.get("deterministic_result"), dict) else None
+    documents = payload.get("document_evidence") if isinstance(payload.get("document_evidence"), dict) else {}
 
     def project_source(source: dict[str, Any]) -> dict[str, Any]:
         columns = [str(item) for item in source.get("columns", []) if str(item)]
@@ -2100,6 +3293,39 @@ def agent_handoff_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "validated_paths": group.get("validated_paths", []),
             "errors": group.get("errors", []),
         })
+
+    document_sources = []
+    for source in documents.get("sources", []) if isinstance(documents.get("sources"), list) else []:
+        if not isinstance(source, dict):
+            continue
+        hits = []
+        for hit in source.get("hits", []) if isinstance(source.get("hits"), list) else []:
+            if not isinstance(hit, dict):
+                continue
+            hits.append({
+                "source": hit.get("source"),
+                "source_digest": hit.get("source_digest"),
+                "locator": hit.get("locator"),
+                "chunk_id": hit.get("chunk_id"),
+                "text_digest": hit.get("text_digest"),
+                "text": hit.get("text"),
+                "score": hit.get("score"),
+            })
+        document_sources.append({
+            "source_id": source.get("source_id"),
+            "kind": source.get("kind"),
+            "status": source.get("status"),
+            "path": source.get("path"),
+            "source_digest": source.get("source_digest"),
+            "index": source.get("index", {}),
+            "search_terms": source.get("search_terms", []),
+            "hits": hits,
+            "hit_count_returned": source.get("hit_count_returned", len(hits)),
+            "search_truncated": source.get("search_truncated", False),
+            "ocr": source.get("ocr"),
+            "errors": source.get("errors", []),
+            "warnings": source.get("warnings", []),
+        })
     return {
         "status": payload.get("status"),
         "request": payload.get("request"),
@@ -2115,8 +3341,18 @@ def agent_handoff_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "coverage": candidate.get("coverage"),
             "instruction": candidate.get("instruction"),
         },
+        "recipe_execution": payload.get("recipe_execution"),
+        "document_evidence": {
+            "status": documents.get("status"),
+            "search_terms": documents.get("search_terms", []),
+            "sources": document_sources,
+            "coverage": documents.get("coverage", {}),
+            "evidence_contract": documents.get("evidence_contract"),
+            "merge_boundary": "Do not merge document chunks with structured rows without an accepted business key or explicit contract link.",
+        } if documents else None,
         "deterministic_result": deterministic,
         "result_handle": payload.get("result_handle"),
+        "delivery": payload.get("delivery"),
         "execution_steps": payload.get("execution_steps", []),
         "result_contract": payload.get("result_contract", {}),
         "next_step": payload.get("next_step"),
@@ -2137,11 +3373,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     # still receives valid JSON.  Full UTF-8 evidence stays in --output files.
     encoded = json.dumps(encoded_payload, ensure_ascii=True, indent=2)
     if len(encoded) > MAX_OUTPUT_CHARS:
-        encoded = json.dumps({
-            "status": payload.get("status", "success"),
-            "message": "Evidence package exceeded the stdout budget; use the artifact written by --output.",
-            "artifact": payload.get("artifact"),
-        }, ensure_ascii=True, indent=2)
+        # An execute call without ``--output`` used to replace a large but
+        # otherwise useful handoff with ``artifact: null``.  That forces a
+        # host Agent to retry the same expensive request merely to learn what
+        # it should do next.  Keep the decision-relevant projection even when
+        # no persistent artifact was requested.
+        encoded_payload = compact_stdout_payload(payload)
+        encoded_payload["message"] = (
+            "Evidence was summarized to fit the stdout budget. Re-run with --output only if the full audit package is required."
+        )
+        encoded = json.dumps(encoded_payload, ensure_ascii=True, indent=2)
+        if len(encoded) > MAX_OUTPUT_CHARS:
+            encoded = json.dumps({
+                "status": payload.get("status", "success"),
+                "message": "Evidence package exceeded the stdout budget; re-run with --output to persist the full audit package.",
+                "next_action": payload.get("next_action"),
+                "next_step": payload.get("next_step"),
+                "recipe_execution": payload.get("recipe_execution"),
+                "artifact": payload.get("artifact"),
+            }, ensure_ascii=True, indent=2)
     print(encoded)
     return code
 
