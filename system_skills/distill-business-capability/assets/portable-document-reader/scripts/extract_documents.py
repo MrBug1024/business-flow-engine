@@ -7,11 +7,12 @@ import argparse
 import hashlib
 import html
 import json
+import os
 import re
 import sqlite3
 import sys
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Iterator, Sequence
 
 
@@ -24,10 +25,120 @@ HARD_MAX_CHARS = 2_000_000
 DEFAULT_CHUNK_CHARS = 4_000
 MAX_CHUNK_CHARS = 20_000
 MAX_RESULTS = 100
+ARTIFACT_ROOT_ENV = "BUSINESS_ARTIFACT_ROOT"
 
 
 class ExtractError(ValueError):
     pass
+
+
+class ArtifactPathError(ExtractError):
+    pass
+
+
+def artifact_root() -> Path:
+    configured = str(os.environ.get(ARTIFACT_ROOT_ENV, "")).strip()
+    if not configured:
+        raise ArtifactPathError(
+            "Persistent artifact output is blocked: the host must set BUSINESS_ARTIFACT_ROOT."
+        )
+    root = Path(configured).expanduser()
+    if not root.is_absolute():
+        raise ArtifactPathError("BUSINESS_ARTIFACT_ROOT must be an absolute host-managed directory.")
+    root = root.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    if not root.is_dir():
+        raise ArtifactPathError("BUSINESS_ARTIFACT_ROOT is not a writable artifact directory.")
+    return root
+
+
+def normalize_artifact_name(value: str | Path, label: str = "artifact name") -> str:
+    raw = str(value or "").strip()
+    normalized = raw.replace("\\", "/")
+    if not normalized:
+        raise ArtifactPathError(f"{label} must be a non-empty relative artifact name.")
+    if (
+        "\x00" in normalized
+        or normalized.startswith("/")
+        or raw.startswith("\\")
+        or re.match(r"^[A-Za-z]:", raw)
+    ):
+        raise ArtifactPathError(f"{label} must be a safe relative artifact name, not an absolute path.")
+    parts = PurePosixPath(normalized).parts
+    if not parts or any(part in {"", ".", ".."} or ":" in part for part in parts):
+        raise ArtifactPathError(f"{label} must not contain traversal or drive-qualified segments.")
+    return PurePosixPath(*parts).as_posix()
+
+
+def _absolute_artifact_input(raw: str) -> bool:
+    return (
+        Path(raw).expanduser().is_absolute()
+        or raw.replace("\\", "/").startswith("/")
+        or raw.startswith("\\")
+        or bool(re.match(r"^[A-Za-z]:", raw))
+    )
+
+
+def resolve_artifact_name(value: str | Path, label: str = "artifact name") -> tuple[Path, str]:
+    root = artifact_root()
+    raw = str(value or "").strip()
+    if _absolute_artifact_input(raw):
+        target = Path(raw).expanduser().resolve()
+        try:
+            relative_path = target.relative_to(root).as_posix()
+        except ValueError as exc:
+            raise ArtifactPathError(
+                f"{label} must be a safe relative artifact name or an already-translated path inside BUSINESS_ARTIFACT_ROOT."
+            ) from exc
+    else:
+        relative_path = normalize_artifact_name(raw, label)
+        target = (root.joinpath(*PurePosixPath(relative_path).parts)).resolve()
+    if target == root or root not in target.parents:
+        raise ArtifactPathError(f"{label} escapes BUSINESS_ARTIFACT_ROOT.")
+    return target, relative_path
+
+
+def artifact_reference(path: Path, kind: str) -> dict[str, Any]:
+    root = artifact_root()
+    resolved = path.expanduser().resolve()
+    try:
+        relative_path = resolved.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise ArtifactPathError("Artifact output must stay inside BUSINESS_ARTIFACT_ROOT.") from exc
+    if not resolved.is_file():
+        raise ArtifactPathError("Artifact file does not exist inside BUSINESS_ARTIFACT_ROOT.")
+    sha256 = file_digest(resolved)
+    return {
+        "schema_version": 1,
+        "kind": kind,
+        "artifact_id": "artifact-" + hashlib.sha256(
+            f"{kind}\0{relative_path}\0{sha256}".encode("utf-8")
+        ).hexdigest()[:24],
+        "relative_path": relative_path,
+        "format": resolved.suffix.casefold().lstrip("."),
+        "sha256": sha256,
+        "size_bytes": resolved.stat().st_size,
+    }
+
+
+def artifact_relative_path(path: Path) -> tuple[Path, str]:
+    root = artifact_root()
+    resolved = path.expanduser().resolve()
+    try:
+        relative_path = resolved.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise ArtifactPathError("Artifact output must stay inside BUSINESS_ARTIFACT_ROOT.") from exc
+    if not relative_path or relative_path == ".":
+        raise ArtifactPathError("Artifact output must name a file below BUSINESS_ARTIFACT_ROOT.")
+    return resolved, relative_path
+
+
+def blocked_artifact_output(exc: ArtifactPathError) -> dict[str, Any]:
+    return {
+        "status": "blocked_host_artifact_sink",
+        "message": str(exc),
+        "artifact_root_environment": ARTIFACT_ROOT_ENV,
+    }
 
 
 def validate_file(raw: str) -> Path:
@@ -198,7 +309,12 @@ def file_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def create_index(output: Path, source: str, source_digest: str, segments: Iterable[tuple[str, str]]) -> dict[str, Any]:
+def create_temporary_index(output: Path, source: str, source_digest: str, segments: Iterable[tuple[str, str]]) -> dict[str, Any]:
+    """Create a process-private index for an executor's temporary evidence pass.
+
+    This is deliberately distinct from a delivered index artifact. Its caller
+    owns a ``TemporaryDirectory`` and must not return its path in host metadata.
+    """
     output = output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary_handle = tempfile.NamedTemporaryFile(
@@ -262,6 +378,20 @@ def create_index(output: Path, source: str, source_digest: str, segments: Iterab
         "chunk_count": count,
         "character_count": characters,
     }
+
+
+def create_index(output: Path, source: str, source_digest: str, segments: Iterable[tuple[str, str]]) -> dict[str, Any]:
+    """Create a persistent index only under the host-injected artifact root."""
+    output, _relative_path = artifact_relative_path(output)
+    result = create_temporary_index(output, source, source_digest, segments)
+    artifact = artifact_reference(output, "document_evidence_index")
+    result.pop("index", None)
+    result.update({
+        "artifact": artifact,
+        "artifact_id": artifact["artifact_id"],
+        "relative_path": artifact["relative_path"],
+    })
+    return result
 
 
 def ocr_text_items(payload: Any, prefix: str = "ocr") -> Iterator[tuple[str, str, str]]:
@@ -402,11 +532,11 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--format", choices=["text", "json"], default="json")
     index = commands.add_parser("index")
     index.add_argument("--input", required=True)
-    index.add_argument("--output", required=True)
+    index.add_argument("--output", required=True, help="Safe relative artifact name under BUSINESS_ARTIFACT_ROOT.")
     index.add_argument("--chunk-chars", type=int, default=DEFAULT_CHUNK_CHARS)
     index_ocr = commands.add_parser("index-ocr")
     index_ocr.add_argument("--input-json", required=True)
-    index_ocr.add_argument("--output", required=True)
+    index_ocr.add_argument("--output", required=True, help="Safe relative artifact name under BUSINESS_ARTIFACT_ROOT.")
     index_ocr.add_argument("--source", default="")
     index_ocr.add_argument("--chunk-chars", type=int, default=DEFAULT_CHUNK_CHARS)
     search = commands.add_parser("search")
@@ -427,24 +557,63 @@ def build_parser() -> argparse.ArgumentParser:
 def run(argv: Sequence[str] | None = None) -> tuple[dict[str, Any], str]:
     args = build_parser().parse_args(argv)
     if args.command == "search":
-        payload = search_index(args.index, args.term, max(1, min(args.limit, MAX_RESULTS)))
+        try:
+            index_path, _index_relative_path = resolve_artifact_name(args.index, "--index")
+        except ArtifactPathError as exc:
+            payload = blocked_artifact_output(exc)
+        else:
+            payload = search_index(str(index_path), args.term, max(1, min(args.limit, MAX_RESULTS)))
     elif args.command == "get":
-        payload = get_chunk(args.index, args.chunk_id)
+        try:
+            index_path, _index_relative_path = resolve_artifact_name(args.index, "--index")
+        except ArtifactPathError as exc:
+            payload = blocked_artifact_output(exc)
+        else:
+            payload = get_chunk(str(index_path), args.chunk_id)
     elif args.command == "context":
-        payload = get_context(
-            args.index, args.chunk_id,
-            max(0, min(args.before, 5)), max(0, min(args.after, 5)),
-        )
+        try:
+            index_path, _index_relative_path = resolve_artifact_name(args.index, "--index")
+        except ArtifactPathError as exc:
+            payload = blocked_artifact_output(exc)
+        else:
+            payload = get_context(
+                str(index_path), args.chunk_id,
+                max(0, min(args.before, 5)), max(0, min(args.after, 5)),
+            )
     elif args.command == "index-ocr":
         input_json = Path(args.input_json).expanduser().resolve()
         chunk_chars = max(200, min(args.chunk_chars, MAX_CHUNK_CHARS))
-        payload = create_ocr_index(input_json, Path(args.output), args.source, chunk_chars)
+        try:
+            output_path, _output_relative_path = resolve_artifact_name(args.output, "--output")
+        except ArtifactPathError as exc:
+            payload = blocked_artifact_output(exc)
+        else:
+            payload = create_ocr_index(input_json, output_path, args.source, chunk_chars)
+            artifact = artifact_reference(output_path, "document_evidence_index")
+            payload.pop("index", None)
+            payload.update({
+                "artifact": artifact,
+                "artifact_id": artifact["artifact_id"],
+                "relative_path": artifact["relative_path"],
+            })
     else:
         path = validate_file(args.input)
         limit = max(1, min(int(getattr(args, "max_chars", DEFAULT_MAX_CHARS)), HARD_MAX_CHARS))
         if args.command == "index":
             chunk_chars = max(200, min(args.chunk_chars, MAX_CHUNK_CHARS))
-            payload = create_index(Path(args.output), str(path), file_digest(path), iter_segments(path, chunk_chars))
+            try:
+                output_path, _output_relative_path = resolve_artifact_name(args.output, "--output")
+            except ArtifactPathError as exc:
+                payload = blocked_artifact_output(exc)
+            else:
+                payload = create_index(output_path, str(path), file_digest(path), iter_segments(path, chunk_chars))
+                artifact = artifact_reference(output_path, "document_evidence_index")
+                payload.pop("index", None)
+                payload.update({
+                    "artifact": artifact,
+                    "artifact_id": artifact["artifact_id"],
+                    "relative_path": artifact["relative_path"],
+                })
         else:
             text, metadata = bounded_extract(path, limit if args.command == "extract" else min(limit, 20_000))
             payload = {

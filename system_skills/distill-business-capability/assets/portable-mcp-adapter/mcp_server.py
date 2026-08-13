@@ -145,6 +145,26 @@ def limited_rows(arguments: dict[str, Any], default: int) -> str:
     return str(max(1, min(value, 20_000)))
 
 
+def reject_legacy_artifact_paths(arguments: dict[str, Any]) -> None:
+    """Do not silently reinterpret a legacy host directory as an artifact sink.
+
+    Old package hosts supplied ``out_dir`` or a full ``output`` path such as
+    ``E:\\outputs\\...``.  That produced files outside the conversation's
+    retrievable storage.  Requiring new, relative names makes an unsupported
+    host fail visibly instead of creating an invisible file.
+    """
+    legacy = [
+        key for key in ("out_dir", "output", "delivery_output")
+        if str(arguments.get(key, "")).strip()
+    ]
+    if legacy:
+        raise AdapterError(
+            "Legacy artifact path arguments " + ", ".join(legacy)
+            + " are not accepted. Set BUSINESS_ARTIFACT_ROOT in the host and use "
+            "artifact_name / delivery_artifact_name with safe relative names."
+        )
+
+
 def describe_capability(_: dict[str, Any]) -> dict[str, Any]:
     module = executor()
     return module.run(["describe"])
@@ -207,24 +227,34 @@ def search_rules(arguments: dict[str, Any]) -> dict[str, Any]:
 
 def execute_business_request(arguments: dict[str, Any]) -> dict[str, Any]:
     module = executor()
+    reject_legacy_artifact_paths(arguments)
     request = required_text(arguments, "request")
     data_root = required_data_root(arguments)
     argv = [
         "execute", "--request", request, "--data-root", data_root,
         "--max-rows", limited_rows(arguments, 50),
     ]
-    output = str(arguments.get("output", "")).strip()
-    if not output and str(arguments.get("out_dir", "")).strip():
-        output = str(Path(str(arguments["out_dir"])).expanduser() / "scenario-evidence.json")
-    delivery_output = str(arguments.get("delivery_output", "")).strip()
-    if delivery_output and not output:
+    rule_locator = str(arguments.get("rule_locator", "")).strip()
+    if rule_locator:
+        argv.extend(["--rule-locator", rule_locator])
+    if "external_evidence" in arguments and arguments.get("external_evidence") is not None:
+        external_evidence = arguments.get("external_evidence")
+        if not isinstance(external_evidence, (dict, list)):
+            raise AdapterError("external_evidence must be an object or array returned by a host capability or MCP")
+        encoded_evidence = json.dumps(external_evidence, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded_evidence) > 256_000:
+            raise AdapterError("external_evidence exceeds the bounded executor input limit")
+        argv.extend(["--external-evidence-json", encoded_evidence])
+    artifact_name = str(arguments.get("artifact_name", "")).strip()
+    delivery_artifact_name = str(arguments.get("delivery_artifact_name", "")).strip()
+    if delivery_artifact_name and not artifact_name:
         raise AdapterError(
-            "delivery_output requires output or out_dir so the JSON evidence package remains available for audit"
+            "delivery_artifact_name requires artifact_name so the JSON evidence package remains available for audit"
         )
-    if output:
-        argv.extend(["--output", output])
-    if delivery_output:
-        argv.extend(["--delivery-output", delivery_output])
+    if artifact_name:
+        argv.extend(["--output", artifact_name])
+    if delivery_artifact_name:
+        argv.extend(["--delivery-output", delivery_artifact_name])
         delivery_format = str(arguments.get("delivery_format", "auto")).strip()
         if delivery_format:
             argv.extend(["--delivery-format", delivery_format])
@@ -254,9 +284,10 @@ def query_runtime_data(arguments: dict[str, Any]) -> dict[str, Any]:
 
 def export_runtime_result(arguments: dict[str, Any]) -> dict[str, Any]:
     module = executor()
+    reject_legacy_artifact_paths(arguments)
     data_root = required_data_root(arguments)
     sql = required_text(arguments, "sql")
-    output = required_text(arguments, "output")
+    artifact_name = required_text(arguments, "artifact_name")
     links = arguments.get("link_ids", arguments.get("link_id", []))
     if isinstance(links, str):
         links = [links]
@@ -268,7 +299,7 @@ def export_runtime_result(arguments: dict[str, Any]) -> dict[str, Any]:
         contract,
         Path(data_root).expanduser().resolve(),
         sql,
-        output,
+        artifact_name,
         [str(item) for item in links if str(item).strip()],
         overwrite=bool(arguments.get("overwrite", False)),
         bindings=reader.parse_source_bindings(bindings(arguments)),
@@ -340,7 +371,7 @@ _ALL_TOOLS = [
     {"name": "list_outputs", "description": "Return the declared business result contract.", "inputSchema": {"type": "object", "properties": {}}},
     {"name": "list_knowledge", "description": "List knowledge rows before selecting one governing record.", "inputSchema": {"type": "object", "properties": {"data_root": {"type": "string"}, "limit": {"type": "integer"}, "bindings": {"type": "object"}}, "required": ["data_root"]}},
     {"name": "search_knowledge", "description": "Search knowledge rows for a governing record.", "inputSchema": {"type": "object", "properties": {"data_root": {"type": "string"}, "keyword": {"type": "string"}, "limit": {"type": "integer"}, "bindings": {"type": "object"}}, "required": ["data_root", "keyword"]}},
-    {"name": "execute", "description": "Run the one complete business request transaction and return its terminal status, bounded evidence, artifact handles and Agent handoff. delivery_output is allowed only for an explicitly requested JSON/CSV/XLSX final result after a verified deterministic completion.", "inputSchema": {"type": "object", "properties": {"data_root": {"type": "string"}, "output_id": {"type": "string", "default": "execute_business_request"}, "params": {"type": ["string", "object", "null"]}, "request": {"type": "string"}, "max_rows": {"type": "integer"}, "out_dir": {"type": "string"}, "delivery_output": {"type": "string", "description": "Explicit final JSON, CSV, or XLSX output path; requires out_dir or output."}, "delivery_format": {"type": "string", "enum": ["auto", "json", "csv", "xlsx"], "default": "auto"}, "delivery_template_id": {"type": "string", "description": "Declared template id; materializes only when every column comes directly from the verified recipe."}, "bindings": {"type": "object"}}, "required": ["data_root", "request"]}},
+    {"name": "execute", "description": "Run the one complete business request transaction and return its terminal status, bounded evidence, artifact handles and Agent handoff. A required external capability/MCP gate returns blocked_required_external_enrichment; invoke the declared matching capability and resubmit its provenance-bearing external_evidence. To persist files, the host must set BUSINESS_ARTIFACT_ROOT and pass only safe relative artifact_name / delivery_artifact_name values.", "inputSchema": {"type": "object", "properties": {"data_root": {"type": "string"}, "output_id": {"type": "string", "default": "execute_business_request"}, "params": {"type": ["string", "object", "null"]}, "request": {"type": "string"}, "rule_locator": {"type": "string", "description": "Optional rule-only locator; output/count/template instructions stay in request delivery intent."}, "external_evidence": {"type": ["object", "array"], "description": "Provenance-bearing result from the host-selected required external capability/MCP. Each item includes requirement_id, status, provider, provider_capability, query, sources, and retrieved_at (or explicit not_applicable reason)."}, "max_rows": {"type": "integer"}, "artifact_name": {"type": "string", "description": "Safe relative JSON evidence artifact name under host-injected BUSINESS_ARTIFACT_ROOT."}, "delivery_artifact_name": {"type": "string", "description": "Safe relative JSON, CSV, or XLSX result artifact name under BUSINESS_ARTIFACT_ROOT; requires artifact_name."}, "delivery_format": {"type": "string", "enum": ["auto", "json", "csv", "xlsx"], "default": "auto"}, "delivery_template_id": {"type": "string", "description": "Declared template id; materializes only when every column comes directly from the verified recipe."}, "bindings": {"type": "object"}}, "required": ["data_root", "request"]}},
     {"name": "query_data", "description": "Run a bounded read-only SELECT against declared runtime sources.", "inputSchema": {"type": "object", "properties": {"data_root": {"type": "string"}, "sql": {"type": "string"}, "link_ids": {"type": "array", "items": {"type": "string"}}, "bindings": {"type": "object"}, "max_rows": {"type": "integer"}}, "required": ["data_root", "sql"]}},
 ]
 

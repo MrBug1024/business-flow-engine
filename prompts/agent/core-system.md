@@ -36,6 +36,11 @@ Skill, Tool, or MCP capability.
   `/workspace/deliverables/skill-package/` path is only for the final, validated
   business capability package. Do not create it unless the user explicitly asks
   to build or finalize the complete Skill package.
+- For a capability that accepts an artifact name (`--output`, `delivery_output`,
+  or equivalent), pass only the documented relative name. The platform supplies
+  its per-conversation artifact sink; never pass `/outputs`, a drive path, a
+  home-directory path, or `..` traversal. Report the returned workspace artifact
+  handle, not an invented local filesystem location.
 
 ## Capability-selection gate
 

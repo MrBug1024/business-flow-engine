@@ -3,8 +3,10 @@
 This module intentionally has no external runtime-service dependency.
 It provides dependency isolation through one system-level virtual environment
 and maps the virtual ``/workspace``, ``/skills`` and ``/tmp`` roots onto local
-directories.  The venv, HOME, caches and temporary files live outside every
-business workspace.
+directories.  ``/outputs`` is a backwards-compatible alias for the current
+workspace's ``outputs`` directory, so legacy capability packages cannot create
+an untracked drive-root output directory.  The venv, HOME, caches and temporary
+files live outside every business workspace.
 
 This is an application runtime boundary, not an operating-system security
 boundary.  It keeps Skill dependencies away from the user's physical Python
@@ -49,7 +51,7 @@ DEFAULT_MAX_OUTPUT_BYTES = 100_000
 DEFAULT_MAX_TRANSFER_BYTES = 64 * 1024 * 1024
 _READ_OUTPUT_LIMIT = 500 * 1024
 _VIRTUAL_ROOT_PATTERN = re.compile(
-    r"/(?:workspace|skills|tmp)(?:/[^\s\"';&|<>)]*)?"
+    r"/(?:workspace|skills|tmp|outputs)(?:/[^\s\"';&|<>)]*)?"
 )
 _SKILL_REFERENCE_PATTERN = re.compile(r"/skills/([^/\s\"';&|<>]+)/")
 _EXPLICIT_REQUIREMENT_PATTERN = re.compile(
@@ -162,6 +164,10 @@ class LocalVenvSandboxBackend(BaseSandbox):
         )
         environment = self._base_environment()
         environment.update(scoped_environment)
+        # This is a host-owned routing boundary, not a Skill-provided setting.
+        # Do not let a declared secret/environment entry redirect artifacts out
+        # of the current conversation workspace.
+        environment["BUSINESS_ARTIFACT_ROOT"] = str(self.workspace_root / "outputs")
         explicit_requirement_skills = _explicit_requirement_skill_names(command)
         dependency_error = self._ensure_skill_dependencies(
             _referenced_skill_names(command) - explicit_requirement_skills,
@@ -501,8 +507,10 @@ class LocalVenvSandboxBackend(BaseSandbox):
         scripts = _venv_scripts(self.venv_root)
         home = self.venv_root.parent / "home"
         cache = self.venv_root.parent / "cache"
+        artifact_root = self.workspace_root / "outputs"
         home.mkdir(parents=True, exist_ok=True)
         cache.mkdir(parents=True, exist_ok=True)
+        artifact_root.mkdir(parents=True, exist_ok=True)
         environment = {
             "PATH": os.pathsep.join((str(scripts), os.environ.get("PATH", ""))),
             "VIRTUAL_ENV": str(self.venv_root),
@@ -515,6 +523,10 @@ class LocalVenvSandboxBackend(BaseSandbox):
             "TMP": str(self.temp_root),
             "TEMP": str(self.temp_root),
             "TMPDIR": str(self.temp_root),
+            # Portable capability packages receive only a host-owned artifact
+            # root.  They must resolve relative artifact names inside this
+            # directory rather than accepting arbitrary local output paths.
+            "BUSINESS_ARTIFACT_ROOT": str(artifact_root),
         }
         for key in (
             "COMSPEC",
@@ -616,6 +628,10 @@ class LocalVenvSandboxBackend(BaseSandbox):
             "workspace": self.workspace_root,
             "skills": self.skills_root,
             "tmp": self.temp_root,
+            # Retain this alias for already-generated packages that used
+            # ``/outputs``.  Canonical paths reported back to the UI remain
+            # ``/workspace/outputs/...`` via ``_to_virtual_path`` below.
+            "outputs": self.workspace_root / "outputs",
         }
         if len(pure.parts) < 2 or pure.parts[1] not in roots:
             raise PermissionError("permission_denied")

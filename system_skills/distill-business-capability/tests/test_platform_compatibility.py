@@ -24,8 +24,16 @@ class PlatformCompatibilityTests(unittest.TestCase):
         payload = {
             "status": "ready_for_agent_judgment",
             "candidate_evidence": {"records": [{"id": "a"}, {"id": "b"}]},
-            "artifact": {"kind": "scenario_evidence_package", "path": "C:/runtime/outputs/scenario-evidence.json"},
-            "agent_handoff": {"kind": "scenario_agent_handoff", "path": "C:/runtime/outputs/scenario-evidence.agent.json"},
+            "artifact": {
+                "kind": "scenario_evidence_package", "artifact_id": "artifact-evidence",
+                "relative_path": "scenario-evidence.json", "sha256": "a" * 64,
+                "size_bytes": 12, "format": "json",
+            },
+            "agent_handoff": {
+                "kind": "scenario_agent_handoff", "artifact_id": "artifact-handoff",
+                "relative_path": "scenario-evidence.agent.json", "sha256": "b" * 64,
+                "size_bytes": 8, "format": "json",
+            },
         }
         result = RUNTIME.host_action_envelope(payload)
 
@@ -34,13 +42,26 @@ class PlatformCompatibilityTests(unittest.TestCase):
         self.assertEqual(
             "bounded_evidence_record_groups_not_final_business_rows", result["row_semantics"]
         )
-        self.assertEqual("C:/runtime/outputs/scenario-evidence.json", result["artifact"])
+        self.assertEqual("scenario-evidence.json", result["artifact"])
         self.assertEqual(payload["artifact"], result["evidence_artifact"])
+        self.assertNotIn("path", result["evidence_artifact"])
         self.assertEqual(
-            "C:/runtime/outputs/scenario-evidence.agent.json",
-            result["host_response_contract"]["agent_handoff_path"],
+            "scenario-evidence.agent.json",
+            result["host_response_contract"]["agent_handoff_relative_path"],
         )
+        self.assertEqual("artifact-evidence", result["host_response_contract"]["evidence_artifact_id"])
         self.assertTrue(result["host_response_contract"]["requires_structured_passthrough"])
+
+    def test_legacy_physical_artifact_paths_are_not_reexposed(self) -> None:
+        result = RUNTIME.host_action_envelope({
+            "status": "ready_for_agent_judgment",
+            "artifact": {"kind": "scenario_evidence_package", "path": "E:/outputs/hidden.json"},
+            "agent_handoff": {"kind": "scenario_agent_handoff", "path": "E:/outputs/hidden.agent.json"},
+        })
+
+        self.assertEqual("", result["artifact"])
+        self.assertNotIn("path", result["evidence_artifact"])
+        self.assertNotIn("agent_handoff_path", result["host_response_contract"])
 
     def test_deterministic_rows_remain_distinct_from_evidence_groups(self) -> None:
         result = RUNTIME.host_action_envelope({

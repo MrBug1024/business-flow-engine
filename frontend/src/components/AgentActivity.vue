@@ -65,7 +65,12 @@
               <component :is="statusIcon(item.status)" />
             </el-icon>
             <span>{{ operationLabel(item.operation) }}</span>
-            <code :title="item.path">{{ item.path }}</code>
+            <button
+              type="button"
+              class="workspace-file-link"
+              :title="item.path"
+              @click="emit('open-workspace-file', item.workspacePath)"
+            >{{ item.path }}</button>
             <em :class="item.status">{{ statusLabel(item.status) }}</em>
           </li>
         </ul>
@@ -150,6 +155,7 @@ type TechnicalGroup = {
 type FileActivity = {
   key: string
   path: string
+  workspacePath: string
   operation: string
   status: string
 }
@@ -180,6 +186,10 @@ const props = withDefaults(defineProps<{
   compact: false,
   language: 'zh',
 })
+
+const emit = defineEmits<{
+  (event: 'open-workspace-file', path: string): void
+}>()
 
 const copy = {
   zh: {
@@ -419,6 +429,7 @@ const fileActivities = computed<FileActivity[]>(() => {
     rows.push({
       key: `${normalized(event.call_id || event.id) || rows.length}:${path}`,
       path,
+      workspacePath: path,
       operation: normalized(event.operation) || 'manage',
       status: normalized(event.status) || 'completed',
     })
@@ -545,7 +556,9 @@ function displayText(value: unknown) {
 
 function displayWorkspacePath(value: unknown) {
   const path = normalized(value).replace(/\\/g, '/')
-  return path.replace(/^\/workspace\/?/, '')
+  return path.replace(/^\/(?:workspace|outputs)\/?/, (matched) => (
+    matched.startsWith('/outputs') ? 'outputs/' : ''
+  ))
 }
 
 function eventIcon(event: TraceEvent) {
@@ -722,13 +735,26 @@ function eventIcon(event: TraceEvent) {
   font-size: 10.5px;
 }
 
-.file-activity-list code {
+.workspace-file-link {
   min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
   overflow: hidden;
   color: var(--text-main);
+  cursor: pointer;
   font-family: var(--font-mono);
+  font-size: inherit;
+  text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.workspace-file-link:hover,
+.workspace-file-link:focus-visible {
+  color: var(--accent);
+  outline: none;
+  text-decoration: underline;
 }
 
 .file-activity-list em {

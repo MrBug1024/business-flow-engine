@@ -1029,6 +1029,128 @@ class StudioStore:
             target.write_text(record.model_dump_json(indent=2), encoding="utf-8")
             return record
 
+    def claim_chat_resume(
+        self,
+        *,
+        business_id: str,
+        owner_id: str,
+        session_id: str,
+        source_run_id: str,
+        selected_model: str,
+        question_ids: tuple[str, ...],
+    ) -> dict[str, Any]:
+        """Atomically create the one continuation run for answered questions.
+
+        Preparing a resume and streaming it are separate HTTP/SSE steps.  The
+        durable claim closes the gap between them so a second browser tab (or a
+        refresh retry) cannot resume the same LangGraph checkpoint twice.
+        """
+
+        with self._lock:
+            record = self.require(business_id, owner_id)
+            session = self.require_chat_session(record, session_id)
+            source_run = next((item for item in record.runs if item.id == source_run_id), None)
+            if source_run is None or source_run.session_id != session.id:
+                raise ValueError("The waiting task no longer belongs to this chat session.")
+            if source_run.status != "waiting_for_user":
+                raise ValueError("This waiting task has already resumed or completed.")
+
+            linked_questions = [
+                item
+                for item in record.context.questions
+                if item.get("run_id") == source_run.id
+                or item.get("checkpoint_run_id") == source_run.id
+            ]
+            expected_questions = {str(item) for item in question_ids if str(item)}
+            linked_ids = {str(item.get("id") or "") for item in linked_questions}
+            if (
+                not expected_questions
+                or not expected_questions.issubset(linked_ids)
+                or any(item.get("status") == "open" for item in linked_questions)
+                or any(
+                    item.get("status") != "answered"
+                    for item in linked_questions
+                    if str(item.get("id") or "") in expected_questions
+                )
+            ):
+                raise ValueError("The waiting task still has unanswered questions.")
+
+            active_child = next(
+                (
+                    item
+                    for item in record.runs
+                    if item.resumed_from_run_id == source_run.id
+                    and item.status in {"running", "waiting_for_user", "succeeded"}
+                ),
+                None,
+            )
+            if active_child is not None:
+                raise ValueError("This waiting task is already resuming.")
+
+            source_progress = deepcopy(source_run.task_progress or {})
+            existing_claim = source_progress.get("resume_claim")
+            if (
+                isinstance(existing_claim, dict)
+                and existing_claim.get("state") == "running"
+            ):
+                raise ValueError("This waiting task is already resuming.")
+
+            claimed_at = now()
+            continuation_progress = deepcopy(source_progress)
+            continuation_progress.pop("resume_claim", None)
+            run = AIRun(
+                id=new_id("run"),
+                business_id=record.id,
+                session_id=session.id,
+                task_id=source_run.task_id or new_id("task"),
+                segment_index=max(1, source_run.segment_index),
+                resumed_from_run_id=source_run.id,
+                model=selected_model,
+                plan=list(source_run.plan),
+                task_progress=continuation_progress,
+                started_at=claimed_at,
+            )
+            if run.task_progress:
+                run.task_progress["status"] = "running"
+            source_progress["resume_claim"] = {
+                "state": "running",
+                "continuation_run_id": run.id,
+                "claimed_at": claimed_at,
+                "question_ids": sorted(expected_questions),
+            }
+            source_run.task_progress = source_progress
+            self.append_run(record, run)
+            self.save(record)
+            return {"record": record, "source_run": source_run, "run": run}
+
+    def release_chat_resume_claim(
+        self,
+        *,
+        business_id: str,
+        owner_id: str,
+        source_run_id: str,
+        continuation_run_id: str,
+    ) -> BusinessRecord:
+        """Release an unconsumed resume claim after its stream cannot start."""
+
+        with self._lock:
+            record = self.require(business_id, owner_id)
+            source_run = next((item for item in record.runs if item.id == source_run_id), None)
+            if source_run is None:
+                return record
+            progress = deepcopy(source_run.task_progress or {})
+            claim = progress.get("resume_claim")
+            if (
+                source_run.status == "waiting_for_user"
+                and isinstance(claim, dict)
+                and claim.get("state") == "running"
+                and claim.get("continuation_run_id") == continuation_run_id
+            ):
+                progress.pop("resume_claim", None)
+                source_run.task_progress = progress
+                self.save(record)
+            return record
+
     def ensure_file_catalog(
         self,
         record: BusinessRecord,

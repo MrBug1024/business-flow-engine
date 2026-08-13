@@ -7,10 +7,11 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import re
 import sys
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Sequence
 
 
@@ -30,8 +31,10 @@ MAX_DOCUMENT_INDEX_CHUNKS_PER_SOURCE = 400
 MAX_DOCUMENT_INDEX_CHARS_PER_SOURCE = 600_000
 MAX_DOCUMENT_CHUNK_CHARS = 1_500
 MAX_DOCUMENT_HITS = 40
+MAX_EXTERNAL_EVIDENCE_CHARS = 256_000
 MIN_PDF_TEXT_CHARS = 80
 DELIVERY_FORMATS = {"auto", "json", "csv", "xlsx"}
+ARTIFACT_ROOT_ENV = "BUSINESS_ARTIFACT_ROOT"
 XLSX_MAX_CELL_CHARS = 32_767
 XLSX_INVALID_SHEET_TITLE = re.compile(r"[\\\\/*?:\[\]]")
 XLSX_INVALID_TEXT = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
@@ -45,6 +48,45 @@ REQUEST_PREFIXES = (
     "请", "帮我", "执行", "进行", "处理", "分析", "审核", "审计", "核查", "检查", "查询", "定位", "生成",
 )
 CJK_TEXT = re.compile(r"[\u4e00-\u9fff]{3,}")
+# Delivery language is intentionally generic.  It is separated before rule
+# lookup so a count, output format, export destination, or report request can
+# never become a governing predicate or ranking anchor.  Do not classify a
+# clause merely because it contains a generic business word such as "result"
+# or "output": those words are also common in normative rule text.
+DELIVERY_INTENT_PATTERNS = (
+    re.compile(r"\b(?:how many|number of|count(?:\s+of)?)\b", re.IGNORECASE),
+    re.compile(r"\b(?:tell|show)\s+me\b", re.IGNORECASE),
+    re.compile(r"\b(?:export|download|preview)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:return|render|produce|generate|export)\b.{0,32}"
+        r"\b(?:file|table|template|format|structure|report)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:result|output)\b.{0,32}\b(?:file|table|template|format|structure)\b", re.IGNORECASE),
+    re.compile("\u544a\u8bc9\u6211|\u8bf7\u544a\u77e5|\u7ed9\u6211"),
+    re.compile("\u591a\u5c11\u6761|\u51e0\u6761|\u5171\u8ba1.{0,8}\u6761|\u5408\u8ba1.{0,8}\u6761"),
+    re.compile(
+        "(?:\u6309|\u6309\u7167|\u4ee5).{0,32}"
+        "(?:\u7ed3\u679c|\u8f93\u51fa|\u4ea4\u4ed8|\u6587\u4ef6|\u8868\u683c|\u6a21\u677f|\u683c\u5f0f|\u7ed3\u6784).{0,24}"
+        "(?:\u8f93\u51fa|\u8fd4\u56de|\u751f\u6210|\u4ea4\u4ed8|\u5c55\u793a|\u63d0\u4f9b)"
+    ),
+    re.compile(
+        "(?:\u8bf7|\u5e2e\u6211|\u9700\u8981|\u8981\u6c42).{0,16}"
+        "(?:\u8f93\u51fa|\u8fd4\u56de|\u751f\u6210|\u4ea4\u4ed8|\u5bfc\u51fa|\u4e0b\u8f7d|\u9884\u89c8).{0,24}"
+        "(?:\u7ed3\u679c|\u6587\u4ef6|\u8868\u683c|\u62a5\u544a|\u6a21\u677f|\u683c\u5f0f|\u7ed3\u6784)"
+    ),
+    # An explicit action plus a row-count limit is an output directive even
+    # without an imperative prefix (for example, "输出不超过99条结果").
+    re.compile(
+        "(?:\u8f93\u51fa|\u8fd4\u56de|\u751f\u6210|\u4ea4\u4ed8|\u5bfc\u51fa).{0,20}"
+        "(?:\u4e0d\u8d85\u8fc7|\u8d85\u8fc7|\u81f3\u591a|\u81f3\u5c11)?\\s*\\d*\\s*\u6761"
+        "(?:\u7ed3\u679c|\u6570\u636e|\u8bb0\u5f55)?"
+    ),
+    re.compile(
+        "^(?:\u8f93\u51fa|\u8fd4\u56de|\u751f\u6210|\u4ea4\u4ed8|\u5bfc\u51fa|\u4e0b\u8f7d|\u9884\u89c8).{0,24}"
+        "(?:\u6587\u4ef6|\u8868\u683c|\u62a5\u544a|\u6a21\u677f|\u683c\u5f0f|\u7ed3\u6784)$"
+    ),
+)
 
 GENERIC_COLUMN_ROLE_MARKERS: dict[str, tuple[str, ...]] = {
     "identifier": (
@@ -76,6 +118,138 @@ class ExecutorError(ValueError):
     pass
 
 
+class ArtifactPathError(ExecutorError):
+    """Raised when a host asks the portable package to escape its artifact sink."""
+
+
+def artifact_root() -> Path:
+    """Return the host-injected artifact root without exposing it to callers.
+
+    A portable capability may create files only inside this explicit host-owned
+    sink.  In particular, a user/Agent-supplied output path must never be used
+    as the root itself: doing so previously let a package write to arbitrary
+    locations such as ``E:\\outputs`` that the conversation could not retrieve.
+    """
+    configured = str(os.environ.get(ARTIFACT_ROOT_ENV, "")).strip()
+    if not configured:
+        raise ArtifactPathError(
+            "Persistent artifact output is blocked: the host must set BUSINESS_ARTIFACT_ROOT."
+        )
+    root = Path(configured).expanduser()
+    if not root.is_absolute():
+        raise ArtifactPathError("BUSINESS_ARTIFACT_ROOT must be an absolute host-managed directory.")
+    root = root.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    if not root.is_dir():
+        raise ArtifactPathError("BUSINESS_ARTIFACT_ROOT is not a writable artifact directory.")
+    return root
+
+
+def normalize_artifact_name(value: str | Path, label: str = "artifact name") -> str:
+    """Accept one portable relative artifact name and reject drive/escape paths."""
+    raw = str(value or "").strip()
+    normalized = raw.replace("\\", "/")
+    if not normalized:
+        raise ArtifactPathError(f"{label} must be a non-empty relative artifact name.")
+    if (
+        "\x00" in normalized
+        or normalized.startswith("/")
+        or raw.startswith("\\")
+        or re.match(r"^[A-Za-z]:", raw)
+    ):
+        raise ArtifactPathError(f"{label} must be a safe relative artifact name, not an absolute path.")
+    parts = PurePosixPath(normalized).parts
+    if not parts or any(part in {"", ".", ".."} or ":" in part for part in parts):
+        raise ArtifactPathError(f"{label} must not contain traversal or drive-qualified segments.")
+    return PurePosixPath(*parts).as_posix()
+
+
+def _absolute_artifact_input(raw: str) -> bool:
+    return (
+        Path(raw).expanduser().is_absolute()
+        or raw.replace("\\", "/").startswith("/")
+        or raw.startswith("\\")
+        or bool(re.match(r"^[A-Za-z]:", raw))
+    )
+
+
+def resolve_artifact_name(value: str | Path, label: str = "artifact name") -> tuple[Path, str]:
+    """Resolve a public artifact name under the injected root only.
+
+    A platform sandbox may translate legacy virtual ``/outputs/name`` input to
+    a physical path before this process starts.  Preserve that safe bridge only
+    when the resolved physical path is already within the injected root; all
+    other absolute paths remain rejected.
+    """
+    root = artifact_root()
+    raw = str(value or "").strip()
+    if _absolute_artifact_input(raw):
+        target = Path(raw).expanduser().resolve()
+        try:
+            relative_path = target.relative_to(root).as_posix()
+        except ValueError as exc:
+            raise ArtifactPathError(
+                f"{label} must be a safe relative artifact name or an already-translated path inside BUSINESS_ARTIFACT_ROOT."
+            ) from exc
+    else:
+        relative_path = normalize_artifact_name(raw, label)
+        target = (root.joinpath(*PurePosixPath(relative_path).parts)).resolve()
+    if target == root or root not in target.parents:
+        raise ArtifactPathError(f"{label} escapes BUSINESS_ARTIFACT_ROOT.")
+    return target, relative_path
+
+
+def artifact_relative_path(path: Path) -> tuple[Path, str]:
+    """Assert an internal path is in the artifact root and return its public name."""
+    root = artifact_root()
+    resolved = path.expanduser().resolve()
+    try:
+        relative_path = resolved.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise ArtifactPathError("Artifact output must stay inside BUSINESS_ARTIFACT_ROOT.") from exc
+    if not relative_path or relative_path == ".":
+        raise ArtifactPathError("Artifact output must name a file below BUSINESS_ARTIFACT_ROOT.")
+    return resolved, relative_path
+
+
+def artifact_reference(path: Path, kind: str, *, include_digest: bool = True) -> dict[str, Any]:
+    """Build transport-safe artifact metadata; never return a physical host path."""
+    resolved, relative_path = artifact_relative_path(path)
+    digest = hashlib.sha256()
+    size_bytes = 0
+    if include_digest:
+        if not resolved.is_file():
+            raise ArtifactPathError("Artifact file does not exist inside BUSINESS_ARTIFACT_ROOT.")
+        with resolved.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+                size_bytes += len(chunk)
+        sha256 = digest.hexdigest()
+    else:
+        sha256 = ""
+    reference = {
+        "schema_version": 1,
+        "kind": kind,
+        "artifact_id": "artifact-" + hashlib.sha256(
+            f"{kind}\0{relative_path}\0{sha256}".encode("utf-8")
+        ).hexdigest()[:24],
+        "relative_path": relative_path,
+        "format": resolved.suffix.casefold().lstrip("."),
+    }
+    if include_digest:
+        reference.update({"sha256": sha256, "size_bytes": size_bytes})
+    return reference
+
+
+def blocked_artifact_output(exc: ArtifactPathError) -> dict[str, Any]:
+    """A visible, non-writing answer for legacy hosts without an artifact sink."""
+    return {
+        "status": "blocked_host_artifact_sink",
+        "message": str(exc),
+        "artifact_root_environment": ARTIFACT_ROOT_ENV,
+    }
+
+
 def load_json(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise ExecutorError(f"Missing contract file: {path}")
@@ -102,6 +276,86 @@ def bounded_text(value: Any, limit: int = 2_000) -> Any:
 
 def normalized_text(value: Any) -> str:
     return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", str(value or "").casefold())
+
+
+def is_delivery_intent_clause(clause: str) -> bool:
+    """Recognize an explicit delivery directive, not generic rule vocabulary."""
+
+    text = str(clause or "").strip()
+    return bool(text) and any(pattern.search(text) for pattern in DELIVERY_INTENT_PATTERNS)
+
+
+def request_semantics(request: str | dict[str, Any]) -> dict[str, Any]:
+    """Separate rule locator text from delivery intent without domain rules.
+
+    The raw request remains available for reporting, but only ``rule_locator``
+    may reach rule discovery, ranking, and request-constraint fallback.  Hosts
+    can provide the split explicitly; legacy free text is split conservatively
+    on delivery-oriented clauses.
+    """
+
+    if isinstance(request, dict):
+        raw_request = str(request.get("request") or request.get("raw_request") or "").strip()
+        explicit_locator = str(request.get("rule_locator") or request.get("rule_text") or "").strip()
+        explicit_delivery = request.get("delivery_instructions")
+        delivery = [str(item).strip() for item in explicit_delivery] if isinstance(explicit_delivery, list) else (
+            [str(explicit_delivery).strip()] if str(explicit_delivery or "").strip() else []
+        )
+        if not raw_request:
+            raw_request = explicit_locator or " ".join(delivery)
+        if not raw_request:
+            raise ExecutorError("A non-empty business request is required")
+        if not explicit_locator:
+            # Object-shaped legacy requests still need the same safe split as
+            # free text.  ``execute`` intentionally passes a structured
+            # semantics object on its second hop, which already has an
+            # explicit locator and therefore never re-enters this branch.
+            inferred = request_semantics(raw_request)
+            inferred_delivery = [
+                item for item in [*inferred["delivery_instructions"], *delivery] if item
+            ]
+            return {
+                **inferred,
+                "delivery_instructions": list(dict.fromkeys(inferred_delivery)),
+                "source": "structured_request_without_explicit_locator",
+            }
+        return {
+            "raw_request": raw_request,
+            "rule_locator": explicit_locator,
+            "delivery_instructions": delivery,
+            "source": "structured_request",
+        }
+
+    raw_request = str(request or "").strip()
+    if not raw_request:
+        raise ExecutorError("A non-empty business request is required")
+    # Colons introduce a locator in many imperative requests; commas and
+    # sentence boundaries usually introduce delivery clauses.  Keep a clause
+    # unless it has an explicit delivery sentence pattern.
+    clauses = [
+        item.strip(" -—_\t")
+        for item in re.split(r"[，,；;。！？!?\r\n]+", raw_request)
+        if item.strip(" -—_\t")
+    ]
+    locator_clauses: list[str] = []
+    delivery: list[str] = []
+    for clause in clauses or [raw_request]:
+        if is_delivery_intent_clause(clause):
+            delivery.append(clause)
+        else:
+            locator_clauses.append(clause)
+    locator = "，".join(locator_clauses).strip()
+    if not locator:
+        # A delivery-only request cannot identify a rule. Retain it as the
+        # locator solely so the normal bounded 'rule not found' path explains
+        # the missing governing record rather than silently doing nothing.
+        locator = raw_request
+    return {
+        "raw_request": raw_request,
+        "rule_locator": locator,
+        "delivery_instructions": delivery,
+        "source": "heuristic_legacy_text",
+    }
 
 
 def infer_column_semantic_role(column: dict[str, Any]) -> str:
@@ -497,37 +751,18 @@ def search_source(
 def write_artifact(
     path: Path, payload: dict[str, Any], kind: str = "scenario_evidence_package",
 ) -> dict[str, Any]:
-    path = path.expanduser().resolve()
+    path, _relative_path = artifact_relative_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     encoded = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_bytes(encoded)
     temporary.replace(path)
-    return {
-        "kind": kind,
-        "path": str(path),
-        "format": "json",
-        "sha256": hashlib.sha256(encoded).hexdigest(),
-        "size_bytes": len(encoded),
-    }
+    return artifact_reference(path, kind)
 
 
 def file_artifact_descriptor(path: Path, kind: str) -> dict[str, Any]:
     """Return a content-addressed descriptor for an already-persisted file."""
-    path = path.expanduser().resolve()
-    if not path.is_file():
-        raise ExecutorError(f"Artifact file does not exist: {path}")
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return {
-        "kind": kind,
-        "path": str(path),
-        "format": path.suffix.casefold().lstrip("."),
-        "sha256": digest.hexdigest(),
-        "size_bytes": path.stat().st_size,
-    }
+    return artifact_reference(path, kind)
 
 
 def _delivery_format(path: Path, requested: str) -> tuple[str | None, str | None]:
@@ -564,6 +799,143 @@ def _deterministic_delivery_columns(result: dict[str, Any]) -> tuple[list[str], 
     return columns, rows
 
 
+def _template_format(template: dict[str, Any]) -> str:
+    return str(template.get("format", "")).strip().casefold().lstrip(".")
+
+
+def _template_delivery_capability(
+    template: dict[str, Any], delivery_format: str,
+) -> dict[str, Any]:
+    """Validate a data-free historical structure before writing a result file.
+
+    New generated contracts carry a single-table schema and an explicit
+    materialization declaration.  Older generated packages exposed only a
+    flat `columns` list; retain that narrow backward-compatible form without
+    treating it as a claim about workbook layout.
+    """
+
+    template_id = str(template.get("template_id", "")).strip()
+    template_format = _template_format(template)
+    if template_format and template_format != delivery_format:
+        return {
+            "status": "not_compatible",
+            "template_id": template_id,
+            "template_format": template_format,
+            "requested_delivery_format": delivery_format,
+            "message": (
+                f"Template {template_id!r} declares {template_format!r}, but this portable "
+                f"runtime can only materialize a matching {delivery_format!r} result file."
+            ),
+        }
+
+    materialization = template.get("materialization")
+    if isinstance(materialization, dict):
+        if str(materialization.get("status", "")) != "materializable_schema":
+            return {
+                "status": "not_materializable",
+                "template_id": template_id,
+                "template_format": template_format,
+                "requested_delivery_format": delivery_format,
+                "reason": materialization.get("reason", "unavailable_structure"),
+                "message": materialization.get("message") or (
+                    "The declared historical output structure is not materializable by the portable runtime."
+                ),
+                "materialization": materialization,
+            }
+        tables = [item for item in template.get("tables", []) if isinstance(item, dict)]
+        selected_table_id = str(materialization.get("selected_table_id", "")).strip()
+        selected_tables = [
+            table for table in tables
+            if str(table.get("table_id", "")).strip() == selected_table_id
+        ]
+        if len(selected_tables) != 1:
+            return {
+                "status": "not_materializable",
+                "template_id": template_id,
+                "template_format": template_format,
+                "requested_delivery_format": delivery_format,
+                "reason": "selected_table_missing_or_ambiguous",
+                "message": "The template does not declare exactly one selected table for portable materialization.",
+            }
+        table = selected_tables[0]
+        descriptors = [item for item in table.get("columns", []) if isinstance(item, dict)]
+        descriptors.sort(key=lambda item: int(item.get("ordinal", 0)) if str(item.get("ordinal", "")).isdigit() else 0)
+        columns = [str(item.get("name", "")).strip() for item in descriptors if str(item.get("name", "")).strip()]
+        declared_order = [str(item).strip() for item in materialization.get("column_order", []) if str(item).strip()]
+        if not columns or len(columns) != len(set(columns)) or (declared_order and declared_order != columns):
+            return {
+                "status": "not_materializable",
+                "template_id": template_id,
+                "template_format": template_format,
+                "requested_delivery_format": delivery_format,
+                "reason": "invalid_declared_column_structure",
+                "message": "The declared historical column order is incomplete, duplicated, or internally inconsistent.",
+            }
+        if table.get("header_row_index") != 0 or materialization.get("header_row_index") != 0:
+            return {
+                "status": "not_materializable",
+                "template_id": template_id,
+                "template_format": template_format,
+                "requested_delivery_format": delivery_format,
+                "reason": "noncanonical_header_offset",
+                "message": "The portable writer cannot reproduce title or pre-header rows without a dedicated layout renderer.",
+            }
+        if delivery_format == "xlsx":
+            worksheet_name = str(materialization.get("worksheet_name") or table.get("worksheet_name") or "")
+            table_worksheet_name = str(table.get("worksheet_name") or "")
+            if (
+                not worksheet_name
+                or worksheet_name != table_worksheet_name
+                or safe_xlsx_sheet_name(worksheet_name) != worksheet_name
+            ):
+                return {
+                    "status": "not_materializable",
+                    "template_id": template_id,
+                    "template_format": template_format,
+                    "requested_delivery_format": delivery_format,
+                    "reason": "unsupported_worksheet_name",
+                    "message": "The declared historical worksheet name cannot be reproduced exactly by the portable writer.",
+                }
+        return {
+            "status": "ready",
+            "template_id": template_id,
+            "template_format": template_format or delivery_format,
+            "columns": columns,
+            "column_descriptors": descriptors,
+            "table": table,
+            "materialization": materialization,
+            "historical_structure": True,
+        }
+
+    # Compatibility path for packages published before the structured-template
+    # contract.  They can preserve a declared column order but make no layout
+    # promise (such as sheet name, pre-header rows, or styling).
+    columns: list[str] = []
+    for item in template.get("columns", []):
+        column = str(item).strip()
+        if column and column not in columns:
+            columns.append(column)
+    if not columns:
+        return {
+            "status": "not_materializable",
+            "template_id": template_id,
+            "template_format": template_format,
+            "requested_delivery_format": delivery_format,
+            "reason": "missing_columns",
+            "message": f"Template {template_id!r} has no declared output columns.",
+        }
+    return {
+        "status": "ready",
+        "template_id": template_id,
+        "template_format": template_format or delivery_format,
+        "columns": columns,
+        "column_descriptors": [],
+        "table": {},
+        "materialization": {},
+        "historical_structure": False,
+    }
+
+
 def delivery_plan(
     payload: dict[str, Any], output_path: Path, requested_format: str = "auto",
     template_id: str = "",
@@ -574,6 +946,7 @@ def delivery_plan(
     a final result.  Only the existing replay gate may cross that boundary.
     This function intentionally performs no rule interpretation or source IO.
     """
+    output_path, _output_relative_path = artifact_relative_path(output_path)
     if payload.get("status") != "completed_deterministically":
         return {
             "status": "blocked_delivery_requires_verified_result",
@@ -608,7 +981,6 @@ def delivery_plan(
             "status": "blocked_delivery_missing_result_columns",
             "message": "No final result file was written because the verified result has no exportable columns.",
         }
-    output_path = output_path.expanduser().resolve()
     delivery_format, format_error = _delivery_format(output_path, requested_format)
     if format_error:
         return {
@@ -630,6 +1002,9 @@ def delivery_plan(
             "emitted by the verified recipe."
         ),
     }
+    selected_template: dict[str, Any] | None = None
+    selected_capability: dict[str, Any] | None = None
+    selection_mode = ""
     if requested_template:
         matched = [
             item for item in templates
@@ -641,31 +1016,70 @@ def delivery_plan(
                 "message": f"No design-time output template has id {requested_template!r}.",
                 "available_template_ids": [str(item.get("template_id", "")) for item in templates],
             }
-        template = matched[0]
-        template_format = str(template.get("format", "")).strip().casefold().lstrip(".")
-        if template_format and template_format != delivery_format:
+        selected_template = matched[0]
+        selected_capability = _template_delivery_capability(selected_template, delivery_format)
+        if selected_capability.get("status") == "not_compatible":
             return {
                 "status": "blocked_delivery_format_requires_renderer",
-                "message": (
-                    f"Template {requested_template!r} declares {template_format!r}, but this portable "
-                    f"runtime can only materialize a matching {delivery_format!r} result file. "
-                    "It will not pretend to have created a different document format."
-                ),
+                "message": selected_capability.get("message"),
                 "template_id": requested_template,
-                "template_format": template_format,
+                "template_format": selected_capability.get("template_format"),
                 "requested_delivery_format": delivery_format,
             }
-        template_columns: list[str] = []
-        for item in template.get("columns", []):
-            column = str(item)
-            if column and column not in template_columns:
-                template_columns.append(column)
-        if not template_columns:
+        if selected_capability.get("status") != "ready":
             return {
                 "status": "blocked_delivery_template_not_materializable",
-                "message": f"Template {requested_template!r} has no declared output columns.",
+                "message": selected_capability.get("message"),
                 "template_id": requested_template,
+                "reason": selected_capability.get("reason"),
+                "template_materialization": selected_capability.get("materialization"),
             }
+        selection_mode = "explicit_template_id"
+    elif delivery_format in {"csv", "xlsx"}:
+        format_templates = [
+            item for item in templates
+            if _template_format(item) == delivery_format
+        ]
+        capabilities = [
+            (item, _template_delivery_capability(item, delivery_format))
+            for item in format_templates
+        ]
+        ready = [(item, capability) for item, capability in capabilities if capability.get("status") == "ready"]
+        if len(ready) == 1:
+            selected_template, selected_capability = ready[0]
+            selection_mode = "auto_single_compatible_template"
+        elif len(ready) > 1:
+            return {
+                "status": "blocked_delivery_template_selection_required",
+                "message": (
+                    "More than one materializable historical output structure matches this delivery format. "
+                    "Specify --template-id; no file was written."
+                ),
+                "requested_delivery_format": delivery_format,
+                "available_template_ids": [
+                    str(item.get("template_id", "")) for item, _ in ready
+                ],
+            }
+        elif format_templates:
+            return {
+                "status": "blocked_delivery_template_not_materializable",
+                "message": (
+                    "Historical output structures exist for this delivery format, but none can be reproduced "
+                    "by the portable schema writer. No lookalike file was written."
+                ),
+                "requested_delivery_format": delivery_format,
+                "templates": [
+                    {
+                        "template_id": capability.get("template_id"),
+                        "reason": capability.get("reason"),
+                        "message": capability.get("message"),
+                    }
+                    for _, capability in capabilities
+                ],
+            }
+
+    if selected_template is not None and selected_capability is not None:
+        template_columns = selected_capability["columns"]
         missing = [column for column in template_columns if column not in columns]
         if missing:
             return {
@@ -679,13 +1093,23 @@ def delivery_plan(
                 "recipe_columns": columns,
             }
         columns = template_columns
+        table = selected_capability.get("table") if isinstance(selected_capability.get("table"), dict) else {}
+        materialization = selected_capability.get("materialization") if isinstance(selected_capability.get("materialization"), dict) else {}
         template_materialization = {
-            "status": "materialized_exact_columns",
-            "template_id": requested_template,
-            "name": template.get("name"),
+            "status": "materialized_historical_structure" if selected_capability.get("historical_structure") else "materialized_exact_columns",
+            "template_id": str(selected_template.get("template_id", "")),
+            "selection": selection_mode,
+            "name": selected_template.get("name"),
             "format": delivery_format,
             "selected_columns": columns,
-            "message": "Every requested template column is emitted directly by the verified recipe.",
+            "column_descriptors": selected_capability.get("column_descriptors", []),
+            "table_id": table.get("table_id"),
+            "table_name": table.get("table_name"),
+            "worksheet_name": table.get("worksheet_name"),
+            "header_row_index": table.get("header_row_index"),
+            "layout_fidelity": materialization.get("layout_fidelity", "column_order_only"),
+            "structure_fingerprint": selected_template.get("structure_fingerprint", ""),
+            "message": "Every selected template column is emitted directly by the verified recipe; historical business rows were not used.",
         }
     return {
         "status": "ready",
@@ -757,7 +1181,7 @@ def _xlsx_cell(value: Any) -> Any:
 
 def write_csv_artifact(path: Path, columns: Sequence[str], rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """Atomically write a UTF-8 CSV projection without adding a spreadsheet dependency."""
-    path = path.expanduser().resolve()
+    path, _relative_path = artifact_relative_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8", newline="") as handle:
@@ -783,7 +1207,7 @@ def write_xlsx_artifact(
     except ImportError as exc:  # pragma: no cover - exercised in target runtime
         raise ExecutorError("openpyxl is required for XLSX delivery; install this Skill's requirements.txt") from exc
 
-    path = path.expanduser().resolve()
+    path, _relative_path = artifact_relative_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     title = safe_xlsx_sheet_name(sheet_name)
     temporary = path.with_name(f"{path.stem}.tmp{path.suffix}")
@@ -875,7 +1299,10 @@ def materialize_verified_delivery(
             plan["output_path"],
             plan["columns"],
             plan["rows"],
-            str(template.get("name") or "Result") if isinstance(template, dict) else "Result",
+            (
+                str(template.get("worksheet_name") or template.get("name") or "Result")
+                if isinstance(template, dict) else "Result"
+            ),
         )
         manifest_path = plan["output_path"].with_name(plan["output_path"].stem + ".delivery.json")
         manifest = write_artifact(manifest_path, document, "verified_deterministic_result_delivery_manifest")
@@ -896,12 +1323,13 @@ def deliver_saved_result(
     result_path: Path, output_path: Path, requested_format: str = "auto", template_id: str = "",
 ) -> dict[str, Any]:
     """Materialize a result file from an existing evidence package without re-execution."""
-    result_path = result_path.expanduser().resolve()
-    if result_path == output_path.expanduser().resolve():
+    result_path, _result_relative_path = artifact_relative_path(result_path)
+    output_path, _output_relative_path = artifact_relative_path(output_path)
+    if result_path == output_path:
         return {
             "status": "blocked_delivery_output_conflicts_with_evidence",
             "message": "Delivery output must not overwrite the JSON evidence package.",
-            "evidence_path": str(result_path),
+            "evidence_artifact": file_artifact_descriptor(result_path, "scenario_evidence_package"),
         }
     payload = load_json(result_path)
     evidence_package = file_artifact_descriptor(result_path, "scenario_evidence_package")
@@ -936,7 +1364,7 @@ def result_handle(payload: dict[str, Any], artifact_path: Path) -> dict[str, Any
         "schema_version": 1,
         "kind": "deterministic_result_handle",
         "result_id": _stable_result_id(payload),
-        "artifact": str(artifact_path.expanduser().resolve()),
+        "artifact_relative_path": artifact_relative_path(artifact_path)[1],
         "filterable_columns": columns,
         "complete_for_projection": bool(coverage.get("complete_for_all_matching_runtime_rows")),
         "continuation_command": "continue --result <scenario-evidence-package.json> --filter <field>=<value>",
@@ -974,7 +1402,8 @@ def continue_deterministic_result(result_path: Path, filter_values: Sequence[str
     cannot switch data sources, re-resolve a rule, or invent SQL; it receives a
     filtered view of the same completed deterministic result.
     """
-    payload = load_json(result_path.expanduser().resolve())
+    result_path, _result_relative_path = artifact_relative_path(result_path)
+    payload = load_json(result_path)
     if payload.get("status") != "completed_deterministically":
         raise ExecutorError("Continuation requires a completed deterministic result artifact")
     deterministic = payload.get("deterministic_result")
@@ -1206,7 +1635,10 @@ def collect_document_evidence(
                 source_digest = documents.file_digest(path)
                 segments, bounds = bounded_document_segments(documents, path)
                 index_path = index_root / f"{position:02d}-{hashlib.sha256(source_id.encode('utf-8')).hexdigest()[:16]}.sqlite"
-                index = documents.create_index(index_path, str(path), source_digest, segments)
+                # The document index is process-private temporary evidence, not
+                # a delivered artifact. Never route this transient path through
+                # the host artifact sink or return it in result metadata.
+                index = documents.create_temporary_index(index_path, str(path), source_digest, segments)
                 index_summary = {
                     "chunk_count": int(index.get("chunk_count", 0)),
                     "character_count": int(index.get("character_count", 0)),
@@ -1217,13 +1649,13 @@ def collect_document_evidence(
                     "truncated": bool(bounds["truncated"]),
                 }
                 source_result.update({
-                    "path": str(source.get("path", "")),
+                    "source_reference": str(source.get("path", "")),
                     "source_digest": source_digest,
                     "index": index_summary,
                 })
                 result["preflight"]["registrations"].append({
                     "source_id": source_id,
-                    "path": str(path),
+                    "source_reference": str(source.get("path", "")),
                     "kind": kind,
                     "source_digest": source_digest,
                     "index_chunk_count": index_summary["chunk_count"],
@@ -1340,9 +1772,9 @@ def source_semantic_columns(contract: dict[str, Any], source_id: str) -> dict[st
 
 
 def derive_rule_constraints(
-    selected_rule: dict[str, Any] | None, contract: dict[str, Any], request: str = "",
+    selected_rule: dict[str, Any] | None, contract: dict[str, Any], rule_locator: str = "",
 ) -> dict[str, Any]:
-    """Extract bounded, inspectable rule signals without pretending to adjudicate them."""
+    """Extract rule signals; fallback sees only the normalized rule locator."""
     row = selected_rule.get("row", {}) if isinstance(selected_rule, dict) else {}
     # Example/reference columns describe historical evidence, not a second
     # normative predicate for the current request.
@@ -1351,7 +1783,7 @@ def derive_rule_constraints(
         for key, value in row.items()
         if not any(marker in normalized_text(key) for marker in ("example", "sample", "reference", "示例", "参考"))
     )
-    request_text = str(request or "")
+    locator_text = str(rule_locator or "")
     pattern = re.compile(
         r"(\u4e0d\u8d85\u8fc7|\u8d85\u8fc7|\u4e0d\u5c11\u4e8e|\u81f3\u5c11|\u4e0d\u4f4e\u4e8e|\u5927\u4e8e\u7b49\u4e8e|\u5927\u4e8e|\u5c0f\u4e8e\u7b49\u4e8e|\u5c0f\u4e8e|at\s+most|at\s+least|greater\s+than|less\s+than|equal\s+to)"
         r"\s*([0-9]+(?:\.[0-9]+)?)\s*(\u5929|\u65e5|\u6b21|\u5143|\u4e2a|\u4ef6|\u9879|days?|times?|items?|units?|percent|%)?"
@@ -1368,8 +1800,8 @@ def derive_rule_constraints(
             for match in pattern.finditer(text)
         ]
     normative_constraints = parse_constraints(normative_text)
-    request_constraints = parse_constraints(request_text)
-    constraints = normative_constraints or request_constraints
+    locator_constraints = parse_constraints(locator_text)
+    constraints = normative_constraints or locator_constraints
     field_candidates: dict[str, list[dict[str, Any]]] = {}
     for source_id in contract.get("runtime_source_ids", []):
         semantic_columns = source_semantic_columns(contract, str(source_id))
@@ -1403,13 +1835,13 @@ def derive_rule_constraints(
     return {
         "constraints": constraints,
         "normative_constraints": normative_constraints,
-        "request_constraints": request_constraints,
-        "constraint_source": "selected_rule_row" if normative_constraints else "user_request_fallback",
+        "rule_locator_constraints": locator_constraints,
+        "constraint_source": "selected_rule_row" if normative_constraints else "rule_locator_fallback",
         "rule_row_id": rule_row_id,
         "field_candidates": field_candidates,
         "application_plan": application_plan,
         "semantic_decision_required": True,
-        "boundary": "Normative constraints exclude reference-example columns; request constraints are shown separately. The Agent must still apply the rule to candidate evidence.",
+        "boundary": "Normative constraints exclude reference-example columns; fallback constraints come only from rule_locator, never delivery/count/output wording. The Agent must still apply the rule to candidate evidence.",
     }
 
 
@@ -1467,7 +1899,14 @@ def result_contract(flow: dict[str, Any]) -> dict[str, Any]:
                 "template_id": item.get("template_id"),
                 "name": item.get("name"),
                 "format": item.get("format"),
+                "source_kind": item.get("source_kind"),
                 "columns": item.get("output_columns", []),
+                "tables": item.get("tables", []),
+                "materialization": item.get("materialization", {}),
+                "structure_fingerprint": item.get("structure_fingerprint", ""),
+                "historical_data_policy": item.get(
+                    "historical_data_policy", "structure_metadata_only_no_historical_rows"
+                ),
                 "runtime_required": False,
             }
             for item in templates if isinstance(item, dict)
@@ -1477,9 +1916,264 @@ def result_contract(flow: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def required_external_requirements(contract: dict[str, Any], flow: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read scenario-required host integrations, never local rule tables."""
+
+    candidates = flow.get("external_requirements")
+    if not isinstance(candidates, list) or not any(
+        isinstance(item, dict) and item.get("required") is True for item in candidates
+    ):
+        candidates = contract.get("external_requirements")
+    if not isinstance(candidates, list) or not any(
+        isinstance(item, dict) and item.get("required") is True for item in candidates
+    ):
+        candidates = contract.get("external_capabilities", [])
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in candidates:
+        if not isinstance(item, dict) or item.get("required") is not True:
+            continue
+        requirement_id = str(item.get("requirement_id") or item.get("node_id") or "")
+        if not requirement_id or requirement_id in seen:
+            continue
+        seen.add(requirement_id)
+        result.append({**item, "requirement_id": requirement_id})
+    return result
+
+
+def condition_scope_text(condition_text: str) -> str:
+    """Extract a conditional subject from scenario text without domain terms."""
+
+    text = str(condition_text or "").strip()
+    if not text:
+        return ""
+    first = re.split(r"[，,；;。.!?！？]", text, maxsplit=1)[0]
+    first = re.split(
+        r"\b(?:must|shall|required|need to|needs to)\b|\u5fc5\u987b|\u9700\u8981|\u5e94\u5f53",
+        first, maxsplit=1, flags=re.IGNORECASE,
+    )[0]
+    first = re.sub(
+        r"^\s*(?:if|when|unless|where|\u5982\u679c|\u5f53|\u82e5|\u9047\u5230)\s*",
+        "", first, flags=re.IGNORECASE,
+    )
+    return re.sub(
+        r"^(?:the\s+)?(?:selected\s+)?rule\s+(?:has|contains|mentions?)\s*|^\u89c4\u5219(?:\u6709|\u5305\u542b|\u6d89\u53ca)",
+        "", first, flags=re.IGNORECASE,
+    ).strip()
+
+
+def requirement_applies_to_selected_rule(requirement: dict[str, Any], selected_rule: dict[str, Any]) -> tuple[bool, str]:
+    condition_text = str(requirement.get("condition_text", "")).strip()
+    evaluation = str(requirement.get("condition_evaluation", "always_after_complete_rule_selection"))
+    if not condition_text or evaluation == "always_after_complete_rule_selection":
+        return True, "no_condition_declared"
+    scope = condition_scope_text(condition_text)
+    normalized_scope = normalized_text(scope)
+    if len(normalized_scope) < 2:
+        return True, "condition_not_machine_resolvable_fail_closed"
+    row = selected_rule.get("row", {}) if isinstance(selected_rule, dict) else {}
+    selected_text = normalized_text(" ".join(str(value or "") for value in row.values()))
+    if normalized_scope in selected_text:
+        return True, "condition_matches_selected_rule"
+    cjk = "".join(re.findall(r"[\u4e00-\u9fff]", scope))
+    anchors = [
+        cjk[index:index + width]
+        for width in range(min(6, len(cjk)), 2, -1)
+        for index in range(max(0, len(cjk) - width + 1))
+    ]
+    if any(normalized_text(anchor) in selected_text for anchor in anchors):
+        return True, "condition_anchor_matches_selected_rule"
+    # Natural-language conditions routinely name a classification that the
+    # selected record expresses only through a concrete value.  Treating a
+    # lexical miss as not-applicable would silently bypass a mandatory
+    # scenario contract.  Ask the declared host capability/MCP to classify it
+    # and accept an explicit, attributable not_applicable response if needed.
+    return True, "condition_requires_host_classification_fail_closed"
+
+
+def normalize_external_evidence(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        value = value.get("items") if isinstance(value.get("items"), list) else [value]
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]
+
+
+def parse_external_evidence_json(value: str) -> Any:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if len(raw) > MAX_EXTERNAL_EVIDENCE_CHARS:
+        raise ExecutorError("--external-evidence-json exceeds the bounded evidence input limit")
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ExecutorError("--external-evidence-json must be a JSON object or array") from exc
+    if not isinstance(decoded, (dict, list)):
+        raise ExecutorError("--external-evidence-json must decode to a JSON object or array")
+    return decoded
+
+
+def external_enrichment_gate(
+    contract: dict[str, Any], flow: dict[str, Any], selected_rule: dict[str, Any], external_evidence: Any,
+) -> dict[str, Any]:
+    """Require a host/MCP response after the governing record is selected."""
+
+    requirements = required_external_requirements(contract, flow)
+    if not requirements:
+        return {"status": "not_required", "requirements": [], "records": []}
+    evidence_by_requirement: dict[str, dict[str, Any]] = {}
+    for record in normalize_external_evidence(external_evidence):
+        requirement_id = str(record.get("requirement_id") or record.get("node_id") or "")
+        if requirement_id and requirement_id not in evidence_by_requirement:
+            evidence_by_requirement[requirement_id] = record
+    records: list[dict[str, Any]] = []
+    blockers: list[dict[str, Any]] = []
+    for requirement in requirements:
+        requirement_id = str(requirement["requirement_id"])
+        applies, applicability = requirement_applies_to_selected_rule(requirement, selected_rule)
+        if not applies:
+            records.append({
+                "requirement_id": requirement_id,
+                "state": "not_required_for_selected_rule",
+                "applicability": applicability,
+            })
+            continue
+        evidence = evidence_by_requirement.get(requirement_id)
+        if evidence is None:
+            blockers.append({
+                "requirement": requirement,
+                "reason": "required_external_evidence_not_supplied",
+                "applicability": applicability,
+            })
+            continue
+        evidence_status = str(evidence.get("status", "success"))
+        if evidence_status == "success":
+            missing = [
+                field for field in requirement.get("evidence_contract", [])
+                if field in {"provider", "provider_capability", "query", "sources", "retrieved_at"}
+                and not evidence.get(field)
+            ]
+            if missing:
+                blockers.append({
+                    "requirement": requirement,
+                    "reason": "external_evidence_missing_required_provenance",
+                    "missing_fields": missing,
+                    "applicability": applicability,
+                })
+            else:
+                records.append({
+                    "requirement_id": requirement_id,
+                    "state": "completed",
+                    "applicability": applicability,
+                    "evidence": evidence,
+                })
+        elif evidence_status == "not_applicable" and str(evidence.get("reason", "")).strip():
+            records.append({
+                "requirement_id": requirement_id,
+                "state": "completed_not_applicable",
+                "applicability": applicability,
+                "evidence": evidence,
+            })
+        else:
+            blockers.append({
+                "requirement": requirement,
+                "reason": str(evidence.get("reason") or "external_capability_unavailable_or_unsuccessful"),
+                "provider_status": evidence_status,
+                "applicability": applicability,
+            })
+    return {
+        "status": "blocked" if blockers else "completed",
+        "requirements": requirements,
+        "records": records,
+        "blockers": blockers,
+    }
+
+
+def bounded_external_value(value: Any, depth: int = 0) -> Any:
+    """Keep returned enrichment useful to an Agent without unbounded stdout."""
+
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if depth >= 5:
+        return bounded_text(value, 2_000)
+    if isinstance(value, dict):
+        projected: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= 48:
+                projected["_truncated_key_count"] = max(0, len(value) - index)
+                break
+            projected[str(bounded_text(key, 160))] = bounded_external_value(item, depth + 1)
+        return projected
+    if isinstance(value, (list, tuple)):
+        projected_items = [bounded_external_value(item, depth + 1) for item in value[:32]]
+        if len(value) > len(projected_items):
+            projected_items.append({"_truncated_item_count": len(value) - len(projected_items)})
+        return projected_items
+    return bounded_text(value, 4_000)
+
+
+def external_enrichment_projection(value: Any) -> dict[str, Any] | None:
+    """Project required enrichment and its verified returned evidence for handoff."""
+
+    if not isinstance(value, dict):
+        return None
+    requirements = []
+    for item in value.get("requirements", []) if isinstance(value.get("requirements"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        requirements.append({
+            "requirement_id": item.get("requirement_id"),
+            "node_id": item.get("node_id"),
+            "name": item.get("name"),
+            "description": bounded_text(item.get("description", ""), 2_000),
+            "condition_text": bounded_text(item.get("condition_text", ""), 2_000),
+            "capability_kinds": item.get("capability_kinds", []),
+            "accepted_integrations": item.get("accepted_integrations", []),
+            "evidence_contract": item.get("evidence_contract", []),
+            "failure_policy": item.get("failure_policy"),
+        })
+    records = []
+    for item in value.get("records", []) if isinstance(value.get("records"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        records.append({
+            "requirement_id": item.get("requirement_id"),
+            "state": item.get("state"),
+            "applicability": item.get("applicability"),
+            # Keep the returned external facts as well as provenance.  The
+            # Agent is explicitly allowed to use this bounded evidence in its
+            # one business-evaluation pass after the gate has completed.
+            "evidence": bounded_external_value(item.get("evidence")),
+        })
+    blockers = []
+    for item in value.get("blockers", []) if isinstance(value.get("blockers"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        requirement = item.get("requirement") if isinstance(item.get("requirement"), dict) else {}
+        blockers.append({
+            "requirement_id": requirement.get("requirement_id") or item.get("requirement_id"),
+            "reason": item.get("reason"),
+            "missing_fields": item.get("missing_fields", []),
+            "provider_status": item.get("provider_status"),
+            "applicability": item.get("applicability"),
+        })
+    return {
+        "status": value.get("status"),
+        "requirements": requirements,
+        "records": records,
+        "blockers": blockers,
+        "handoff_boundary": (
+            "Use completed evidence and its provenance to assist the selected-rule evaluation; "
+            "do not treat absent, unsuccessful, or unprovenanced evidence as optional."
+        ),
+    }
+
+
 def execution_steps(
     flow: dict[str, Any], status: str, rule_selection: str,
     candidate_evidence: dict[str, Any], result: dict[str, Any],
+    external_enrichment: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Expose the inferred sequence as state, rather than prompt memory."""
     stages = [item for item in flow.get("stages", []) if isinstance(item, dict)]
@@ -1523,15 +2217,28 @@ def execution_steps(
         rule_detail = "No complete rule row matched the request; do not infer a policy from partial text."
     add("runtime.rule_resolution", "locate_complete_governing_record", rule_state, "use_selected_record", rule_detail)
 
+    external_state = str((external_enrichment or {}).get("status", "not_required"))
+    if external_state == "blocked":
+        enrichment_step_state = "blocked"
+        enrichment_detail = (
+            "A scenario-required host capability or MCP response is missing, unavailable, or lacks provenance; "
+            "the business decision is blocked."
+        )
+    elif external_state == "completed":
+        enrichment_step_state = "completed"
+        enrichment_detail = "Required external enrichment was returned with host/MCP provenance after complete rule selection."
+    else:
+        enrichment_step_state = "not_required"
+        enrichment_detail = "No required external enrichment applies to the selected governing record."
     add(
-        "runtime.optional_enrichment",
-        "optional_enrichment_check",
-        "not_required" if rule_selection == "unique" else "pending",
-        "activate_only_if_declared",
-        "No optional enrichment is activated unless the accepted capability model declares it necessary and available.",
+        "runtime.required_external_enrichment",
+        "resolve_required_external_enrichment",
+        enrichment_step_state,
+        "invoke_declared_host_capability_or_mcp",
+        enrichment_detail,
     )
 
-    evidence_state = "blocked" if rule_selection not in {"unique", "not_applicable"} else (
+    evidence_state = "blocked" if external_state == "blocked" or rule_selection not in {"unique", "not_applicable"} else (
         "blocked" if evidence_status == "no_candidate_row" else "completed"
     )
     add(
@@ -1542,7 +2249,10 @@ def execution_steps(
         "Runtime rows are selected from the ranked source set and linked only through accepted key sets.",
     )
 
-    if rule_selection not in {"unique", "not_applicable"}:
+    if external_state == "blocked":
+        adjudicate_state = "blocked"
+        adjudicate_detail = "Business evaluation cannot start until required external enrichment is returned by the host capability or MCP."
+    elif rule_selection not in {"unique", "not_applicable"}:
         adjudicate_state = "blocked"
         adjudicate_detail = "Business evaluation cannot start until one complete governing record is selected."
     elif evidence_status == "no_candidate_row":
@@ -1610,9 +2320,86 @@ def next_step_for_agent(
     }
 
 
+def blocked_required_external_enrichment_payload(
+    request: str,
+    semantics: dict[str, Any],
+    terms: Sequence[str],
+    flow: dict[str, Any],
+    preflight: dict[str, Any],
+    rule_matches: list[dict[str, Any]],
+    selected_rule: dict[str, Any],
+    rule_constraints: dict[str, Any],
+    external_enrichment: dict[str, Any],
+) -> dict[str, Any]:
+    """Return a structured host handoff instead of optional-enrichment prose."""
+
+    candidate_evidence = {
+        "status": "not_started",
+        "instruction": "No business data was opened before the required external capability/MCP gate completed.",
+        "sources": [],
+        "records": [],
+    }
+    requirements = [
+        {
+            "requirement_id": item.get("requirement_id"),
+            "node_id": item.get("node_id"),
+            "name": item.get("name"),
+            "description": item.get("description"),
+            "condition_text": item.get("condition_text"),
+            "capability_kinds": item.get("capability_kinds", []),
+            "accepted_integrations": item.get("accepted_integrations", []),
+            "capability_selection": item.get("capability_selection"),
+            "query_context": item.get("query_context"),
+            "evidence_contract": item.get("evidence_contract", []),
+            "failure_policy": item.get("failure_policy"),
+        }
+        for item in external_enrichment.get("requirements", []) if isinstance(item, dict)
+    ]
+    return {
+        "status": "blocked_required_external_enrichment",
+        "request": request,
+        "request_semantics": semantics,
+        "search_terms": list(terms),
+        "rule_selection": "unique",
+        "selected_rule": selected_rule,
+        "rule_constraints": rule_constraints,
+        "preflight": preflight,
+        "rule_matches": rule_matches,
+        "candidate_evidence": candidate_evidence,
+        "external_enrichment": external_enrichment,
+        "required_external_enrichment": requirements,
+        "execution_steps": execution_steps(
+            flow, "blocked_required_external_enrichment", "unique", candidate_evidence,
+            {"preflight": preflight}, external_enrichment,
+        ),
+        "result_contract": result_contract(flow),
+        "evidence_policy": {
+            "raw_source_files_not_loaded": True,
+            "requires_agent_judgment": False,
+            "semantic_decision_boundary": "Required external knowledge/retrieval must be returned with provenance before a business decision or deterministic recipe may run.",
+        },
+        "next_action": "request_required_external_enrichment",
+        "next_step": {
+            "id": "request_required_external_enrichment",
+            "actor": "host_capability_or_mcp",
+            "action": "invoke_declared_matching_capability_once",
+            "selected_rule": selected_rule,
+            "rule_locator": semantics.get("rule_locator", ""),
+            "requirements": requirements,
+            "completion": (
+                "Return external_evidence with the matching requirement_id, status, provider, provider_capability, "
+                "query, sources, and retrieved_at; then submit the same request once with that evidence. "
+                "If no declared capability is available, keep the business decision blocked."
+            ),
+            "do_not_repeat": ["guess_external_knowledge", "apply_business_rule", "query_runtime_data"],
+        },
+    }
+
+
 def deterministic_execution_payload(
     request: str,
     terms: Sequence[str],
+    semantics: dict[str, Any],
     flow: dict[str, Any],
     preflight: dict[str, Any],
     rule_matches: list[dict[str, Any]],
@@ -1620,6 +2407,7 @@ def deterministic_execution_payload(
     rule_constraints: dict[str, Any],
     result: dict[str, Any],
     recipe_execution: dict[str, Any] | None = None,
+    external_enrichment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return one terminal handoff when a reviewed recipe evaluated the rule."""
     output_contract = result_contract(flow)
@@ -1652,8 +2440,18 @@ def deterministic_execution_payload(
             "action": "use_selected_record",
             "detail": "Exactly one complete governing rule record was selected.",
         },
+        *([
+            {
+                "order": 3,
+                "stage_id": "runtime.required_external_enrichment",
+                "name": "resolve_required_external_enrichment",
+                "state": "completed",
+                "action": "use_host_capability_or_mcp_evidence",
+                "detail": "Required external enrichment was completed with returned provenance before recipe execution.",
+            },
+        ] if (external_enrichment or {}).get("status") == "completed" else []),
         {
-            "order": 3,
+            "order": 4 if (external_enrichment or {}).get("status") == "completed" else 3,
             "stage_id": "runtime.deterministic_recipe",
             "name": "execute_reviewed_recipe",
             "state": "completed",
@@ -1661,7 +2459,7 @@ def deterministic_execution_payload(
             "detail": f"Reviewed recipe {recipe_id or '<unnamed>'} produced the result directly from validated runtime rows.",
         },
         {
-            "order": 4,
+            "order": 5 if (external_enrichment or {}).get("status") == "completed" else 4,
             "stage_id": "runtime.output",
             "name": "materialize_auditable_result",
             "state": "completed",
@@ -1672,6 +2470,7 @@ def deterministic_execution_payload(
     return {
         "status": "completed_deterministically",
         "request": request,
+        "request_semantics": semantics,
         "rule_selection": "unique",
         "selected_rule": rule_provenance,
         "preflight": preflight,
@@ -1685,6 +2484,7 @@ def deterministic_execution_payload(
             "verified": True,
             "reason": "The caller supplied a deterministic result from the reviewed recipe path.",
         },
+        "external_enrichment": external_enrichment or {"status": "not_required", "requirements": [], "records": []},
         "deterministic_result": result,
         "execution_steps": execution_steps,
         "result_contract": output_contract,
@@ -2314,13 +3114,15 @@ def execute_evidence_pipeline(
 
 
 def execute_structured(
-    request: str, data_root: Path, contract: dict[str, Any], flow: dict[str, Any],
+    request: str | dict[str, Any], data_root: Path, contract: dict[str, Any], flow: dict[str, Any],
     bindings: dict[str, str], max_rows: int, validate_joins: bool,
     compiled_recipes: Sequence[dict[str, Any]] = (),
     recipe_verification: dict[str, Any] | None = None,
+    external_evidence: Any = None,
 ) -> dict[str, Any]:
-    if not str(request or "").strip():
-        raise ExecutorError("A non-empty business request is required")
+    semantics = request_semantics(request)
+    raw_request = str(semantics["raw_request"])
+    rule_locator = str(semantics["rule_locator"])
     reader = tabular_runtime()
     sources = source_map(contract)
     rule_ids = [
@@ -2332,15 +3134,19 @@ def execute_structured(
         source_id for source_id in contract.get("runtime_source_ids", [])
         if str(source_id) in sources and sources[str(source_id)].get("kind") == "tabular"
     ]
-    terms = unique_terms(request)
+    terms = unique_terms(rule_locator)
     if not rule_ids and not declared_rule_ids:
-        return execute_evidence_pipeline(
-            request, data_root, contract, flow, bindings, max_rows, validate_joins
+        payload = execute_evidence_pipeline(
+            rule_locator, data_root, contract, flow, bindings, max_rows, validate_joins
         )
+        payload["request"] = raw_request
+        payload["request_semantics"] = semantics
+        return payload
     if not rule_ids:
         return {
             "status": "blocked_unstructured_governing_source",
-            "request": request,
+            "request": raw_request,
+            "request_semantics": semantics,
             "search_terms": terms,
             "message": "A governing source is declared, but it is not a structured tabular source supported by this primary executor. Use the declared document/knowledge foundation and preserve provenance.",
             "requires_agent_judgment": True,
@@ -2356,7 +3162,7 @@ def execute_structured(
         )
     except Exception as exc:
         return blocked_execution_payload(
-            request,
+            raw_request,
             terms,
             flow,
             selected_ids,
@@ -2394,12 +3200,12 @@ def execute_structured(
                 "request_anchor_matches": request_anchor_score(
                     result.get("rows", [])[score.get("row_index", -1)]
                     if 0 <= int(score.get("row_index", -1)) < len(result.get("rows", [])) else {},
-                    request,
+                    rule_locator,
                 )[0],
                 "request_anchor_coverage": request_anchor_score(
                     result.get("rows", [])[score.get("row_index", -1)]
                     if 0 <= int(score.get("row_index", -1)) < len(result.get("rows", [])) else {},
-                    request,
+                    rule_locator,
                 )[1],
             }
             for result in rule_matches
@@ -2438,7 +3244,18 @@ def execute_structured(
         else "multiple"
     )
     selected_rule = ranked_rule_candidates[0] if rule_selection == "unique" else None
-    rule_constraints = derive_rule_constraints(selected_rule, contract, request)
+    rule_constraints = derive_rule_constraints(selected_rule, contract, rule_locator)
+    if selected_rule is not None:
+        external_enrichment = external_enrichment_gate(
+            contract, flow, selected_rule, external_evidence,
+        )
+        if external_enrichment.get("status") == "blocked":
+            return blocked_required_external_enrichment_payload(
+                raw_request, semantics, terms, flow, preflight, rule_matches,
+                selected_rule, rule_constraints, external_enrichment,
+            )
+    else:
+        external_enrichment = {"status": "not_required", "requirements": [], "records": []}
     recipe_execution: dict[str, Any] = {
         "status": "not_applicable",
         "verified": False,
@@ -2548,8 +3365,9 @@ def execute_structured(
                                 preflight["registrations"] = [*registrations, *recipe_registrations]
                                 preflight["message"] = "The governing rule and only the deterministic recipe sources are available and schema-compatible."
                                 return deterministic_execution_payload(
-                                    request,
+                                    raw_request,
                                     terms,
+                                    semantics,
                                     flow,
                                     preflight,
                                     rule_matches,
@@ -2557,10 +3375,11 @@ def execute_structured(
                                     rule_constraints,
                                     deterministic_result,
                                     recipe_execution,
+                                    external_enrichment,
                                 )
         elif not recipe_selection_error:
             return uncompiled_rule_family_payload(
-                request, flow, preflight, selected_rule,
+                raw_request, flow, preflight, selected_rule,
             )
     data_matches: list[dict[str, Any]] = []
     join_results: list[dict[str, Any]] = []
@@ -2685,7 +3504,9 @@ def execute_structured(
         data_connection = None
     output_contract = result_contract(flow)
     result_shell = {"preflight": preflight}
-    steps = execution_steps(flow, status, rule_selection, candidate_evidence, result_shell)
+    steps = execution_steps(
+        flow, status, rule_selection, candidate_evidence, result_shell, external_enrichment,
+    )
     if (
         recipe_execution.get("recipe_id") or recipe_execution.get("status", "").endswith("evidence_only")
     ) and not recipe_execution.get("verified"):
@@ -2702,11 +3523,13 @@ def execute_structured(
     next_step = next_step_for_agent(status, candidate_evidence, output_contract, rule_selection)
     return {
         "status": status,
-        "request": request,
+        "request": raw_request,
+        "request_semantics": semantics,
         "search_terms": terms,
         "rule_selection": rule_selection,
         "selected_rule": selected_rule,
         "rule_constraints": rule_constraints,
+        "external_enrichment": external_enrichment,
         "source_column_metadata": {
             str(source_id): source_column_metadata(contract, str(source_id))
             for source_id in runtime_ids
@@ -3001,33 +3824,37 @@ def attach_document_evidence(
 
 
 def execute(
-    request: str, data_root: Path, contract: dict[str, Any], flow: dict[str, Any],
+    request: str | dict[str, Any], data_root: Path, contract: dict[str, Any], flow: dict[str, Any],
     bindings: dict[str, str], max_rows: int, validate_joins: bool,
     compiled_recipes: Sequence[dict[str, Any]] = (),
     recipe_verification: dict[str, Any] | None = None,
+    external_evidence: Any = None,
 ) -> dict[str, Any]:
     """Route a request once across tabular, document, or hybrid input shapes."""
-    if not str(request or "").strip():
-        raise ExecutorError("A non-empty business request is required")
+    semantics = request_semantics(request)
+    raw_request = str(semantics["raw_request"])
+    rule_locator = str(semantics["rule_locator"])
     sources = source_map(contract)
     document_ids = non_tabular_source_ids(contract)
     document_rule_ids = non_tabular_rule_source_ids(contract)
     if not document_ids:
         return execute_structured(
-            request, data_root, contract, flow, bindings, max_rows, validate_joins,
-            compiled_recipes, recipe_verification,
+            semantics, data_root, contract, flow, bindings, max_rows, validate_joins,
+            compiled_recipes, recipe_verification, external_evidence,
         )
 
     document_evidence = collect_document_evidence(
-        request, data_root, contract, bindings, document_ids, max_rows,
+        rule_locator, data_root, contract, bindings, document_ids, max_rows,
     )
     # A sparse PDF or a missing required document invalidates a hybrid result as
     # well. Stop before opening tables: retrying the structured half cannot
     # recover the named unstructured input gap.
     if str(document_evidence.get("status", "")).startswith("blocked_"):
-        return document_only_execution_payload(
-            request, unique_terms(request), flow, document_evidence, document_rule_ids,
+        payload = document_only_execution_payload(
+            raw_request, unique_terms(rule_locator), flow, document_evidence, document_rule_ids,
         )
+        payload["request_semantics"] = semantics
+        return payload
 
     tabular_rule_ids = [
         source_id for source_id in contract.get("rule_source_ids", [])
@@ -3039,14 +3866,16 @@ def execute(
     ]
     if tabular_rule_ids:
         payload = execute_structured(
-            request, data_root, contract, flow, bindings, max_rows, validate_joins,
-            compiled_recipes, recipe_verification,
+            semantics, data_root, contract, flow, bindings, max_rows, validate_joins,
+            compiled_recipes, recipe_verification, external_evidence,
         )
         return attach_document_evidence(payload, document_evidence, flow, document_rule_ids)
     if tabular_runtime_ids:
         payload = execute_evidence_pipeline(
-            request, data_root, contract, flow, bindings, max_rows, validate_joins,
+            rule_locator, data_root, contract, flow, bindings, max_rows, validate_joins,
         )
+        payload["request"] = raw_request
+        payload["request_semantics"] = semantics
         attached = attach_document_evidence(payload, document_evidence, flow, document_rule_ids)
         if (
             document_rule_ids
@@ -3058,9 +3887,11 @@ def execute(
             attached["rule_selection"] = "document_evidence"
             attached["next_action"] = "apply_accepted_procedure_to_bounded_hybrid_evidence"
         return attached
-    return document_only_execution_payload(
-        request, unique_terms(request), flow, document_evidence, document_rule_ids,
+    payload = document_only_execution_payload(
+        raw_request, unique_terms(rule_locator), flow, document_evidence, document_rule_ids,
     )
+    payload["request_semantics"] = semantics
+    return payload
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3079,21 +3910,29 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--max-rows", type=int, default=20)
     execute_parser = commands.add_parser("execute", aliases=["audit", "run", "produce"])
     execute_parser.add_argument("--request", required=True)
+    execute_parser.add_argument(
+        "--rule-locator", default="",
+        help="Optional structured rule-locator text; delivery wording remains in --request.",
+    )
+    execute_parser.add_argument(
+        "--external-evidence-json", default="",
+        help="Host/MCP enrichment evidence JSON returned after a required external-capability gate.",
+    )
     execute_parser.add_argument("--data-root", required=True)
     execute_parser.add_argument("--bind", action="append", default=[])
     execute_parser.add_argument("--max-rows", type=int, default=50)
-    execute_parser.add_argument("--output", default="")
-    execute_parser.add_argument("--delivery-output", default="")
+    execute_parser.add_argument("--output", default="", help="Safe relative artifact name under BUSINESS_ARTIFACT_ROOT.")
+    execute_parser.add_argument("--delivery-output", default="", help="Safe relative artifact name under BUSINESS_ARTIFACT_ROOT.")
     execute_parser.add_argument("--delivery-format", default="auto", choices=sorted(DELIVERY_FORMATS))
     execute_parser.add_argument("--delivery-template-id", default="")
     execute_parser.add_argument("--no-join-validation", action="store_true")
     delivery = commands.add_parser("deliver")
-    delivery.add_argument("--result", required=True)
-    delivery.add_argument("--output", required=True)
+    delivery.add_argument("--result", required=True, help="Safe relative evidence artifact name under BUSINESS_ARTIFACT_ROOT.")
+    delivery.add_argument("--output", required=True, help="Safe relative result artifact name under BUSINESS_ARTIFACT_ROOT.")
     delivery.add_argument("--format", default="auto", choices=sorted(DELIVERY_FORMATS))
     delivery.add_argument("--template-id", default="")
     continuation = commands.add_parser("continue")
-    continuation.add_argument("--result", required=True)
+    continuation.add_argument("--result", required=True, help="Safe relative evidence artifact name under BUSINESS_ARTIFACT_ROOT.")
     continuation.add_argument("--filter", action="append", default=[])
     continuation.add_argument("--max-rows", type=int, default=200)
     query = commands.add_parser("query")
@@ -3109,9 +3948,18 @@ def run(argv: Sequence[str] | None = None) -> dict[str, Any]:
     args = build_parser().parse_args(argv)
     command = str(args.command)
     if command == "deliver":
-        return deliver_saved_result(
-            Path(args.result), Path(args.output), args.format, args.template_id,
-        )
+        try:
+            result_path, _result_relative_path = resolve_artifact_name(args.result, "--result")
+            output_path, _output_relative_path = resolve_artifact_name(args.output, "--output")
+        except ArtifactPathError as exc:
+            return blocked_artifact_output(exc)
+        return deliver_saved_result(result_path, output_path, args.format, args.template_id)
+    if command == "continue":
+        try:
+            result_path, _result_relative_path = resolve_artifact_name(args.result, "--result")
+        except ArtifactPathError as exc:
+            return blocked_artifact_output(exc)
+        return continue_deterministic_result(result_path, args.filter, args.max_rows)
     contract = load_json(resolve_contract(args.contract, DEFAULT_CONTRACT))
     flow = load_json(resolve_contract(args.flow_contract, DEFAULT_FLOW))
     recipes_path = resolve_contract(args.recipes, DEFAULT_RECIPES)
@@ -3124,8 +3972,6 @@ def run(argv: Sequence[str] | None = None) -> dict[str, Any]:
     )
     if command == "describe":
         return contract_summary(contract, flow)
-    if command == "continue":
-        return continue_deterministic_result(Path(args.result), args.filter, args.max_rows)
     data_root = Path(args.data_root).expanduser().resolve()
     if not data_root.is_dir():
         raise ExecutorError(f"Data root does not exist: {data_root}")
@@ -3150,32 +3996,46 @@ def run(argv: Sequence[str] | None = None) -> dict[str, Any]:
     if command == "query":
         reader = tabular_runtime()
         return reader.query_contract(contract, data_root, args.sql, limit, args.link_id, bindings)
+    artifact_path: Path | None = None
+    delivery_path: Path | None = None
+    if args.output:
+        try:
+            artifact_path, _artifact_relative_path = resolve_artifact_name(args.output, "--output")
+            if args.delivery_output:
+                delivery_path, _delivery_relative_path = resolve_artifact_name(
+                    args.delivery_output, "--delivery-output"
+                )
+        except ArtifactPathError as exc:
+            return blocked_artifact_output(exc)
     if args.delivery_output:
         if not args.output:
             raise ExecutorError(
                 "--delivery-output requires --output so the complete JSON evidence package remains available for audit."
             )
-        evidence_path = Path(args.output).expanduser().resolve()
-        delivery_path = Path(args.delivery_output).expanduser().resolve()
-        if evidence_path == delivery_path:
+        if artifact_path is None or delivery_path is None:
+            raise ExecutorError("Artifact output resolution unexpectedly did not produce both requested files.")
+        if artifact_path == delivery_path:
             raise ExecutorError("--delivery-output must not overwrite the JSON evidence package.")
-        if evidence_path.suffix.casefold() != ".json":
+        if artifact_path.suffix.casefold() != ".json":
             raise ExecutorError("--output must use a .json filename when --delivery-output is requested.")
+    request_input: str | dict[str, Any] = args.request
+    if str(args.rule_locator or "").strip():
+        request_input = {"request": args.request, "rule_locator": args.rule_locator}
+    external_evidence = parse_external_evidence_json(args.external_evidence_json)
     payload = execute(
-        args.request, data_root, contract, flow, bindings, limit,
+        request_input, data_root, contract, flow, bindings, limit,
         validate_joins=not bool(args.no_join_validation), compiled_recipes=compiled_recipes,
-        recipe_verification=recipe_verification,
+        recipe_verification=recipe_verification, external_evidence=external_evidence,
     )
-    if args.output:
-        artifact_path = Path(args.output)
+    if artifact_path is not None:
         handle = result_handle(payload, artifact_path)
         if handle is not None:
             payload["result_handle"] = handle
         payload["artifact"] = write_artifact(artifact_path, payload)
-        if args.delivery_output:
+        if delivery_path is not None:
             payload["delivery"] = materialize_verified_delivery(
                 payload,
-                Path(args.delivery_output),
+                delivery_path,
                 args.delivery_format,
                 args.delivery_template_id,
                 evidence_package=payload.get("artifact") if isinstance(payload.get("artifact"), dict) else None,
@@ -3197,8 +4057,10 @@ def compact_stdout_payload(payload: dict[str, Any]) -> dict[str, Any]:
     deterministic = payload.get("deterministic_result") if isinstance(payload.get("deterministic_result"), dict) else {}
     documents = payload.get("document_evidence") if isinstance(payload.get("document_evidence"), dict) else {}
     document_sources = documents.get("sources") if isinstance(documents.get("sources"), list) else []
+    external_enrichment = external_enrichment_projection(payload.get("external_enrichment"))
     return {
         "status": payload.get("status", "success"),
+        "request_semantics": payload.get("request_semantics"),
         "rule_selection": payload.get("rule_selection"),
         "selected_rule": {
             "source_id": selected.get("source_id"),
@@ -3239,6 +4101,8 @@ def compact_stdout_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(item, dict) and item.get("status") == "blocked_ocr_required"
             ],
         } if documents else None,
+        "external_enrichment": external_enrichment,
+        "required_external_enrichment": payload.get("required_external_enrichment", []),
         "execution_steps": payload.get("execution_steps", []),
         "next_action": payload.get("next_action"),
         "next_step": payload.get("next_step"),
@@ -3254,6 +4118,7 @@ def agent_handoff_payload(payload: dict[str, Any]) -> dict[str, Any]:
     candidate = payload.get("candidate_evidence") if isinstance(payload.get("candidate_evidence"), dict) else {}
     deterministic = payload.get("deterministic_result") if isinstance(payload.get("deterministic_result"), dict) else None
     documents = payload.get("document_evidence") if isinstance(payload.get("document_evidence"), dict) else {}
+    external_enrichment = external_enrichment_projection(payload.get("external_enrichment"))
 
     def project_source(source: dict[str, Any]) -> dict[str, Any]:
         columns = [str(item) for item in source.get("columns", []) if str(item)]
@@ -3315,7 +4180,7 @@ def agent_handoff_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "source_id": source.get("source_id"),
             "kind": source.get("kind"),
             "status": source.get("status"),
-            "path": source.get("path"),
+            "source_reference": source.get("source_reference"),
             "source_digest": source.get("source_digest"),
             "index": source.get("index", {}),
             "search_terms": source.get("search_terms", []),
@@ -3329,9 +4194,12 @@ def agent_handoff_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "status": payload.get("status"),
         "request": payload.get("request"),
+        "request_semantics": payload.get("request_semantics"),
         "rule_selection": payload.get("rule_selection"),
         "selected_rule": payload.get("selected_rule"),
         "rule_constraints": payload.get("rule_constraints"),
+        "external_enrichment": external_enrichment,
+        "required_external_enrichment": payload.get("required_external_enrichment", []),
         "source_column_metadata": payload.get("source_column_metadata", {}),
         "execution_plan": payload.get("execution_plan", {}),
         "candidate_evidence": {

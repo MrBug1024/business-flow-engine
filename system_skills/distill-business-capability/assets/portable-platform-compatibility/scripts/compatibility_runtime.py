@@ -51,18 +51,42 @@ def request_text(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _artifact_path(value: Any) -> str:
-    """Normalize executor artifact metadata for legacy package hosts.
+def _safe_relative_reference(value: Any) -> str:
+    """Keep legacy string fields useful without re-exposing host disk paths."""
+    candidate = str(value or "").strip().replace("\\", "/")
+    if (
+        not candidate
+        or candidate.startswith("/")
+        or candidate.startswith("//")
+        or re.match(r"^[A-Za-z]:", candidate)
+        or ".." in Path(candidate).parts
+    ):
+        return ""
+    return candidate
 
-    The modern executor returns a provenance-bearing artifact object. Older
-    hosts expect ``artifact`` to be a string and otherwise raise while trying
-    to call ``Path(artifact)``. Keep the rich object under a separate field so
-    an updated host can pass the full transaction through unchanged.
-    """
 
+def _artifact_metadata(value: Any) -> dict[str, Any]:
+    """Whitelist transport-safe artifact metadata from current or old runtimes."""
     if isinstance(value, dict):
-        return str(value.get("path", "")).strip()
-    return str(value or "").strip()
+        result = {
+            key: value[key]
+            for key in ("schema_version", "kind", "artifact_id", "relative_path", "format", "sha256", "size_bytes")
+            if key in value
+        }
+        relative_path = _safe_relative_reference(result.get("relative_path", ""))
+        if relative_path:
+            result["relative_path"] = relative_path
+        else:
+            result.pop("relative_path", None)
+        return result
+    relative_path = _safe_relative_reference(value)
+    return {"relative_path": relative_path} if relative_path else {}
+
+
+def _artifact_reference(value: Any) -> str:
+    """A safe compatibility string: relative name first, opaque id second."""
+    metadata = _artifact_metadata(value)
+    return str(metadata.get("relative_path") or metadata.get("artifact_id") or "")
 
 
 def host_action_envelope(payload: dict[str, Any]) -> dict[str, Any]:
@@ -76,8 +100,8 @@ def host_action_envelope(payload: dict[str, Any]) -> dict[str, Any]:
     requirement machine-readable for newer adapters.
     """
 
-    evidence_artifact = payload.get("artifact")
-    handoff_artifact = payload.get("agent_handoff")
+    evidence_artifact = _artifact_metadata(payload.get("artifact"))
+    handoff_artifact = _artifact_metadata(payload.get("agent_handoff"))
     deterministic = payload.get("deterministic_result")
     candidate = payload.get("candidate_evidence")
     documents = payload.get("document_evidence")
@@ -102,18 +126,22 @@ def host_action_envelope(payload: dict[str, Any]) -> dict[str, Any]:
     result.update({
         "mode": "scenario_execution",
         # Compatibility with hosts that expect a numeric result count and a
-        # string artifact path. Never erase the modern metadata below.
+        # string artifact reference. It is deliberately relative/opaque, never
+        # a physical host path.
         "rows": row_count,
         "row_semantics": row_semantics,
-        "artifact": _artifact_path(evidence_artifact),
+        "artifact": _artifact_reference(evidence_artifact),
         "evidence_artifact": evidence_artifact,
+        "agent_handoff": handoff_artifact,
         "agent_handoff_artifact": handoff_artifact,
         "host_response_contract": {
             "kind": "portable_business_request_transaction_result",
             "status": result.get("status", ""),
             "normal_next_action": "read_agent_handoff_then_deliver_once",
-            "agent_handoff_path": _artifact_path(handoff_artifact),
-            "evidence_artifact_path": _artifact_path(evidence_artifact),
+            "agent_handoff_artifact_id": handoff_artifact.get("artifact_id", ""),
+            "agent_handoff_relative_path": handoff_artifact.get("relative_path", ""),
+            "evidence_artifact_id": evidence_artifact.get("artifact_id", ""),
+            "evidence_artifact_relative_path": evidence_artifact.get("relative_path", ""),
             "requires_structured_passthrough": True,
             "legacy_row_semantics": row_semantics,
         },
@@ -267,6 +295,7 @@ def produce(
     out_dir: str = "",
     params: Any = None,
     max_rows: int = 50,
+    artifact_name: str = "",
 ) -> dict[str, Any]:
     """Run the generated scenario executor through the package-host entrypoint.
 
@@ -285,15 +314,24 @@ def produce(
     except (TypeError, ValueError) as exc:
         raise ValueError("max_rows must be an integer") from exc
 
+    if str(out_dir or "").strip():
+        return host_action_envelope({
+            "status": "blocked_host_artifact_sink",
+            "message": (
+                "Legacy out_dir is not an artifact sink. The host must set BUSINESS_ARTIFACT_ROOT "
+                "and pass a safe relative artifact_name; no file was written."
+            ),
+            "artifact_root_environment": "BUSINESS_ARTIFACT_ROOT",
+        })
+
     argv = [
         "execute",
         "--request", request,
         "--data-root", str(data_dir),
         "--max-rows", str(bounded_rows),
     ]
-    if str(out_dir or "").strip():
-        output = Path(out_dir).expanduser() / "scenario-evidence.json"
-        argv.extend(["--output", str(output)])
+    if str(artifact_name or "").strip():
+        argv.extend(["--output", str(artifact_name).strip()])
     payload = executor().run(argv)
     if not isinstance(payload, dict):
         raise RuntimeError("Generated scenario executor returned an invalid payload")

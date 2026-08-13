@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import unittest
@@ -26,7 +27,9 @@ class PortableMcpSurfaceTests(unittest.TestCase):
         schema = SERVER.TOOLS[0]["inputSchema"]
         self.assertIn("request", schema["required"])
         self.assertIn("data_dir", schema["properties"])
-        self.assertIn("delivery_output", schema["properties"])
+        self.assertIn("artifact_name", schema["properties"])
+        self.assertIn("delivery_artifact_name", schema["properties"])
+        self.assertNotIn("delivery_output", schema["properties"])
         self.assertEqual(["auto", "json", "csv", "xlsx"], schema["properties"]["delivery_format"]["enum"])
 
     def test_hidden_action_is_rejected_even_if_called_directly(self) -> None:
@@ -47,8 +50,8 @@ class PortableMcpSurfaceTests(unittest.TestCase):
             result = SERVER.execute_business_request({
                 "request": "export the verified result",
                 "data_dir": "C:/runtime/data",
-                "out_dir": "C:/runtime/outputs",
-                "delivery_output": "C:/runtime/outputs/result.csv",
+                "artifact_name": "scenario-evidence.json",
+                "delivery_artifact_name": "result.csv",
                 "delivery_format": "csv",
                 "delivery_template_id": "exact-columns",
             })
@@ -56,10 +59,42 @@ class PortableMcpSurfaceTests(unittest.TestCase):
         self.assertEqual({"status": "completed_deterministically"}, result)
         self.assertEqual([
             "execute", "--request", "export the verified result", "--data-root", "C:/runtime/data",
-            "--max-rows", "50", "--output", str(Path("C:/runtime/outputs") / "scenario-evidence.json"),
-            "--delivery-output", "C:/runtime/outputs/result.csv", "--delivery-format", "csv",
+            "--max-rows", "50", "--output", "scenario-evidence.json",
+            "--delivery-output", "result.csv", "--delivery-format", "csv",
             "--delivery-template-id", "exact-columns",
         ], fake.argv)
+
+    def test_execute_forwards_rule_locator_and_required_external_evidence(self) -> None:
+        class FakeExecutor:
+            argv: list[str] = []
+
+            def run(self, argv: list[str]) -> dict[str, str]:
+                self.argv = argv
+                return {"status": "blocked_required_external_enrichment"}
+
+        fake = FakeExecutor()
+        evidence = {
+            "requirement_id": "external-knowledge-1",
+            "status": "success",
+            "provider": "knowledge-mcp",
+            "provider_capability": "knowledge_retrieval",
+            "query": "selected rule",
+            "sources": [{"locator": "record-1"}],
+            "retrieved_at": "2026-08-12T00:00:00Z",
+        }
+        with mock.patch.object(SERVER, "executor", return_value=fake):
+            result = SERVER.execute_business_request({
+                "request": "执行审计；告诉我有多少条",
+                "rule_locator": "天麻素注射液限定支付条件",
+                "data_dir": "C:/runtime/data",
+                "external_evidence": evidence,
+            })
+
+        self.assertEqual({"status": "blocked_required_external_enrichment"}, result)
+        self.assertIn("--rule-locator", fake.argv)
+        self.assertEqual("天麻素注射液限定支付条件", fake.argv[fake.argv.index("--rule-locator") + 1])
+        self.assertIn("--external-evidence-json", fake.argv)
+        self.assertEqual(evidence, json.loads(fake.argv[fake.argv.index("--external-evidence-json") + 1]))
 
 
 if __name__ == "__main__":

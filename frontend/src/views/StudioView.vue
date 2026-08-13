@@ -467,6 +467,7 @@
               :events="messageActivityEvents(message)"
               compact
               :language="uiLanguage"
+              @open-workspace-file="openWorkspaceArtifact"
             />
           </div>
         </article>
@@ -486,6 +487,7 @@
               :events="executionTrace"
               :active="isStreaming"
               :language="uiLanguage"
+              @open-workspace-file="openWorkspaceArtifact"
             />
             <MarkdownContent v-if="streamingAssistant" :content="streamingAssistant" />
           </div>
@@ -802,6 +804,10 @@ const isSubmittingAnswer = ref(false)
 const activeStreamTarget = ref<StreamTarget | null>(null)
 const pendingResume = ref<PendingResume | null>(null)
 const recoveredDistillationContinuations = new Set<string>()
+// Recovery runs only once per browser page for a waiting Agent checkpoint.
+// A failed recovery remains visible through the existing manual retry action;
+// repeatedly refreshing the workspace must not keep resubmitting it.
+const recoveredQuestionResumeRuns = new Set<string>()
 const chatBoxHeight = ref(96)
 let chatBoxObserver: ResizeObserver | null = null
 
@@ -1169,6 +1175,7 @@ async function refreshCurrent() {
     ? previousSessionId
     : preferredChatSessionId(current.value)
   await recoverUnfinishedDistillationContinuation()
+  await recoverAnsweredQuestionResume()
   await loadBusinesses()
 }
 
@@ -1210,6 +1217,76 @@ async function recoverUnfinishedDistillationContinuation() {
     localStorage.setItem(`studio.chatSession.${record.id}`, sessionId)
   }
   await continueDistillation(confirmationId, {
+    businessId: record.id,
+    sessionId,
+  })
+}
+
+function unansweredQuestionResumeRun(record: any, sessionId: string) {
+  const runs = Array.isArray(record?.runs) ? record.runs : []
+  const questions = Array.isArray(record?.context?.questions)
+    ? record.context.questions
+    : []
+  const resumedSourceRunIds = new Set(
+    runs
+      .filter((run: any) => String(run?.session_id || '') === sessionId)
+      .map((run: any) => String(run?.resumed_from_run_id || '').trim())
+      .filter(Boolean),
+  )
+
+  return [...runs].reverse().find((run: any) => {
+    const runId = String(run?.id || '').trim()
+    if (
+      !runId
+      || String(run?.session_id || '') !== sessionId
+      || run?.status !== 'waiting_for_user'
+      || recoveredQuestionResumeRuns.has(runId)
+      || resumedSourceRunIds.has(runId)
+    ) return false
+
+    const linkedQuestions = questions.filter((question: any) => {
+      const questionSessionId = String(question?.session_id || '').trim()
+      if (questionSessionId && questionSessionId !== sessionId) return false
+      return String(question?.run_id || '').trim() === runId
+        || String(question?.checkpoint_run_id || '').trim() === runId
+    })
+    // An approved formal review resumes the original LangGraph checkpoint;
+    // a rejected review instead owns a separate platform continuation.  This
+    // distinction keeps a browser refresh from abandoning an approved task
+    // while never replaying a rejected decision through the wrong path.
+    if (linkedQuestions.some((question: any) => (
+      question?.source === 'distillation_approval'
+      && question?.decision !== 'approved'
+    ))) {
+      return false
+    }
+    const unanswered = linkedQuestions.some((question: any) => question?.status === 'open')
+    const pendingAnswer = linkedQuestions.some((question: any) => (
+      question?.status === 'answered'
+      && !question?.continued_at
+      && !question?.continuation_run_id
+      && String(question?.answer || '').trim()
+    ))
+    return !unanswered && pendingAnswer
+  }) || null
+}
+
+async function recoverAnsweredQuestionResume() {
+  const record = current.value
+  const sessionId = activeChatSessionId.value
+  // Keep the signed lineage continuation authoritative when an old rejected
+  // approval still needs its platform-owned recovery action.
+  if (
+    !record
+    || !sessionId
+    || isBusy.value
+    || unfinishedLineageContinuation(record)
+  ) return
+  const run = unansweredQuestionResumeRun(record, sessionId)
+  const runId = String(run?.id || '').trim()
+  if (!runId) return
+  recoveredQuestionResumeRuns.add(runId)
+  await resumeAgent(runId, {
     businessId: record.id,
     sessionId,
   })
@@ -1454,6 +1531,15 @@ function compareMentionFiles(left: MentionFile, right: MentionFile) {
 
 function normalizeMentionQuery(value: string) {
   return value.trim().toLocaleLowerCase()
+}
+
+function openWorkspaceArtifact(path: string) {
+  const normalizedPath = String(path || '')
+    .replace(/^\/(?:workspace|outputs)\/?/, (matched) => (matched.startsWith('/outputs') ? 'outputs/' : ''))
+    .replace(/\\/g, '/')
+  if (!normalizedPath || normalizedPath.split('/').includes('..')) return
+  const parts = normalizedPath.split('/').filter(Boolean)
+  void openWorkspaceFile({ name: parts[parts.length - 1] || normalizedPath, path: normalizedPath })
 }
 
 function normalizeWorkspacePath(value: string) {

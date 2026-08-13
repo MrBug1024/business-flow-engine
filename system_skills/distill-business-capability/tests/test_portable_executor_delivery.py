@@ -6,6 +6,7 @@ import csv
 import hashlib
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -78,10 +79,62 @@ def verified_payload() -> dict:
     }
 
 
+def structured_template(
+    template_id: str, *, format: str = "xlsx", worksheet_name: str = "Historical Result",
+    columns: list[str] | None = None, materialization_status: str = "materializable_schema",
+    reason: str = "single_tabular_schema",
+) -> dict:
+    columns = columns or ["case_id", "amount", "decision"]
+    return {
+        "template_id": template_id,
+        "name": "historical_result",
+        "format": format,
+        "historical_data_policy": "structure_metadata_only_no_historical_rows",
+        "tables": [{
+            "table_id": "table-1",
+            "table_name": worksheet_name,
+            "worksheet_name": worksheet_name if format == "xlsx" else None,
+            "header_row_index": 0,
+            "columns": [
+                {
+                    "ordinal": index,
+                    "name": column,
+                    "semantic_kind": "other",
+                    "source_type": None,
+                }
+                for index, column in enumerate(columns)
+            ],
+        }],
+        "materialization": {
+            "status": materialization_status,
+            "reason": reason,
+            "message": "portable test structure",
+            "selected_table_id": "table-1",
+            "worksheet_name": worksheet_name if format == "xlsx" else None,
+            "header_row_index": 0,
+            "column_order": columns,
+            "layout_fidelity": "schema_only",
+        },
+        "structure_fingerprint": "f" * 64,
+    }
+
+
 class PortableExecutorDeliveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._previous_artifact_root = os.environ.get("BUSINESS_ARTIFACT_ROOT")
+        self._artifact_root = tempfile.TemporaryDirectory()
+        os.environ["BUSINESS_ARTIFACT_ROOT"] = self._artifact_root.name
+
+    def tearDown(self) -> None:
+        if self._previous_artifact_root is None:
+            os.environ.pop("BUSINESS_ARTIFACT_ROOT", None)
+        else:
+            os.environ["BUSINESS_ARTIFACT_ROOT"] = self._previous_artifact_root
+        self._artifact_root.cleanup()
+
     def test_evidence_only_payload_never_creates_a_final_result_file(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            target = Path(raw) / "not-a-final-result.json"
+            target = Path(self._artifact_root.name) / "not-a-final-result.json"
             payload = verified_payload()
             payload["status"] = "ready_for_agent_judgment"
             payload["recipe_execution"]["verified"] = False
@@ -92,15 +145,27 @@ class PortableExecutorDeliveryTests(unittest.TestCase):
             self.assertEqual("blocked_delivery_requires_verified_result", delivery["status"])
             self.assertFalse(target.exists())
 
+    def test_flow_contract_preserves_structured_template_for_delivery(self) -> None:
+        template = structured_template("historical-xlsx", worksheet_name="Historical Outcome")
+        template["output_columns"] = ["case_id", "amount", "decision"]
+        contract = EXECUTOR.result_contract({"design_time_output_templates": [template]})
+
+        resolved = contract["design_time_templates"][0]
+        self.assertEqual("historical-xlsx", resolved["template_id"])
+        self.assertEqual("Historical Outcome", resolved["tables"][0]["worksheet_name"])
+        self.assertEqual("materializable_schema", resolved["materialization"]["status"])
+        self.assertEqual("structure_metadata_only_no_historical_rows", resolved["historical_data_policy"])
+
     def test_saved_verified_result_can_materialize_json_without_reexecution(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            evidence = root / "scenario-evidence.json"
-            target = root / "result.json"
+            artifact_root = Path(self._artifact_root.name)
+            evidence = artifact_root / "scenario-evidence.json"
+            target = artifact_root / "result.json"
             evidence.write_text(json.dumps(verified_payload(), ensure_ascii=False), encoding="utf-8")
 
             delivery = EXECUTOR.run([
-                "deliver", "--result", str(evidence), "--output", str(target), "--format", "json",
+                "deliver", "--result", "scenario-evidence.json", "--output", "result.json", "--format", "json",
             ])
 
             self.assertEqual("delivered_deterministically", delivery["status"])
@@ -109,17 +174,17 @@ class PortableExecutorDeliveryTests(unittest.TestCase):
             self.assertEqual("verified_deterministic_result_delivery", exported["kind"])
             self.assertTrue(exported["verification"]["verified"])
             self.assertEqual(["case_id", "amount", "decision"], exported["deterministic_result"]["columns"])
-            self.assertEqual(str(evidence.resolve()), exported["evidence_package"]["path"])
+            self.assertEqual("scenario-evidence.json", exported["evidence_package"]["relative_path"])
             self.assertFalse(exported["delivery_boundary"]["agent_semantic_judgment_used"])
 
     def test_delivery_never_overwrites_the_evidence_package(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            evidence = Path(raw) / "scenario-evidence.json"
+            evidence = Path(self._artifact_root.name) / "scenario-evidence.json"
             original = json.dumps(verified_payload(), ensure_ascii=False)
             evidence.write_text(original, encoding="utf-8")
 
             delivery = EXECUTOR.run([
-                "deliver", "--result", str(evidence), "--output", str(evidence),
+                "deliver", "--result", "scenario-evidence.json", "--output", "scenario-evidence.json",
             ])
 
             self.assertEqual("blocked_delivery_output_conflicts_with_evidence", delivery["status"])
@@ -127,13 +192,13 @@ class PortableExecutorDeliveryTests(unittest.TestCase):
 
     def test_csv_requires_an_exact_template_mapping_and_writes_a_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(self._artifact_root.name)
             evidence = root / "scenario-evidence.json"
             evidence.write_text(json.dumps(verified_payload(), ensure_ascii=False), encoding="utf-8")
             csv_target = root / "duplicate-rows.csv"
 
             delivery = EXECUTOR.run([
-                "deliver", "--result", str(evidence), "--output", str(csv_target),
+                "deliver", "--result", "scenario-evidence.json", "--output", "duplicate-rows.csv",
                 "--template-id", "csv-exact",
             ])
 
@@ -149,7 +214,7 @@ class PortableExecutorDeliveryTests(unittest.TestCase):
 
             blocked_target = root / "must-not-exist.csv"
             blocked = EXECUTOR.run([
-                "deliver", "--result", str(evidence), "--output", str(blocked_target),
+                "deliver", "--result", "scenario-evidence.json", "--output", "must-not-exist.csv",
                 "--template-id", "csv-incomplete",
             ])
             self.assertEqual("blocked_delivery_template_not_materializable", blocked["status"])
@@ -157,7 +222,7 @@ class PortableExecutorDeliveryTests(unittest.TestCase):
 
     def test_csv_formula_like_text_is_exported_as_literal_data(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(self._artifact_root.name)
             evidence = root / "scenario-evidence.json"
             payload = verified_payload()
             payload["deterministic_result"]["rows"][0]["decision"] = "\t=not-a-formula"
@@ -165,7 +230,7 @@ class PortableExecutorDeliveryTests(unittest.TestCase):
             target = root / "duplicate-rows.csv"
 
             delivery = EXECUTOR.run([
-                "deliver", "--result", str(evidence), "--output", str(target),
+                "deliver", "--result", "scenario-evidence.json", "--output", "duplicate-rows.csv",
                 "--template-id", "csv-exact",
             ])
 
@@ -176,7 +241,7 @@ class PortableExecutorDeliveryTests(unittest.TestCase):
 
     def test_xlsx_requires_the_same_verified_template_mapping_and_is_data_only(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(self._artifact_root.name)
             evidence = root / "scenario-evidence.json"
             payload = verified_payload()
             payload["deterministic_result"]["rows"][0]["decision"] = "=not-a-formula"
@@ -184,7 +249,7 @@ class PortableExecutorDeliveryTests(unittest.TestCase):
             target = root / "duplicate-rows.xlsx"
 
             delivery = EXECUTOR.run([
-                "deliver", "--result", str(evidence), "--output", str(target),
+                "deliver", "--result", "scenario-evidence.json", "--output", "duplicate-rows.xlsx",
                 "--format", "xlsx", "--template-id", "xlsx-exact",
             ])
 
@@ -211,6 +276,111 @@ class PortableExecutorDeliveryTests(unittest.TestCase):
             finally:
                 workbook.close()
             self.assertTrue((root / "duplicate-rows.delivery.json").is_file())
+
+    def test_single_materializable_historical_template_is_selected_automatically(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(self._artifact_root.name)
+            evidence = root / "scenario-evidence.json"
+            payload = verified_payload()
+            payload["result_contract"]["design_time_templates"] = [
+                structured_template("historical-xlsx", worksheet_name="Historical Outcome")
+            ]
+            evidence.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            target = root / "historical.xlsx"
+
+            delivery = EXECUTOR.run([
+                "deliver", "--result", "scenario-evidence.json", "--output", "historical.xlsx", "--format", "xlsx",
+            ])
+
+            self.assertEqual("delivered_deterministically", delivery["status"])
+            materialization = delivery["template_materialization"]
+            self.assertEqual("historical-xlsx", materialization["template_id"])
+            self.assertEqual("auto_single_compatible_template", materialization["selection"])
+            self.assertEqual("materialized_historical_structure", materialization["status"])
+            self.assertEqual("Historical Outcome", delivery["result_file"]["sheet_name"])
+            workbook = load_workbook(target, read_only=True, data_only=True)
+            try:
+                worksheet = workbook["Historical Outcome"]
+                self.assertEqual(
+                    ["case_id", "amount", "decision"],
+                    [cell.value for cell in next(worksheet.iter_rows())],
+                )
+            finally:
+                workbook.close()
+
+    def test_multiple_compatible_historical_templates_require_explicit_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(self._artifact_root.name)
+            payload = verified_payload()
+            payload["result_contract"]["design_time_templates"] = [
+                structured_template("first", worksheet_name="First"),
+                structured_template("second", worksheet_name="Second"),
+            ]
+            target = root / "must-not-exist.xlsx"
+
+            delivery = EXECUTOR.materialize_verified_delivery(payload, target, "xlsx")
+
+            self.assertEqual("blocked_delivery_template_selection_required", delivery["status"])
+            self.assertEqual(["first", "second"], delivery["available_template_ids"])
+            self.assertFalse(target.exists())
+
+    def test_nonmaterializable_historical_template_blocks_without_lookalike_file(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(self._artifact_root.name)
+            payload = verified_payload()
+            payload["result_contract"]["design_time_templates"] = [
+                structured_template(
+                    "multi-sheet", materialization_status="not_materializable",
+                    reason="multiple_or_missing_tables",
+                )
+            ]
+            target = root / "must-not-exist.xlsx"
+
+            delivery = EXECUTOR.materialize_verified_delivery(payload, target, "xlsx")
+
+            self.assertEqual("blocked_delivery_template_not_materializable", delivery["status"])
+            self.assertFalse(target.exists())
+
+    def test_tampered_historical_worksheet_name_is_blocked_not_sanitized(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(self._artifact_root.name)
+            payload = verified_payload()
+            payload["result_contract"]["design_time_templates"] = [
+                structured_template("bad-sheet", worksheet_name="Bad/Worksheet")
+            ]
+            target = root / "must-not-exist.xlsx"
+
+            delivery = EXECUTOR.materialize_verified_delivery(payload, target, "xlsx", "bad-sheet")
+
+            self.assertEqual("blocked_delivery_template_not_materializable", delivery["status"])
+            self.assertEqual("unsupported_worksheet_name", delivery["reason"])
+            self.assertFalse(target.exists())
+
+    def test_explicit_structured_template_refuses_missing_recipe_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(self._artifact_root.name)
+            payload = verified_payload()
+            payload["result_contract"]["design_time_templates"] = [
+                structured_template("extra-column", columns=["case_id", "amount", "decision", "rule_basis"])
+            ]
+            target = root / "must-not-exist.xlsx"
+
+            delivery = EXECUTOR.materialize_verified_delivery(payload, target, "xlsx", "extra-column")
+
+            self.assertEqual("blocked_delivery_template_not_materializable", delivery["status"])
+            self.assertEqual(["rule_basis"], delivery["missing_columns"])
+            self.assertFalse(target.exists())
+
+    def test_absolute_delivery_names_are_blocked_by_host_artifact_boundary(self) -> None:
+        evidence = Path(self._artifact_root.name) / "scenario-evidence.json"
+        evidence.write_text(json.dumps(verified_payload(), ensure_ascii=False), encoding="utf-8")
+
+        delivery = EXECUTOR.run([
+            "deliver", "--result", "scenario-evidence.json", "--output", "E:/outputs/result.xlsx",
+        ])
+
+        self.assertEqual("blocked_host_artifact_sink", delivery["status"])
+        self.assertFalse((Path("E:/outputs") / "result.xlsx").exists())
 
 
 if __name__ == "__main__":

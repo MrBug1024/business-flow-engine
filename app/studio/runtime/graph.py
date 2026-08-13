@@ -81,6 +81,91 @@ _WORKSPACE_SNAPSHOT_LIMIT = 10_000
 _LOGGER = logging.getLogger(__name__)
 
 
+def _prepare_execute_command_for_gate(
+    record: BusinessRecord,
+    command: str,
+) -> tuple[str, str | None, str | None, str | None]:
+    """Rebuild the non-distillation execute gates from the current record.
+
+    A LangGraph ``interrupt`` reruns the interrupted tool node.  The approval
+    decision is persisted by a separate HTTP request, so no blocker calculated
+    before that interrupt may be reused after it returns.  Keep command
+    rewriting and the trace-specific blockers in one small helper so both the
+    initial attempt and the resumed attempt observe the same current state.
+    """
+
+    rewritten_command, anchor_blocker = apply_selected_trace_anchor(record, command)
+    role_manifest_blocker: str | None = None
+    correction_retrace_blocker: str | None = None
+    normalized_command = rewritten_command.replace("\\", "/").casefold()
+    is_trace_analyze = bool(
+        re.search(r"analyze_relations\.py[\"']?\s+analyze(?:\s|$)", normalized_command)
+    )
+    if anchor_blocker is None and is_trace_analyze:
+        try:
+            # Validate the host-side signature and source hashes before
+            # exposing only its fixed sandbox path to the command.  The model
+            # never receives a path it can repoint at a different role
+            # assignment.
+            store.require_approved_role_manifest(record)
+            rewritten_command, role_manifest_blocker = apply_approved_role_manifest(
+                rewritten_command
+            )
+            if role_manifest_blocker is None and re.search(
+                r"--trace-review(?:\s|=|$)",
+                rewritten_command.replace("\\", "/").casefold(),
+            ):
+                correction_retrace_blocker = (
+                    "Blocked: an Agent command cannot choose a trace-review file. "
+                    "Use the platform trace action, which validates and injects the one canonical review."
+                )
+            elif (
+                role_manifest_blocker is None
+                and store.require_trace_review_corrections_for_retrace(record)
+            ):
+                # The HTTP retrace action archives the old correction review,
+                # proves its relation IDs reached the selected chain, then
+                # preserves the audit on the fresh review.  A generic Agent
+                # shell execution cannot safely do those transactional steps.
+                correction_retrace_blocker = (
+                    "Blocked: a user-confirmed key-pair correction is pending deterministic retracing. "
+                    "Use the platform trace action from the current scenario; an Agent sandbox command "
+                    "cannot replace the correction archive and post-trace evidence check."
+                )
+        except ValueError as exc:
+            role_manifest_blocker = f"Blocked: current approved role manifest is unavailable: {exc}"
+    return (
+        rewritten_command,
+        anchor_blocker,
+        role_manifest_blocker,
+        correction_retrace_blocker,
+    )
+
+
+def _refresh_record_after_user_interrupt(record: BusinessRecord, run: AIRun) -> None:
+    """Rebase the in-flight graph object onto the persisted user decision.
+
+    Confirmation is intentionally a separate request from the SSE stream.  A
+    resumed graph must therefore read the current record rather than relying
+    on an object that could predate the reviewer decision.  Keep the active
+    ``AIRun`` object's identity: the orchestrator still owns that reference
+    after the graph returns.
+    """
+
+    latest = store.require(record.id, record.owner_id)
+    for field_name in BusinessRecord.model_fields:
+        if field_name != "runs":
+            setattr(record, field_name, getattr(latest, field_name))
+
+    persisted_run = next((item for item in latest.runs if item.id == run.id), None)
+    if persisted_run is not None and persisted_run is not run:
+        for field_name in AIRun.model_fields:
+            setattr(run, field_name, getattr(persisted_run, field_name))
+    record.runs = [run if item.id == run.id else item for item in latest.runs]
+    if persisted_run is None:
+        record.runs.append(run)
+
+
 class _CapabilityDiscoveryInput(BaseModel):
     kind: Literal["all", "skill", "tool", "mcp"] = Field(
         default="all",
@@ -855,41 +940,12 @@ class StudioGraphRuntime:
         correction_retrace_blocker: str | None = None
         if name == "execute":
             original_command = str(arguments.get("command") or "")
-            rewritten_command, anchor_blocker = apply_selected_trace_anchor(record, original_command)
-            normalized_command = rewritten_command.replace("\\", "/").casefold()
-            is_trace_analyze = bool(
-                re.search(r"analyze_relations\.py[\"']?\s+analyze(?:\s|$)", normalized_command)
-            )
-            if anchor_blocker is None and is_trace_analyze:
-                try:
-                    # Validate the host-side signature and source hashes before
-                    # exposing only its fixed sandbox path to the command.
-                    # The model never receives a path it can repoint at a
-                    # different role assignment.
-                    store.require_approved_role_manifest(record)
-                    rewritten_command, role_manifest_blocker = apply_approved_role_manifest(rewritten_command)
-                    if role_manifest_blocker is None and re.search(
-                        r"--trace-review(?:\s|=|$)",
-                        rewritten_command.replace("\\", "/").casefold(),
-                    ):
-                        correction_retrace_blocker = (
-                            "Blocked: an Agent command cannot choose a trace-review file. "
-                            "Use the platform trace action, which validates and injects the one canonical review."
-                        )
-                    elif role_manifest_blocker is None and store.require_trace_review_corrections_for_retrace(record):
-                        # The HTTP retrace action archives the old correction
-                        # review, proves its relation IDs reached the selected
-                        # chain, then preserves the audit on the fresh review.
-                        # A generic Agent shell execution cannot safely do
-                        # those transactional steps, so it must not silently
-                        # consume or overwrite the user's correction.
-                        correction_retrace_blocker = (
-                            "Blocked: a user-confirmed key-pair correction is pending deterministic retracing. "
-                            "Use the platform trace action from the current scenario; an Agent sandbox command "
-                            "cannot replace the correction archive and post-trace evidence check."
-                        )
-                except ValueError as exc:
-                    role_manifest_blocker = f"Blocked: current approved role manifest is unavailable: {exc}"
+            (
+                rewritten_command,
+                anchor_blocker,
+                role_manifest_blocker,
+                correction_retrace_blocker,
+            ) = _prepare_execute_command_for_gate(record, original_command)
             if rewritten_command != original_command:
                 # ``arguments`` normally aliases ``request.tool_call['args']``.
                 # Update both explicitly so the wrapped handler receives the
@@ -1026,7 +1082,7 @@ class StudioGraphRuntime:
                 or correction_retrace_blocker
                 or distillation_blocker
             )
-            if blocker:
+            while blocker:
                 approval_question: dict[str, Any] | None = None
                 question_changed = False
                 if (
@@ -1094,6 +1150,45 @@ class StudioGraphRuntime:
                                 "questions": [approval_question],
                             }
                         )
+                    # The signed decision is persisted by the confirmation
+                    # endpoint while this node is interrupted.  Never reuse a
+                    # blocker calculated before that decision: clear the
+                    # waiting state and rebuild both command rewriting and the
+                    # current distillation gate.
+                    _refresh_record_after_user_interrupt(record, run)
+                    run.status = "running"
+                    run.summary = "Approval received; revalidating the original command."
+                    current_command = str(arguments.get("command") or "")
+                    (
+                        rewritten_command,
+                        anchor_blocker,
+                        role_manifest_blocker,
+                        correction_retrace_blocker,
+                    ) = _prepare_execute_command_for_gate(record, current_command)
+                    if rewritten_command != current_command:
+                        arguments["command"] = rewritten_command
+                        call_args = request.tool_call.get("args")
+                        if isinstance(call_args, dict):
+                            call_args["command"] = rewritten_command
+                    store.refresh_distillation_artifact_contracts(record)
+                    distillation_blocker = distillation_command_blocker(
+                        record,
+                        str(arguments.get("command") or ""),
+                    )
+                    blocker = (
+                        anchor_blocker
+                        or role_manifest_blocker
+                        or correction_retrace_blocker
+                        or distillation_blocker
+                    )
+                    store.save(record)
+                    if blocker is None:
+                        break
+                if approval_question is not None:
+                    # If approval advanced directly to another reviewable
+                    # phase, create that next signed question rather than
+                    # returning a pre-approval failure to the model.
+                    continue
                 _append_runtime_invocation(
                     run,
                     call_id,

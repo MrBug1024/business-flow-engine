@@ -19,6 +19,16 @@ MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
+SCENARIO_ENGINE_PATH = (
+    SKILL_ROOT.parent / "discover-data-relations" / "scripts" / "scenario_engine.py"
+)
+sys.path.insert(0, str(SCENARIO_ENGINE_PATH.parent))
+SCENARIO_SPEC = importlib.util.spec_from_file_location("scenario_engine_external_requirement_under_test", SCENARIO_ENGINE_PATH)
+assert SCENARIO_SPEC is not None and SCENARIO_SPEC.loader is not None
+SCENARIO_ENGINE = importlib.util.module_from_spec(SCENARIO_SPEC)
+sys.modules[SCENARIO_SPEC.name] = SCENARIO_ENGINE
+SCENARIO_SPEC.loader.exec_module(SCENARIO_ENGINE)
+
 
 def sample_operational() -> dict[str, object]:
     return {
@@ -99,6 +109,42 @@ def sample_recipe_catalog() -> dict[str, object]:
 
 
 class GeneratorContractTests(unittest.TestCase):
+    def test_chinese_conditional_external_requirement_crosses_the_synthesis_boundary(self) -> None:
+        description = (
+            "## Scenario Description\n"
+            "如果规则有药品的违规描述，需要调用外部知识库或者网络爬虫MCP服务获取相关药品的规格辅助判断审计！\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            goal = Path(directory) / "business-context.md"
+            goal.write_text(description, encoding="utf-8")
+            cards = SCENARIO_ENGINE.goal_card(goal)
+
+        requirements = [item for item in cards if item.get("kind") == "external_capability_requirement"]
+        self.assertEqual(1, len(requirements))
+        requirement = requirements[0]
+        facts = requirement["facts"]
+        self.assertTrue(facts["required"])
+        self.assertEqual(
+            "selected_rule_matches_condition_text",
+            facts["condition_evaluation"],
+        )
+        self.assertIn("药品", facts["condition_text"])
+        self.assertIn("external_knowledge_retrieval", facts["capability_kinds"])
+        self.assertIn("web_retrieval", facts["capability_kinds"])
+        self.assertIn("mcp_capability", facts["capability_kinds"])
+
+        trace = SCENARIO_ENGINE.make_card(
+            "record_trace", "derived", "trace", [{"file": "rules.csv", "locator": "row:1"}],
+            {"source_files": ["rules.csv"], "key_paths": []},
+        )
+        brief = SCENARIO_ENGINE.synthesis_brief({
+            "cards": [*cards, trace],
+            "coverage": {"files": ["rules.csv"]},
+            "trace_samples": {"compact": {}},
+        })
+        self.assertEqual("ready_for_synthesis", brief["status"])
+        self.assertIn(requirement["id"], [item["id"] for item in brief["cards"]])
+
     def test_delivery_contract_has_structured_and_unstructured_modes(self) -> None:
         contract = sample_delivery_contract()
         modes = contract["runtime_input_contract"]["modes"]
@@ -107,6 +153,133 @@ class GeneratorContractTests(unittest.TestCase):
         self.assertIn("chunk_id", document["evidence"])
         self.assertEqual(contract["entrypoint"]["command"], "execute")
         self.assertIn("custom_business_field", contract["delivery_contract"]["required_fields"])
+        artifact_output = contract["artifact_output_contract"]
+        self.assertEqual("BUSINESS_ARTIFACT_ROOT", artifact_output["root_environment"])
+        self.assertIn("relative_path", artifact_output["public_reference_fields"])
+
+    def test_output_template_retains_data_free_single_sheet_structure(self) -> None:
+        template = {
+            "template_id": "historical-xlsx",
+            "name": "historical-output",
+            "format": "xlsx",
+            "source_kind": "tabular",
+            "evidence_ids": ["E-output"],
+            "output_columns": ["case_id", "amount"],
+            "column_semantics": [{"column": "case_id", "semantic_role": "identifier"}],
+            "tables": [{
+                "table_id": "table-1",
+                "table_name": "Historical Outcome",
+                "worksheet_name": "Historical Outcome",
+                "header_row_index": 0,
+                "columns": [
+                    {"ordinal": 0, "name": "case_id", "semantic_kind": "id", "source_type": None},
+                    {"ordinal": 1, "name": "amount", "semantic_kind": "number", "source_type": "decimal"},
+                ],
+                "column_order": ["case_id", "amount"],
+            }],
+            "materialization": {
+                "status": "materializable_schema",
+                "selected_table_id": "table-1",
+                "column_order": ["case_id", "amount"],
+            },
+        }
+
+        descriptor = MODULE.declared_output_template_descriptor(template)
+
+        self.assertFalse(descriptor["runtime_required"])
+        self.assertEqual("structure_metadata_only_no_historical_rows", descriptor["historical_data_policy"])
+        self.assertEqual("Historical Outcome", descriptor["tables"][0]["worksheet_name"])
+        self.assertEqual(["case_id", "amount"], descriptor["tables"][0]["column_order"])
+        self.assertEqual("decimal", descriptor["tables"][0]["columns"][1]["source_type"])
+        self.assertEqual("materializable_schema", descriptor["materialization"]["status"])
+        self.assertRegex(descriptor["structure_fingerprint"], r"^[0-9a-f]{64}$")
+
+    def test_output_template_marks_multitable_and_document_layouts_as_nonmaterializable(self) -> None:
+        multi = MODULE._output_template_materialization("xlsx", "tabular", [
+            {"table_id": "table-1", "columns": [{"name": "id"}], "header_row_index": 0},
+            {"table_id": "table-2", "columns": [{"name": "id"}], "header_row_index": 0},
+        ])
+        document = MODULE._output_template_materialization("docx", "document", [])
+
+        self.assertEqual("not_materializable", multi["status"])
+        self.assertEqual("multiple_or_missing_tables", multi["reason"])
+        self.assertEqual("not_materializable", document["status"])
+        self.assertEqual("unsupported_format_or_source", document["reason"])
+
+    def test_inferred_historical_template_keeps_structure_and_omits_historical_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            relation_path = root / "relations.json"
+            MODULE.atomic_json(relation_path, {
+                "nodes": [{"type": "output", "evidence_ids": ["E-output"]}],
+            })
+            MODULE.atomic_json(root / "evidence-cards.json", {
+                "cards": [{
+                    "id": "E-output",
+                    "sources": [{"file": "historical-output.xlsx", "locator": "table:Sheet1;header"}],
+                }],
+            })
+            evidence_root = root / "_field-evidence"
+            evidence_root.mkdir()
+            MODULE.atomic_json(evidence_root / "catalog.json", {
+                "files": [{
+                    "path": "historical-output.xlsx",
+                    "extension": ".xlsx",
+                    "kind": "tabular",
+                    "tables": [{
+                        "table_name": "Historical Result",
+                        "header_row": 0,
+                        "row_count": 999,
+                        "columns": [
+                            {
+                                "name": "case_id", "query_name": "case_id", "index": 0,
+                                "kind": "id", "data_type": "string", "sample_value": "private-case-1",
+                            },
+                            {
+                                "name": "amount", "query_name": "amount", "index": 1,
+                                "kind": "number", "data_type": "decimal", "sample_value": 9999,
+                            },
+                        ],
+                    }],
+                }],
+            })
+
+            templates = MODULE.infer_design_time_output_templates(
+                relation_path,
+                {"nodes": [{"type": "output", "evidence_ids": ["E-output"]}]},
+                {"sources": []},
+            )
+
+            self.assertEqual(1, len(templates))
+            template = templates[0]
+            self.assertEqual("xlsx", template["format"])
+            self.assertEqual("materializable_schema", template["materialization"]["status"])
+            table = template["tables"][0]
+            self.assertEqual("Historical Result", table["worksheet_name"])
+            self.assertEqual(["case_id", "amount"], table["column_order"])
+            self.assertEqual("string", table["columns"][0]["source_type"])
+            serialized = json.dumps(template, ensure_ascii=False)
+            self.assertNotIn("private-case-1", serialized)
+            self.assertNotIn("sample_value", serialized)
+            self.assertNotIn("row_count", serialized)
+
+    def test_delivery_contract_exposes_template_selection_policy(self) -> None:
+        operational = sample_operational()
+        operational["output_contract"] = {
+            "templates": [{"template_id": "one"}],
+            "selection_policy": {"automatic": "unique compatible template"},
+        }
+        contract = MODULE.portable_delivery_contract(
+            {"scenario": {"name": "generic review"}},
+            {"scenario": {"name": "generic review"}, "output_contract": operational["output_contract"]},
+            operational,
+        )
+
+        self.assertEqual(2, contract["schema_version"])
+        self.assertEqual(
+            "unique compatible template",
+            contract["delivery_contract"]["template_selection_policy"]["automatic"],
+        )
 
     def test_replay_contract_refreshes_to_current_recipe_cases(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -259,7 +432,10 @@ class GeneratorContractTests(unittest.TestCase):
             self.assertEqual(["execute"], mcp["normal_action_allowlist"])
             self.assertEqual(["execute"], [item["action"] for item in mcp["tools"]])
             delivery_properties = mcp["tools"][0]["inputSchema"]["properties"]
-            self.assertIn("delivery_output", delivery_properties)
+            self.assertIn("artifact_name", delivery_properties)
+            self.assertIn("delivery_artifact_name", delivery_properties)
+            self.assertNotIn("out_dir", delivery_properties)
+            self.assertNotIn("delivery_output", delivery_properties)
             self.assertEqual(["auto", "json", "csv", "xlsx"], delivery_properties["delivery_format"]["enum"])
             (output_root / "release" / "skill" / "main_skill" / "SKILL.md").write_text(
                 guide + "\nsource-tampered\n", encoding="utf-8"

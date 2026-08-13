@@ -66,6 +66,21 @@ EXTERNAL_CAPABILITY_MARKERS = (
     "知识库", "外部知识", "药品知识", "政策知识", "规范知识", "网络检索", "爬虫",
     "外部接口", "远程接口", "第三方接口",
 )
+# These markers deliberately describe integration semantics rather than a
+# business domain.  A scenario can require an external capability for any
+# subject matter; the selected governing record supplies the actual query.
+MANDATORY_REQUIREMENT_MARKERS = (
+    "must", "required", "shall", "mandatory", "need to", "needs to",
+    "\u5fc5\u987b", "\u9700\u8981", "\u5e94\u5f53", "\u987b",
+)
+EXTERNAL_CAPABILITY_UNICODE_MARKERS = (
+    "\u77e5\u8bc6\u5e93", "\u5916\u90e8\u77e5\u8bc6", "\u7f51\u7edc\u68c0\u7d22",
+    "\u7f51\u7edc\u722c\u866b", "\u722c\u866b", "\u5916\u90e8\u63a5\u53e3",
+    "\u8fdc\u7a0b\u63a5\u53e3", "\u7b2c\u4e09\u65b9\u63a5\u53e3",
+)
+CONDITIONAL_REQUIREMENT_MARKERS = (
+    "if", "when", "unless", "where", "\u5982\u679c", "\u5f53", "\u82e5", "\u9047\u5230",
+)
 NODE_TYPES = {
     "trigger", "actor", "input", "activity", "object", "rule", "decision",
     "state", "system", "output",
@@ -696,6 +711,67 @@ def make_card(
     }
 
 
+def external_capability_markers() -> tuple[str, ...]:
+    """Return compatibility markers plus correctly decoded non-ASCII terms.
+
+    Some legacy scenario assets contain non-ASCII literals written by older
+    toolchains.  Keeping the canonical unicode terms here makes the semantic
+    contract independent of the source-file encoding and avoids domain terms.
+    """
+
+    return tuple(dict.fromkeys((*EXTERNAL_CAPABILITY_MARKERS, *EXTERNAL_CAPABILITY_UNICODE_MARKERS)))
+
+
+def has_external_capability_marker(text: str) -> bool:
+    folded = str(text or "").casefold()
+    return any(marker.casefold() in folded for marker in external_capability_markers())
+
+
+def is_mandatory_external_requirement(text: str) -> bool:
+    folded = str(text or "").casefold()
+    return (
+        has_external_capability_marker(folded)
+        and any(marker.casefold() in folded for marker in MANDATORY_REQUIREMENT_MARKERS)
+    )
+
+
+def is_conditional_requirement_statement(text: str) -> bool:
+    folded = str(text or "").casefold()
+    return any(marker.casefold() in folded for marker in CONDITIONAL_REQUIREMENT_MARKERS)
+
+
+def external_requirement_capability_kinds(text: str) -> list[str]:
+    """Describe the required host integration without choosing a provider."""
+
+    folded = str(text or "").casefold()
+    kinds: list[str] = []
+    if any(marker in folded for marker in (
+        "knowledge base", "knowledge-base", "vector kb", "vector-kb", "external knowledge",
+        "\u77e5\u8bc6\u5e93", "\u5916\u90e8\u77e5\u8bc6",
+    )):
+        kinds.append("external_knowledge_retrieval")
+    if any(marker in folded for marker in (
+        "web search", "crawler", "scraper", "\u7f51\u7edc\u68c0\u7d22", "\u7f51\u7edc\u722c\u866b", "\u722c\u866b",
+    )):
+        kinds.append("web_retrieval")
+    if "mcp" in folded:
+        kinds.append("mcp_capability")
+    if any(marker in folded for marker in ("remote api", "external api", "\u5916\u90e8\u63a5\u53e3", "\u8fdc\u7a0b\u63a5\u53e3", "\u7b2c\u4e09\u65b9\u63a5\u53e3")):
+        kinds.append("external_api")
+    return list(dict.fromkeys(kinds)) or ["external_retrieval"]
+
+
+def mandatory_external_requirement_cards(card_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return source-backed scenario contracts that cannot be downgraded later."""
+
+    return [
+        card for card in card_payload.get("cards", [])
+        if isinstance(card, dict)
+        and card.get("kind") == "external_capability_requirement"
+        and bool((card.get("facts") or {}).get("required"))
+    ]
+
+
 def classify_header(header: str) -> str:
     normalized = normalize_name(header)
     scores = {
@@ -1122,11 +1198,13 @@ def goal_card(goal_file: Path | None) -> list[dict[str, Any]]:
         {"description": text},
     )]
     seen: set[str] = set()
+    statements: list[tuple[int, str]] = []
     for line_number, line in section_lines:
         for statement in split_goal_statements(line):
+            statements.append((line_number, statement))
             score, _mentioned = statement_score(statement, [])
             fingerprint = normalize_name(statement)
-            if score and fingerprint not in seen:
+            if score and fingerprint not in seen and len(seen) < 20:
                 seen.add(fingerprint)
                 cards.append(make_card(
                     "goal_relation_statement",
@@ -1136,8 +1214,53 @@ def goal_card(goal_file: Path | None) -> list[dict[str, Any]]:
                     {"relation_markers": sorted({marker for marker in RELATION_MARKERS if marker.casefold() in statement.casefold()})[:12]},
                     statement,
                 ))
-            if len(seen) >= 20:
-                return cards
+
+    # A conditional clause is often separated from its mandatory external
+    # action by punctuation (for example, "if ... , must call ...").  Preserve
+    # both pieces as one structured contract so a later model cannot silently
+    # reinterpret it as optional enrichment.
+    for index, (line_number, statement) in enumerate(statements):
+        if not is_mandatory_external_requirement(statement):
+            continue
+        condition_text = (
+            compact_text(statement, MAX_SNIPPET)
+            if is_conditional_requirement_statement(statement) else ""
+        )
+        condition_sources: list[dict[str, str]] = (
+            [{"file": str(goal_file), "locator": f"line:{line_number}"}]
+            if condition_text else []
+        )
+        if not condition_text:
+            for prior_line_number, prior_statement in reversed(statements[max(0, index - 2):index]):
+                if is_conditional_requirement_statement(prior_statement):
+                    condition_text = compact_text(prior_statement, MAX_SNIPPET)
+                    condition_sources = [{"file": str(goal_file), "locator": f"line:{prior_line_number}"}]
+                    break
+        requirement_id = stable_id(
+            "external-requirement-", normalize_name(condition_text), normalize_name(statement),
+        )
+        cards.append(make_card(
+            "external_capability_requirement",
+            "direct",
+            "The scenario explicitly requires a host-provided external capability before a business decision may continue.",
+            [*condition_sources, {"file": str(goal_file), "locator": f"line:{line_number}"}],
+            {
+                "requirement_id": requirement_id,
+                "required": True,
+                "condition_text": condition_text,
+                "condition_evaluation": (
+                    "selected_rule_matches_condition_text"
+                    if condition_text else "always_after_complete_rule_selection"
+                ),
+                "activation": "after_complete_rule_selection",
+                "capability_kinds": external_requirement_capability_kinds(statement),
+                "accepted_integrations": ["declared_host_capability", "mcp"],
+                "query_context": "selected_rule_record_and_rule_locator",
+                "evidence_contract": ["provider", "provider_capability", "query", "sources", "retrieved_at"],
+                "failure_policy": "block_business_decision",
+            },
+            statement,
+        ))
     return cards
 
 
@@ -1146,8 +1269,14 @@ def deduplicate_and_bound(cards: Iterable[dict[str, Any]], max_cards: int) -> li
     unique = {card["id"]: card for card in cards}
     ordered = sorted(unique.values(), key=lambda item: (priority.get(item["strength"], 9), item["kind"], item["id"]))
     if max_cards > 0 and len(ordered) > max_cards:
-        required = [card for card in ordered if card["kind"] == "file_structure"]
-        remaining = [card for card in ordered if card["kind"] != "file_structure"]
+        required = [
+            card for card in ordered
+            if card["kind"] in {"file_structure", "external_capability_requirement"}
+        ]
+        remaining = [
+            card for card in ordered
+            if card["kind"] not in {"file_structure", "external_capability_requirement"}
+        ]
         ordered = required + remaining[:max(0, max_cards - len(required))]
     return ordered
 
@@ -1255,6 +1384,11 @@ def claims_template(cards_path: Path, files: Sequence[str]) -> dict[str, Any]:
             "complexity": f"At most {MAX_SCENARIO_NODES} nodes, {MAX_SCENARIO_EDGES} edges, and {MAX_SCENARIO_BRANCHES} branches.",
             "preflight": "Create every directed primary-path edge, then fix all validation errors in one bounded rewrite before retrying.",
             "evidence": "Every node, edge, branch, and excluded-file decision must cite evidence card IDs.",
+            "mandatory_external_capabilities": (
+                "For every external_capability_requirement evidence card, create one connected system node that cites "
+                "that card. The node is a required host capability after complete rule selection, never local data "
+                "or optional enrichment."
+            ),
         },
         "scenario": {"name": "", "purpose": ""},
         "nodes": [],
@@ -1744,6 +1878,9 @@ def synthesis_brief(payload: dict[str, Any]) -> dict[str, Any]:
     candidates = (
         sorted((card for card in cards if card.get("kind") == "scenario_goal"), key=source_key)[:1]
         + [trace_card]
+        # These cards are a scenario contract, not historical data.  They
+        # must cross the bounded model boundary before optional schema detail.
+        + sorted(mandatory_external_requirement_cards(payload), key=source_key)
         + first_per_file("file_structure", trace_files, MAX_BRIEF_CARDS)
         + first_per_file("table_schema", trace_files, len(trace_files))
         + sorted(trace_relationships, key=source_key)
@@ -1773,6 +1910,7 @@ def synthesis_brief(payload: dict[str, Any]) -> dict[str, Any]:
             "selected_trace_files": sorted(trace_files),
             "permitted_non_trace_content": [
                 "scenario_goal",
+                "mandatory_external_capability_requirement",
                 "schema_metadata",
                 "rule_source_schema_metadata",
                 "trace_key_relationship_metadata",
@@ -1946,6 +2084,32 @@ def validate_claims(claims: dict[str, Any], card_payload: dict[str, Any]) -> lis
             if any(str(card.get("kind", "")) in local_structure_kinds for card in selected_evidence):
                 errors.append(
                     f"Node {identifier} is an external capability and must not assign local data files as its role evidence"
+                )
+
+    # Direct scenario requirements are contractual: a graph that merely
+    # mentions the scenario goal but omits its required host integration is
+    # invalid.  This makes omission detectable before flow synthesis.
+    for requirement_card in mandatory_external_requirement_cards(card_payload):
+        requirement_card_id = str(requirement_card.get("id", ""))
+        matches = [
+            node for node in nodes
+            if isinstance(node, dict) and requirement_card_id in {
+                str(item) for item in node.get("evidence_ids", []) if str(item)
+            }
+        ]
+        if not matches:
+            errors.append(
+                f"Required external capability evidence {requirement_card_id} must be represented by a connected system node"
+            )
+            continue
+        if len(matches) > 1:
+            errors.append(
+                f"Required external capability evidence {requirement_card_id} must map to exactly one system node"
+            )
+        for node in matches:
+            if str(node.get("type", "")) != "system":
+                errors.append(
+                    f"Required external capability evidence {requirement_card_id} must map to a system node"
                 )
 
     edge_by_pair: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -2267,7 +2431,59 @@ def stable_source_id(path: str) -> str:
 
 def is_external_capability_node(node: dict[str, Any]) -> bool:
     text = " ".join(str(node.get(key, "")) for key in ("name", "description", "type")).casefold()
-    return any(marker.casefold() in text for marker in EXTERNAL_CAPABILITY_MARKERS)
+    return has_external_capability_marker(text)
+
+
+def external_requirement_contracts(
+    nodes: Sequence[dict[str, Any]], card_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Materialize direct scenario requirements as portable runtime contracts.
+
+    Provider discovery remains a host concern: this package declares the role,
+    accepted integration surface, and evidence it needs back.  It never
+    assumes a particular knowledge base, crawler, or business domain.
+    """
+
+    contracts: list[dict[str, Any]] = []
+    for card in mandatory_external_requirement_cards(card_payload):
+        facts = card.get("facts") if isinstance(card.get("facts"), dict) else {}
+        card_id = str(card.get("id", ""))
+        node = next(
+            (
+                item for item in nodes
+                if isinstance(item, dict) and card_id in {
+                    str(value) for value in item.get("evidence_ids", []) if str(value)
+                }
+            ),
+            {},
+        )
+        contracts.append({
+            "requirement_id": str(facts.get("requirement_id") or card_id),
+            "source_evidence_id": card_id,
+            "node_id": str(node.get("id", "")),
+            "name": str(node.get("name", "")) or "required external capability",
+            "description": str(node.get("description", "")) or str(card.get("snippet", "")),
+            "required": True,
+            "lifecycle": "required_external_enrichment",
+            "runtime_required": True,
+            "activation": str(facts.get("activation", "after_complete_rule_selection")),
+            "condition_text": str(facts.get("condition_text", "")),
+            "condition_evaluation": str(
+                facts.get("condition_evaluation", "always_after_complete_rule_selection")
+            ),
+            "capability_kinds": [str(item) for item in facts.get("capability_kinds", []) if str(item)]
+            or ["external_retrieval"],
+            "accepted_integrations": [
+                str(item) for item in facts.get("accepted_integrations", []) if str(item)
+            ] or ["declared_host_capability", "mcp"],
+            "capability_selection": "host_must_select_a_declared_matching_capability",
+            "query_context": str(facts.get("query_context", "selected_rule_record_and_rule_locator")),
+            "evidence_contract": [
+                str(item) for item in facts.get("evidence_contract", []) if str(item)
+            ] or ["provider", "provider_capability", "query", "sources", "retrieved_at"],
+            "failure_policy": str(facts.get("failure_policy", "block_business_decision")),
+        })
+    return contracts
 
 
 def direct_node_files(node: dict[str, Any], cards_by_id: dict[str, dict[str, Any]]) -> set[str]:
@@ -2954,7 +3170,11 @@ def build_operational_contract(
     template_source_ids = [
         source["source_id"] for source in sources if source.get("lifecycle") == "design_time_template"
     ]
-    external_capabilities = [
+    external_requirements = external_requirement_contracts(nodes, card_payload)
+    required_external_node_ids = {
+        str(item.get("node_id", "")) for item in external_requirements if str(item.get("node_id", ""))
+    }
+    optional_external_capabilities = [
         {
             "node_id": str(node.get("id", "")),
             "name": str(node.get("name", "")),
@@ -2965,7 +3185,27 @@ def build_operational_contract(
             "failure_policy": "manual_intervention_required_when_mandatory_and_unavailable",
         }
         for node in nodes
-        if str(node.get("type", "")) == "system" and is_external_capability_node(node)
+        if (
+            str(node.get("type", "")) == "system"
+            and is_external_capability_node(node)
+            and str(node.get("id", "")) not in required_external_node_ids
+        )
+    ]
+    external_capabilities = [*external_requirements, *optional_external_capabilities]
+    required_sequence = [
+        "locate complete rule record with bounded query",
+        *(
+            [
+                "resolve every required external capability through a declared host capability or MCP after complete rule selection; block the business decision when required evidence is unavailable",
+            ] if external_requirements else []
+        ),
+        "derive structured predicates and unstructured retrieval terms from the complete rule record",
+        "use the validated result trace blueprint to select source roles, projected fields, and join keys",
+        "index and search non-tabular sources with provenance-preserving chunks when required",
+        "validate recommended join keys and fanout",
+        "execute bounded read-only SQL only for structured sources that participate in the operation",
+        "resolve non-tabular inputs and outputs through digest-bound document/OCR locators",
+        "reconcile structured rows with document/OCR evidence locators without semantic-only joins",
     ]
     return {
         "schema_version": 3,
@@ -2986,6 +3226,7 @@ def build_operational_contract(
         "runtime_source_ids": runtime_source_ids,
         "template_source_ids": template_source_ids,
         "external_capabilities": external_capabilities,
+        "external_requirements": external_requirements,
         "query_policy": {
             "rule_record_mode": "return_complete_selected_rule_record",
             "structured_rule_record_mode": "return_complete_selected_row",
@@ -2996,16 +3237,7 @@ def build_operational_contract(
             "register_only_sources_referenced_by_the_current_operation": True,
             "runtime_data_validation": "schema_compatibility_not_design_time_content_identity",
             "design_time_templates_are_not_runtime_dependencies": True,
-            "required_sequence": [
-                "locate complete rule record with bounded query",
-                "derive structured predicates and unstructured retrieval terms from the complete rule record",
-                "use the validated result trace blueprint to select source roles, projected fields, and join keys",
-                "index and search non-tabular sources with provenance-preserving chunks when required",
-                "validate recommended join keys and fanout",
-                "execute bounded read-only SQL only for structured sources that participate in the operation",
-                "resolve non-tabular inputs and outputs through digest-bound document/OCR locators",
-                "reconcile structured rows with document/OCR evidence locators without semantic-only joins",
-            ],
+            "required_sequence": required_sequence,
         },
         "quality_gates": {
             "status": "passed" if not blockers else "failed",
@@ -3016,6 +3248,7 @@ def build_operational_contract(
             "unstructured_input_source_count": len(unstructured_input_files),
             "evidence_backed_link_count": sum(bool(item.get("recommended_candidate")) for item in links),
             "semantic_retrieval_route_count": len(semantic_routes),
+            "required_external_capability_count": len(external_requirements),
             "result_trace_link_count": sum(item["kind"] == "result_trace" and bool(item.get("recommended_candidate")) for item in links),
             "validated_trace_bundle_count": len(trace_evidence.get("bundles", [])),
         },

@@ -30,6 +30,15 @@
     </div>
 
     <template v-else-if="payload">
+      <div v-if="payload.download_url" class="preview-file-actions">
+        <a
+          :href="payload.download_url"
+          :download="payload.filename || undefined"
+          target="_blank"
+          rel="noopener"
+        ><el-icon><Download /></el-icon>{{ text.download }}</a>
+      </div>
+
       <el-alert
         v-for="warning in payload.warnings || []"
         :key="warning"
@@ -157,7 +166,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
-import { Document, FullScreen, Loading, Refresh, RefreshLeft, WarningFilled, ZoomIn, ZoomOut } from '@element-plus/icons-vue'
+import { Document, Download, FullScreen, Loading, Refresh, RefreshLeft, WarningFilled, ZoomIn, ZoomOut } from '@element-plus/icons-vue'
 import mermaid from 'mermaid'
 import MarkdownContent from '@/components/MarkdownContent.vue'
 
@@ -304,6 +313,26 @@ function resetGraphSize() {
 
 .workspace-preview :deep(.el-alert:last-of-type) {
   margin-bottom: 12px;
+}
+
+.preview-file-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 8px;
+}
+
+.preview-file-actions a {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--accent);
+  font-size: 12px;
+  text-decoration: none;
+}
+
+.preview-file-actions a:hover,
+.preview-file-actions a:focus-visible {
+  text-decoration: underline;
 }
 
 .preview-loading {

@@ -743,6 +743,12 @@ def build_brief(
         "evidence_card_warning": card_warning,
         "operational_execution": {
             "query_policy": operational.get("query_policy", {}),
+            "external_requirements": operational.get("external_requirements", []),
+            "external_capabilities": operational.get("external_capabilities", []),
+            "external_requirement_policy": (
+                "Every required external capability is a host/MCP gate after complete rule selection. "
+                "Model it in a stage and do not downgrade it to optional enrichment; unavailable evidence blocks the decision."
+            ),
             "large_sources": [
                 {
                     "source_id": item.get("source_id"),
@@ -1189,6 +1195,25 @@ def validate_candidate(
         validate_inference(f"阶段 {identifier}", stage.get("inference"), support_edges, edge_by_id, errors)
 
     stage_ids = set(stage_by_id)
+    required_external_node_ids = {
+        str(item.get("node_id", ""))
+        for item in operational.get("external_requirements", [])
+        if isinstance(item, dict) and item.get("required") is True and str(item.get("node_id", ""))
+    }
+    stage_mapped_node_ids = {
+        node_id
+        for stage in stage_by_id.values()
+        for node_id in (
+            unique_strings(stage.get("input_node_ids"))
+            + unique_strings(stage.get("output_node_ids"))
+        )
+    }
+    missing_external_nodes = sorted(required_external_node_ids - stage_mapped_node_ids)
+    if missing_external_nodes:
+        errors.append(
+            "Every required external capability must be mapped into a flow stage after rule selection: "
+            + ", ".join(missing_external_nodes)
+        )
     transition_by_id: dict[str, dict[str, Any]] = {}
     pair_types: dict[tuple[str, str], set[str]] = defaultdict(set)
     adjacency: dict[str, set[str]] = defaultdict(set)
@@ -1301,6 +1326,25 @@ def validate_candidate(
             errors.append("存在规则源和大表时，主流程必须先有独立阶段定位并交付完整规则记录")
         elif bulk_positions and min(rule_positions) >= min(bulk_positions):
             errors.append("完整规则记录必须先于任何大表汇聚或查询阶段，不能先加载几十万行再定位规则")
+
+    if main_ids and required_external_node_ids and rule_node_ids:
+        rule_positions = [
+            index for index, stage_id in enumerate(main_ids)
+            if stage_id in stage_by_id
+            and set(unique_strings(stage_by_id[stage_id].get("output_node_ids"))).intersection(rule_node_ids)
+        ]
+        external_positions = [
+            index for index, stage_id in enumerate(main_ids)
+            if stage_id in stage_by_id
+            and (
+                set(unique_strings(stage_by_id[stage_id].get("input_node_ids")))
+                | set(unique_strings(stage_by_id[stage_id].get("output_node_ids")))
+            ).intersection(required_external_node_ids)
+        ]
+        if rule_positions and external_positions and min(external_positions) <= min(rule_positions):
+            errors.append(
+                "A required external capability must occur after complete rule selection, not before it"
+            )
 
     if stage_ids:
         start = next(iter(stage_ids))
@@ -1700,6 +1744,9 @@ def finalize(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         return 2, validation
     canonical_claims = output_root / "flow-claims.json"
     atomic_json(canonical_claims, claims)
+    _operational_path, operational, _operational_fingerprint, _operational_errors = operational_context(
+        source, source_path
+    )
     result = {
         "schema_version": SCHEMA_VERSION,
         "status": "complete",
@@ -1709,6 +1756,8 @@ def finalize(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "scenario": claims["scenario"],
         "history_policy": claims["history_policy"],
         "execution_policy": claims["execution_policy"],
+        "external_requirements": operational.get("external_requirements", []),
+        "external_capabilities": operational.get("external_capabilities", []),
         "stages": claims["stages"],
         "transitions": claims["transitions"],
         "main_flow": claims["main_flow"],

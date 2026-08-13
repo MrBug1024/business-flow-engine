@@ -37,6 +37,89 @@ class ResumePreparation:
     prompt: str
 
 
+@dataclass(frozen=True)
+class ResumeExecution:
+    """One atomically claimed answer/approval continuation."""
+
+    record: BusinessRecord
+    source_run: AIRun | None
+    run: AIRun
+
+
+def _mark_resumed_questions_continued(
+    record: BusinessRecord,
+    preparation: ResumePreparation,
+    source_run: AIRun | None,
+    continuation_run: AIRun,
+) -> None:
+    """Durably consume answers once their resumed graph has progressed.
+
+    A resumed run can cross an automatic context/completion boundary without
+    emitting a final chat ``done`` event.  Persisting the answer consumption at
+    that point prevents a reload from treating an already-running task as an
+    unanswered checkpoint and starting a duplicate continuation.
+    """
+
+    current_source = (
+        next((item for item in record.runs if source_run is not None and item.id == source_run.id), None)
+        or source_run
+    )
+    if current_source is not None and current_source.status == "waiting_for_user":
+        current_source.status = "succeeded"
+        current_source.finished_at = time()
+        current_source.summary = "User confirmation received; continuation run created."
+        progress = deepcopy(current_source.task_progress or {})
+        claim = progress.get("resume_claim")
+        if (
+            isinstance(claim, dict)
+            and claim.get("continuation_run_id") == continuation_run.id
+        ):
+            claim["state"] = "continued"
+            claim["continued_at"] = current_source.finished_at
+            progress["resume_claim"] = claim
+            current_source.task_progress = progress
+
+    consumed_at = time()
+    consumed_ids = set(preparation.question_ids)
+    for question in record.context.questions:
+        if str(question.get("id") or "") not in consumed_ids:
+            continue
+        question["continued_at"] = consumed_at
+        question["continuation_run_id"] = continuation_run.id
+        display_run_id = str(question.get("run_id") or "")
+        display_run = next(
+            (item for item in record.runs if item.id == display_run_id),
+            None,
+        )
+        if display_run is not None and display_run.status == "waiting_for_user":
+            display_run.status = "succeeded"
+            display_run.finished_at = consumed_at
+            display_run.summary = "User decision received; continuation run created."
+    store.save(record)
+
+
+def _release_unconsumed_resume_claim(
+    record: BusinessRecord,
+    source_run: AIRun | None,
+    continuation_run: AIRun,
+) -> None:
+    """Make an answered checkpoint retryable if its continuation never began."""
+
+    if source_run is None:
+        return
+    try:
+        store.release_chat_resume_claim(
+            business_id=record.id,
+            owner_id=record.owner_id,
+            source_run_id=source_run.id,
+            continuation_run_id=continuation_run.id,
+        )
+    except (KeyError, ValueError):
+        # A deleted chat or a newer authoritative state must not turn cleanup
+        # into a second stream failure.
+        return
+
+
 class BusinessOrchestrator:
     def chat(
         self,
@@ -322,100 +405,265 @@ class BusinessOrchestrator:
             prompt=_resume_prompt(answers),
         )
 
-    def stream_resume(
+    def claim_resume(
         self,
         record: BusinessRecord,
         preparation: ResumePreparation,
-    ) -> Iterator[dict[str, Any]]:
+    ) -> ResumeExecution:
+        """Reserve the exact waiting checkpoint before opening its SSE stream."""
+
+        if preparation.source_run_id:
+            try:
+                claimed = store.claim_chat_resume(
+                    business_id=record.id,
+                    owner_id=record.owner_id,
+                    session_id=preparation.session_id,
+                    source_run_id=preparation.source_run_id,
+                    selected_model=preparation.selected_model,
+                    question_ids=preparation.question_ids,
+                )
+            except (KeyError, ValueError) as exc:
+                raise ResumeBlockedError(str(exc)) from exc
+            return ResumeExecution(
+                record=claimed["record"],
+                source_run=claimed["source_run"],
+                run=claimed["run"],
+            )
+
         session = store.require_chat_session(record, preparation.session_id)
-        source_run = next(
-            (item for item in record.runs if item.id == preparation.source_run_id),
-            None,
-        )
         run = self._new_run(
             record,
             preparation.selected_model,
             session.id,
-            task_id=source_run.task_id if source_run is not None else "",
-            segment_index=source_run.segment_index if source_run is not None else 1,
-            resumed_from_run_id=preparation.source_run_id,
+            task_id="",
+            segment_index=1,
         )
-        if source_run is not None:
-            run.plan = list(source_run.plan)
-            run.task_progress = deepcopy(source_run.task_progress)
         store.save(record)
+        return ResumeExecution(record=record, source_run=None, run=run)
+
+    def stream_resume(
+        self,
+        record: BusinessRecord,
+        preparation: ResumePreparation,
+        *,
+        execution: ResumeExecution | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        claimed = execution or self.claim_resume(record, preparation)
+        current = claimed.record
+        session = store.require_chat_session(current, preparation.session_id)
+        yield from self._stream_resumed_task(
+            current,
+            session.id,
+            claimed.source_run,
+            claimed.run,
+            preparation,
+        )
+
+    def _stream_resumed_task(
+        self,
+        record: BusinessRecord,
+        session_id: str,
+        source_run: AIRun | None,
+        run: AIRun,
+        preparation: ResumePreparation,
+    ) -> Iterator[dict[str, Any]]:
+        """Continue a user-approved checkpoint until a real terminal boundary.
+
+        Resuming a LangGraph interrupt is only the first segment of the task.
+        Completion validation and provider-context boundaries must follow the
+        same durable continuation protocol as ``stream_chat`` rather than
+        being reported as a completed answer immediately after the approval.
+        """
+
+        task_id = run.task_id
+        original_goal = (
+            _task_original_prompt(record, source_run, preparation.prompt)
+            if source_run is not None
+            else preparation.prompt
+        )
+        segment_prompt = preparation.prompt
+        resume_payload: dict[str, Any] | None = {
+            "source_run_id": preparation.source_run_id,
+            "answers": list(preparation.answers),
+        }
+        include_history = True
+        segment_limit = max(1, env_settings.agent_auto_continuation_limit)
+        segments_used = 1
+        answers_consumed = False
+        if run.task_progress:
+            run.task_progress["status"] = "running"
+        store.save(record)
+
         try:
-            yield _event(
-                run,
-                "run_start",
-                {
-                    "run": run.model_dump(mode="json"),
-                    "resume": {"from_run_id": preparation.source_run_id},
-                },
-            )
-            for event in self._stream_run(
-                record,
-                run,
-                preparation.selected_model,
-                user_prompt=preparation.prompt,
-                resume_payload={
-                    "source_run_id": preparation.source_run_id,
-                    "answers": list(preparation.answers),
-                },
-            ):
-                if event.get("type") == "error":
-                    _redact_transport_error_event(run, event)
-                if event.get("type") == "error" and not event.get("assistant_message"):
-                    failure_message = _append_failure_message(
+            while True:
+                start_payload: dict[str, Any] = {"run": run.model_dump(mode="json")}
+                if resume_payload is not None:
+                    start_payload["resume"] = {"from_run_id": preparation.source_run_id}
+                yield _event(run, "run_start", start_payload)
+
+                continuation_error = ""
+                recovery_error_event: dict[str, Any] | None = None
+                for event in self._stream_run(
+                    record,
+                    run,
+                    preparation.selected_model,
+                    user_prompt=segment_prompt,
+                    include_history=include_history,
+                    resume_payload=resume_payload,
+                ):
+                    if event.get("type") == "error" and _is_recoverable_segment_error(
+                        str(event.get("message") or ""), run
+                    ):
+                        if segments_used < segment_limit:
+                            continuation_error = str(event.get("message") or "")
+                            _ensure_platform_task_checkpoint(record, run, original_goal)
+                            continue
+                        if _is_model_call_limit_error(str(event.get("message") or "")):
+                            # Let the inner generator finish so its cancellation
+                            # cleanup cannot overwrite the retry checkpoint.
+                            recovery_error_event = event
+                            continue
+                    if event.get("type") == "error":
+                        _redact_transport_error_event(run, event)
+                    if event.get("type") == "error" and not event.get("assistant_message"):
+                        failure_message = _append_failure_message(
+                            record,
+                            run,
+                            str(event.get("message") or "Agent execution failed."),
+                        )
+                        event["assistant_message"] = failure_message.model_dump(mode="json")
+                    if (
+                        event.get("type") == "done"
+                        and run.status in {"succeeded", "waiting_for_user"}
+                        and not answers_consumed
+                    ):
+                        _mark_resumed_questions_continued(record, preparation, source_run, run)
+                        answers_consumed = True
+                        event["context"] = record.context.model_dump(mode="json")
+                    yield event
+
+                if recovery_error_event is not None:
+                    if not answers_consumed:
+                        _mark_resumed_questions_continued(record, preparation, source_run, run)
+                        answers_consumed = True
+                    handoff, done = _wait_for_manual_retry_after_segment_limit(
                         record,
                         run,
-                        str(event.get("message") or "Agent execution failed."),
+                        original_goal,
+                        segments_used=segments_used,
+                        segment_limit=segment_limit,
+                        error_event=recovery_error_event,
                     )
-                    event["assistant_message"] = failure_message.model_dump(mode="json")
-                if event.get("type") == "done" and run.status in {"succeeded", "waiting_for_user"}:
-                    if source_run is not None and source_run.status == "waiting_for_user":
-                        source_run.status = "succeeded"
-                        source_run.finished_at = time()
-                        source_run.summary = "User confirmation received; continuation run created."
-                    consumed_at = time()
-                    consumed_ids = set(preparation.question_ids)
-                    for question in record.context.questions:
-                        if str(question.get("id") or "") not in consumed_ids:
-                            continue
-                        question["continued_at"] = consumed_at
-                        question["continuation_run_id"] = run.id
-                        display_run_id = str(question.get("run_id") or "")
-                        display_run = next(
-                            (item for item in record.runs if item.id == display_run_id),
-                            None,
-                        )
-                        if display_run is not None and display_run.status == "waiting_for_user":
-                            display_run.status = "succeeded"
-                            display_run.finished_at = consumed_at
-                            display_run.summary = "User decision received; continuation run created."
-                    store.save(record)
-                    event["context"] = record.context.model_dump(mode="json")
-                yield event
-            if _progress_requests_continuation(run):
-                error = (
-                    "恢复任务的交付完成验收未通过；本次恢复已停止，未保存模型的完成声明。"
+                    yield handoff
+                    yield done
+                    return
+
+                # A newly raised question is a real task boundary.  Do not
+                # mistake an older ``continuing`` progress flag for consent to
+                # skip the user's new answer and create another Agent segment.
+                if run.status == "waiting_for_user":
+                    if not answers_consumed:
+                        _mark_resumed_questions_continued(record, preparation, source_run, run)
+                    return
+
+                if not continuation_error and _progress_requests_continuation(run):
+                    continuation_error = (
+                        "The task completion validation did not pass. Continue from the saved "
+                        "checkpoint and finish the remaining required work before replying."
                 )
-                run.status = "failed"
+                if not continuation_error:
+                    if not answers_consumed and run.status == "failed":
+                        _release_unconsumed_resume_claim(record, source_run, run)
+                    return
+
+                if not answers_consumed:
+                    _mark_resumed_questions_continued(record, preparation, source_run, run)
+                    answers_consumed = True
+
+                if segments_used >= segment_limit:
+                    handoff, done = _wait_for_manual_retry_after_segment_limit(
+                        record,
+                        run,
+                        original_goal,
+                        segments_used=segments_used,
+                        segment_limit=segment_limit,
+                        error_event={"type": "error", "message": continuation_error},
+                    )
+                    yield handoff
+                    yield done
+                    return
+
+                run.status = "succeeded"
                 run.finished_at = time()
-                run.error = error
-                run.summary = "Artifact completion validation did not pass after resume."
-                failure_message = _append_failure_message(record, run, error)
-                yield _event(
+                run.summary = (
+                    f"Task segment {run.segment_index} reached a context or execution boundary; "
+                    "continuing from a compact checkpoint in a fresh Agent run."
+                )
+                run.error = ""
+                next_run = self._new_run(
+                    record,
+                    preparation.selected_model,
+                    session_id,
+                    task_id=task_id,
+                    segment_index=run.segment_index + 1,
+                    continued_from_run_id=run.id,
+                )
+                next_run.plan = list(run.plan)
+                next_run.task_progress = deepcopy(run.task_progress)
+                if next_run.task_progress:
+                    next_run.task_progress["status"] = "running"
+                handoff = _event(
                     run,
-                    "error",
+                    "task_handoff",
                     {
-                        "message": error,
-                        "assistant_message": failure_message.model_dump(mode="json"),
-                        "run": run.model_dump(mode="json"),
+                        "call_id": f"handoff_{run.id}_{next_run.id}",
+                        "name": f"Segment {next_run.segment_index}",
+                        "status": "succeeded",
+                        "summary": (
+                            "The checkpoint was saved; continuing the same task in a fresh Agent context."
+                        ),
+                        "reason": continuation_error[:1000],
+                        "task_id": task_id,
+                        "from_run_id": run.id,
+                        "to_run_id": next_run.id,
+                        "segment_index": next_run.segment_index,
                     },
                 )
+                store.save(record)
+                yield handoff
+                segment_prompt = (
+                    _auto_continuation_prompt(
+                        record,
+                        original_goal,
+                        run,
+                        continuation_error,
+                    )
+                    + "\n\nThe following user answers were already provided and remain authoritative; "
+                    "do not ask for them again:\n"
+                    + preparation.prompt[:4000]
+                )
+                include_history = False
+                resume_payload = None
+                run = next_run
+                segments_used += 1
         except GeneratorExit:
             _fail_cancelled_stream(record, run)
+            if not answers_consumed:
+                _release_unconsumed_resume_claim(record, source_run, run)
+            raise
+        except Exception:
+            if not answers_consumed:
+                # The claim must not leave a child run looking active when an
+                # unexpected failure happens before the answer is consumed.
+                # Otherwise a retry sees that stale child and concludes that
+                # this checkpoint is still being resumed forever.
+                if run.status == "running":
+                    run.status = "failed"
+                    run.finished_at = time()
+                    run.summary = "Resume continuation failed before processing the user answer."
+                    run.error = "Unexpected error while resuming the user-approved checkpoint."
+                    store.save(record)
+                _release_unconsumed_resume_claim(record, source_run, run)
             raise
 
     def _stream_run(

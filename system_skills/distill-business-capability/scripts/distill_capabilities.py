@@ -35,6 +35,8 @@ MAX_FILES = 500
 MAX_STAGE_SKILLS = 12
 MAX_PROCEDURE_STEPS = 10
 SHA256_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+PORTABLE_DELIVERY_TEMPLATE_FORMATS = {"csv", "xlsx"}
+XLSX_TEMPLATE_INVALID_SHEET_TITLE = re.compile(r"[\\\\/*?:\[\]]")
 
 TABULAR_EXTENSIONS = {
     ".csv", ".tsv", ".xlsx", ".xls", ".xlsb", ".parquet", ".jsonl", ".ndjson",
@@ -789,7 +791,30 @@ def normalize_operational_runtime_contract(
         "explicit_or_structural_contract"
         if normalized["rule_source_ids"] else "missing"
     )
-    normalized["external_capabilities"] = [
+    declared_external_requirements = [
+        dict(item)
+        for collection in (
+            normalized.get("external_requirements", []),
+            normalized.get("external_capabilities", []),
+        )
+        if isinstance(collection, list)
+        for item in collection
+        if isinstance(item, dict) and item.get("required") is True
+    ]
+    deduplicated_requirements: dict[str, dict[str, Any]] = {}
+    for item in declared_external_requirements:
+        key = str(item.get("requirement_id") or item.get("node_id") or (
+            "external-" + hashlib.sha1(
+                json.dumps(item, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:12]
+        ))
+        deduplicated_requirements.setdefault(key, item)
+    declared_external_requirements = list(deduplicated_requirements.values())
+    requirement_node_ids = {
+        str(item.get("node_id", "")) for item in declared_external_requirements
+        if str(item.get("node_id", ""))
+    }
+    legacy_external_capabilities = [
         {
             "node_id": str(node.get("id", "")),
             "name": str(node.get("name", "")),
@@ -800,7 +825,19 @@ def normalize_operational_runtime_contract(
             "failure_policy": "manual_intervention_required_when_mandatory_and_unavailable",
         }
         for node in relations.get("nodes", [])
-        if isinstance(node, dict) and str(node.get("id", "")) in external_node_ids
+        if (
+            isinstance(node, dict)
+            and str(node.get("id", "")) in external_node_ids
+            and str(node.get("id", "")) not in requirement_node_ids
+        )
+    ]
+    # Required external contracts were explicitly stated in the scenario and
+    # validated upstream. Preserve their lifecycle and block policy verbatim;
+    # only legacy, unqualified external nodes retain optional enrichment.
+    normalized["external_requirements"] = declared_external_requirements
+    normalized["external_capabilities"] = [
+        *declared_external_requirements,
+        *legacy_external_capabilities,
     ]
     policy = normalized.get("query_policy") if isinstance(normalized.get("query_policy"), dict) else {}
     normalized["query_policy"] = {
@@ -2525,7 +2562,7 @@ def render_tabular_skill(item: dict[str, Any], scenario_name: str, operational: 
         "python \"<this-skill>/scripts/query_tabular.py\" search-contract --contract \"<this-skill>/references/operational-data-contract.json\" --data-root \"<data-root>\" --source-id \"<rule-source-id>\" --bind \"<rule-source-id>=<relative-runtime-file>\" --term \"<user term>\" --max-rows 20",
         "python \"<this-skill>/scripts/query_tabular.py\" validate-join --contract \"<this-skill>/references/operational-data-contract.json\" --data-root \"<data-root>\" --link-id \"<link-id>\" --key-set-index 0",
         "python \"<this-skill>/scripts/query_tabular.py\" query-contract --contract \"<this-skill>/references/operational-data-contract.json\" --data-root \"<data-root>\" --bind \"<source-id>=<relative-runtime-file>\" --link-id \"<link-id>@<key-set-index>\" --sql \"SELECT ... FROM source_1 ...\" --max-rows 500",
-        "python \"<this-skill>/scripts/query_tabular.py\" export-contract --contract \"<this-skill>/references/operational-data-contract.json\" --data-root \"<data-root>\" --bind \"<source-id>=<relative-runtime-file>\" --link-id \"<link-id>@<key-set-index>\" --sql \"SELECT ...\" --output \"<result.parquet>\"",
+        "python \"<this-skill>/scripts/query_tabular.py\" export-contract --contract \"<this-skill>/references/operational-data-contract.json\" --data-root \"<data-root>\" --bind \"<source-id>=<relative-runtime-file>\" --link-id \"<link-id>@<key-set-index>\" --sql \"SELECT ...\" --output \"<safe-relative-result.parquet>\"",
         "~~~", "", "## 场景约束", "", *[f"- {value}" for value in item["scenario_instructions"]],
         "", "## 非职责", "", *[f"- {value}" for value in item["non_goals"]],
         "", "## 可移植运行", "",
@@ -2559,11 +2596,11 @@ def render_document_skill(
         "", "## 非结构化规则源", "", *document_rule_lines,
         "", "~~~text",
         "python \"<this-skill>/scripts/extract_documents.py\" inspect --input \"<file>\"",
-        "python \"<this-skill>/scripts/extract_documents.py\" index --input \"<file>\" --output \"<index.db>\"",
-        "python \"<this-skill>/scripts/extract_documents.py\" search --index \"<index.db>\" --term \"<term>\" --limit 20",
-        "python \"<this-skill>/scripts/extract_documents.py\" get --index \"<index.db>\" --chunk-id 1",
-        "python \"<this-skill>/scripts/extract_documents.py\" context --index \"<index.db>\" --chunk-id 1 --before 2 --after 2",
-        "python \"<this-skill>/scripts/extract_documents.py\" index-ocr --input-json \"<ocr-output.json>\" --output \"<index.db>\" --source \"<original-file>\"",
+        "python \"<this-skill>/scripts/extract_documents.py\" index --input \"<file>\" --output \"<safe-relative-index.db>\"",
+        "python \"<this-skill>/scripts/extract_documents.py\" search --index \"<safe-relative-index.db>\" --term \"<term>\" --limit 20",
+        "python \"<this-skill>/scripts/extract_documents.py\" get --index \"<safe-relative-index.db>\" --chunk-id 1",
+        "python \"<this-skill>/scripts/extract_documents.py\" context --index \"<safe-relative-index.db>\" --chunk-id 1 --before 2 --after 2",
+        "python \"<this-skill>/scripts/extract_documents.py\" index-ocr --input-json \"<ocr-output.json>\" --output \"<safe-relative-index.db>\" --source \"<original-file>\"",
         "~~~", "", "## 场景约束", "", *[f"- {value}" for value in item["scenario_instructions"]],
         "", "## 非职责", "", *[f"- {value}" for value in item["non_goals"]],
         "", "## 可移植运行", "",
@@ -2918,6 +2955,24 @@ def build_execution_plan(flow_contract: dict[str, Any], operational: dict[str, A
             "selector_columns": [profile.get("selector_columns", []) for profile in rule_profiles],
             "contract": "select one complete governing record and preserve its provenance before bulk reads",
         })
+    required_external = [
+        item for item in flow_contract.get("external_requirements", [])
+        if isinstance(item, dict) and item.get("required") is True
+    ]
+    if required_external:
+        steps.append({
+            "order": len(steps) + 1,
+            "operation": "RESOLVE_REQUIRED_EXTERNAL_ENRICHMENT",
+            "requirement_ids": [
+                str(item.get("requirement_id") or item.get("node_id") or "")
+                for item in required_external
+            ],
+            "activation": "after_complete_rule_selection",
+            "contract": (
+                "The host must select and invoke a declared matching capability or MCP, return provenance-bearing "
+                "external evidence, and block the business decision when a required enrichment is unavailable."
+            ),
+        })
     if ranked_candidates:
         steps.append({
             "order": len(steps) + 1,
@@ -2952,12 +3007,16 @@ def build_execution_plan(flow_contract: dict[str, Any], operational: dict[str, A
             "format": template.get("format", "xlsx"),
             "columns": template.get("output_columns", []),
             "column_semantics": template.get("column_semantics", []),
+            "tables": template.get("tables", []),
+            "materialization": template.get("materialization", {}),
+            "structure_fingerprint": template.get("structure_fingerprint", ""),
+            "historical_data_policy": "structure_metadata_only_no_historical_rows",
             "required_source_ids": sorted(runtime_ids),
             "pipeline": [*steps, {
                 "order": len(steps) + 1,
                 "operation": "MATERIALIZE_DECLARED_OUTPUT",
                 "output": template.get("name", "result"),
-                "contract": "write the declared output shape with rule, data and coverage provenance",
+                "contract": "write only a materializable declared output structure with current rule, data and coverage provenance; otherwise return the named renderer blocker",
             }],
         })
     model = build_capability_model(flow_contract, operational)
@@ -2994,6 +3053,7 @@ def build_execution_plan(flow_contract: dict[str, Any], operational: dict[str, A
         "primary_source_path": primary.get("path", "") if primary else "",
         "primary_candidates": ranked_candidates[:12],
         "rule_source_ids": rule_ids,
+        "external_requirements": required_external,
         "capability_model": model,
         "dispatch_config": dispatch_config,
         "join_plan": joins,
@@ -4239,6 +4299,8 @@ def portable_flow_contract(claims: dict[str, Any], flow: dict[str, Any], operati
         "result_source_ids": operational.get("result_source_ids", []),
         "design_time_output_templates": operational.get("design_time_output_templates", []),
         "output_contract": operational.get("output_contract", {}),
+        "external_requirements": operational.get("external_requirements", []),
+        "external_capabilities": operational.get("external_capabilities", []),
         "contract_fingerprint": operational.get("source", {}).get("portable_copy_of_fingerprint", ""),
     }
     contract["execution_plan"] = build_execution_plan(contract, operational)
@@ -4281,8 +4343,11 @@ def render_executor_skill(
         "- `references/compiled-recipes.json` contains reviewed declarative rule recipes. When `execute` reports `completed_deterministically`, its `deterministic_result` is the final business fact; report it directly and never reconstruct its SQL or run the rule again.",
         "- `references/dispatch-config.json` and `references/output-specs.json` are executable metadata, not examples. Preserve their rule id, dispatch value, source provenance, and output columns in the final result.",
         "- When status is `ready_for_agent_judgment`, use the governing record when present, the accepted flow, and `candidate_evidence` to make one business-evaluation pass, then fill every field in `result_contract`.",
+        "- When `external_enrichment.status` is `completed`, use its bounded `records[].evidence` and provenance with the selected rule in that one evaluation pass. When it is blocked, do not evaluate or substitute a guess: carry out the explicit host/MCP `next_step` and resubmit the returned evidence.",
         "- If `candidate_evidence.coverage.complete_for_all_matching_runtime_rows` is false, disclose that the evidence is a bounded preview and do not claim an exhaustive audit.",
         "- Use `query` only when `next_step.query_allowed_only_if` is satisfied. A query must name the missing field or relationship and must not restart rule discovery.",
+        "- Persistent artifacts require the host to inject `BUSINESS_ARTIFACT_ROOT`. Every `--output`, `--delivery-output`, and `--result` value is a safe relative artifact name; descriptors expose only `artifact_id`, `relative_path`, SHA-256, size, and format.",
+        "- For a requested CSV/XLSX result, honor `delivery-contract.json.delivery_contract.declared_output_templates`: the runtime automatically selects exactly one compatible materializable historical structure, or requires `--template-id` when more than one exists. Historical rows are never evidence. If the contract reports a template-renderer blocker, report it instead of substituting a different layout.",
         f"# {scenario.get('name', '')} 主执行器", "",
         f"这是“{scenario.get('name', '')}”能力包的唯一首选端到端入口。执行模式：`{flow_contract.get('execution_mode', 'evidence_pipeline')}`。",
         "主执行器先做机器可验证的规则、数据和证据准备，再把有限结果交给 Agent 应用完整规则；它不把原始大表加载进上下文，也不把语义不确定性伪装成确定结论。",
@@ -4294,8 +4359,9 @@ def render_executor_skill(
         "", "## 固定入口", "",
         "~~~text",
         f"python \"<this-skill>/scripts/execute_scenario.py\" describe",
-        f"python \"<this-skill>/scripts/execute_scenario.py\" execute --request \"<用户完整请求>\" --data-root \"<data-root>\" --output \"<evidence-package.json>\" --bind \"<source-id>=<relative-runtime-file>\"",
-        f"python \"<this-skill>/scripts/execute_scenario.py\" continue --result \"<evidence-package.json>\" --filter \"<已交付结果字段>=<用户限定值>\"",
+        f"python \"<this-skill>/scripts/execute_scenario.py\" execute --request \"<用户完整请求>\" --data-root \"<data-root>\" --output \"<safe-relative-evidence-package.json>\" --bind \"<source-id>=<relative-runtime-file>\"",
+        f"python \"<this-skill>/scripts/execute_scenario.py\" deliver --result \"<safe-relative-evidence-package.json>\" --output \"<safe-relative-result.xlsx>\" [--template-id \"<declared-template-id-when-needed>\"]",
+        f"python \"<this-skill>/scripts/execute_scenario.py\" continue --result \"<safe-relative-evidence-package.json>\" --filter \"<已交付结果字段>=<用户限定值>\"",
         f"python \"<this-skill>/scripts/execute_scenario.py\" query --data-root \"<data-root>\" --sql \"<bounded SELECT>\" --link-id \"<validated-link-id>@<key-set-index>\"",
         "~~~", "",
         "## 场景执行事实", "",
@@ -4381,7 +4447,7 @@ def render_stage_skill(
         "先使用包内阶段运行器建立受约束工作单；不得为本阶段临时编写 Python。文件读取、OCR、知识检索和大表 SQL 继续调用上面列出的基础 Skill 脚本。", "",
         "~~~text",
         "python \"<this-skill>/scripts/run_stage.py\" contract",
-        "python \"<this-skill>/scripts/run_stage.py\" start --request \"<用户请求>\" --input \"<bounded-input.json>\" --output \"<work-order.json>\"",
+        "python \"<this-skill>/scripts/run_stage.py\" start --request \"<用户请求>\" --input \"<bounded-input.json>\" --output \"<safe-relative-work-order.json>\"",
         "~~~", "",
     ])
     for index, step in enumerate(item["procedure"], 1):
@@ -4411,8 +4477,7 @@ def render_stage_skill(
     else:
         lines.append("- 无与本阶段直接关联的已声明待确认项。")
     lines.extend(["", "## 非职责", "", *[f"- {value}" for value in item["non_goals"]], "", "## 可移植运行", ""])
-    lines.append("完成推理后把有界结果写为 JSON，并运行 `python \"<this-skill>/scripts/run_stage.py\" finish --work-order \"<work-order.json>\" --result \"<result.json>\" --output \"<handoff.json>\"`。阶段运行器会验证必需输出、产物存在性和 SHA-256，并拒绝原始业务文件路径。")
-    lines.append("文件型输出必须使用 `value` 或 `artifact` 中的 `kind=exported_query_result`/`bounded_artifact_reference`、绝对 `path`、文件后缀和真实 `sha256`；可直接复用 `query_tabular.py export-contract` 返回的 `artifact` 对象。不得把原始行、全文或未校验路径塞进交接 JSON。")
+    lines.append("阶段状态和交接文件要求宿主注入 `BUSINESS_ARTIFACT_ROOT`；所有 `--output`、`--work-order` 和 `--result` 产物名必须安全相对。文件型输出使用包含 `kind`、`artifact_id`、`relative_path`、format 与已验证 `sha256` 的 artifact 对象，绝不返回物理 `path`。")
     lines.append("本 Skill 不依赖原平台 Tool、固定目录或会话状态。调用方负责提供输入；运行配置由依赖基础 Skill 完整携带或由第三方同名环境变量覆盖。")
     lines.append("")
     return "\n".join(lines)
@@ -4453,12 +4518,12 @@ def render_orchestrator_skill(
         "", "## 可移植运行", "",
         "使用包内状态机启动、查询和记录主流程交接，不得临时编写编排脚本：", "",
         "~~~text",
-        "python \"<this-skill>/scripts/orchestrate.py\" start --request \"<用户请求>\" --output \"<flow-state.json>\"",
-        "python \"<this-skill>/scripts/orchestrate.py\" status --state \"<flow-state.json>\"",
-        "python \"<this-skill>/scripts/orchestrate.py\" record --state \"<flow-state.json>\" --handoff \"<stage-handoff.json>\"",
+        "python \"<this-skill>/scripts/orchestrate.py\" start --request \"<用户请求>\" --output \"<safe-relative-flow-state.json>\"",
+        "python \"<this-skill>/scripts/orchestrate.py\" status --state \"<safe-relative-flow-state.json>\"",
+        "python \"<this-skill>/scripts/orchestrate.py\" record --state \"<safe-relative-flow-state.json>\" --handoff \"<safe-relative-stage-handoff.json>\"",
         "python \"<this-skill>/scripts/orchestrate.py\" route --stage-id \"<optional-stage-id>\"",
         "~~~", "",
-        "所有依赖均按 Skill 名称解析；不假设原平台目录、Tool 网关或持久会话。若某项输入、规则或分支仍属待确认，不得由历史样本或常识补齐。", "",
+        "所有持久状态和交接产物要求宿主注入 `BUSINESS_ARTIFACT_ROOT` 并使用安全相对名称；返回引用不得泄露宿主文件系统路径。", "",
     ])
     return "\n".join(lines)
 
@@ -4661,7 +4726,7 @@ def render_mcp_installation(server_name: str) -> str:
         "",
         "## Tools",
         "",
-        "- `execute` is the only tool exposed by default. It selects the governing record, checks runtime sources, collects bounded linked evidence, and writes an Agent handoff when an output directory is supplied.",
+        "- `execute` is the only tool exposed by default. To persist evidence or a result, the host sets `BUSINESS_ARTIFACT_ROOT` and passes safe relative `artifact_name` / `delivery_artifact_name` values; returned metadata never exposes a physical host path.",
         "- This deliberate one-tool surface prevents a host Agent from rebuilding the transaction with rule searches or ad-hoc SQL. Use a package-local test harness, not the production Agent, for diagnostics.",
         "",
     ])
@@ -4685,14 +4750,19 @@ def mcp_tool_definitions(namespace: str) -> list[dict[str, Any]]:
         }
 
     return [
-        tool("execute", "Run the one complete business request transaction. Return the terminal status, bounded evidence, artifact handles and Agent handoff; do not manually reconstruct it with rule searches or SQL. An explicit JSON/CSV/XLSX final-result path is honored only after a verified deterministic completion.", {
+        tool("execute", "Run the one complete business request transaction. Return the terminal status, bounded evidence, artifact handles and Agent handoff; do not manually reconstruct it with rule searches or SQL. Persistent artifacts require BUSINESS_ARTIFACT_ROOT and safe relative artifact names.", {
             **data_location,
             "request": {"type": "string", "description": "The complete business request."},
+            "rule_locator": {"type": "string", "description": "Optional rule-only locator; delivery/count/template wording remains outside rule resolution."},
+            "external_evidence": {
+                "type": ["object", "array"],
+                "description": "Returned provenance-bearing result from the host-selected required external capability/MCP. Supply it only after execute requests blocked_required_external_enrichment.",
+            },
             "output_id": {"type": "string", "default": "execute_business_request", "description": "Compatibility output id; leave as the declared default."},
             "params": {"type": ["string", "object", "null"], "description": "Compatibility alias of the complete request when a host cannot send request."},
             "max_rows": {"type": "integer"},
-            "out_dir": {"type": "string"},
-            "delivery_output": {"type": "string", "description": "Explicit final JSON, CSV, or XLSX result path. Requires a persistent evidence output directory."},
+            "artifact_name": {"type": "string", "description": "Safe relative JSON evidence artifact name under host-injected BUSINESS_ARTIFACT_ROOT."},
+            "delivery_artifact_name": {"type": "string", "description": "Safe relative JSON, CSV, or XLSX result artifact name under BUSINESS_ARTIFACT_ROOT; requires artifact_name."},
             "delivery_format": {"type": "string", "enum": ["auto", "json", "csv", "xlsx"], "default": "auto"},
             "delivery_template_id": {"type": "string", "description": "Declared template id; it is materialized only when all columns come directly from a verified recipe."},
         }, ["data_dir", "request"]),
@@ -4816,7 +4886,7 @@ def render_platform_system_prompt(
         "",
         "## 执行顺序",
         "",
-        "1. 对完整业务请求，首先且只调用一次 `execute`，固定传入 `output_id=execute_business_request`、用户完整请求作为 `params`、宿主提供的 `data_dir`，以及可写的 `out_dir`。不要先分拆为搜索规则、读表、阶段 Skill 或手工 SQL。",
+        "1. 对完整业务请求，首先且只调用一次 `execute`，固定传入 `output_id=execute_business_request`、用户完整请求作为 `params`、宿主提供的 `data_dir`；需要文件时由宿主注入 `BUSINESS_ARTIFACT_ROOT`，并仅传安全相对 `artifact_name` / `delivery_artifact_name`。不要先分拆为搜索规则、读表、阶段 Skill 或手工 SQL。",
         "2. 宿主必须保留 `execute` 的结构化事务结果（至少 `status`、`selected_rule`、`candidate_evidence`、`deterministic_result`、`agent_handoff`、`next_step` 与 `artifact`），不得把它缩成“输出 N 行”的通用提示。以这些字段为唯一业务事实完成一次判定和交付。零命中、规则不唯一或来源不兼容时，按返回的 blocker 向用户说明，禁止猜测或盲目重试。",
         "3. 只有 `next_step` 明确指出缺失字段或未解决关联时，才使用一次 `query_data` 做该补充；不得用它重新实现整条审计规则。",
         "4. 用户对刚完成的审计结果提出筛选、统计或追问时，优先基于本轮交付的结果和证据继续回答。确需重新执行时，`params` 必须包含原始规则上下文与新条件，不能只传一句过滤条件。",
@@ -4989,6 +5059,9 @@ def build_release_bundle(
                 server_name: {
                     "command": "python",
                     "args": ["/absolute/path/to/package/run_mcp.py"],
+                    "env": {
+                        "BUSINESS_ARTIFACT_ROOT": "/host-managed/retrievable-artifacts",
+                    },
                 }
             }
         })
@@ -5525,6 +5598,175 @@ def copy_customized_system_skill(
     }
 
 
+def _template_column_descriptor(column: dict[str, Any], ordinal: int) -> dict[str, Any] | None:
+    """Keep the declared column shape without deriving values from historical rows."""
+
+    name = str(column.get("query_name") or column.get("name") or "").strip()
+    if not name:
+        return None
+    declared_type = next((
+        column.get(key)
+        for key in ("logical_type", "data_type", "value_type", "dtype", "type")
+        if column.get(key) not in (None, "")
+    ), None)
+    source_index = column.get("index")
+    return {
+        "ordinal": ordinal,
+        "source_index": source_index if isinstance(source_index, int) else ordinal,
+        "name": name,
+        # `kind` is the field-catalogue's semantic classification, not an
+        # assertion about a historical cell value.  Keep any actual declared
+        # type separately when an upstream catalogue has one.
+        "semantic_kind": str(column.get("kind", "other") or "other"),
+        "source_type": str(declared_type) if declared_type is not None else None,
+        "base": str(column.get("base", "") or ""),
+    }
+
+
+def _template_table_descriptor(
+    table: dict[str, Any], table_index: int, output_format: str,
+) -> dict[str, Any]:
+    raw_header = table.get("header_row")
+    header_row_index = raw_header if isinstance(raw_header, int) and raw_header >= 0 else None
+    columns = [
+        descriptor
+        for ordinal, column in enumerate(table.get("columns", []))
+        if isinstance(column, dict)
+        for descriptor in [_template_column_descriptor(column, ordinal)]
+        if descriptor is not None
+    ]
+    table_name = str(table.get("table_name") or table.get("name") or "").strip()
+    return {
+        "table_id": f"table-{table_index + 1}",
+        "table_name": table_name,
+        "worksheet_name": table_name if output_format == "xlsx" else None,
+        "header_row_index": header_row_index,
+        "column_count": len(columns),
+        "columns": columns,
+        "column_order": [str(column["name"]) for column in columns],
+    }
+
+
+def _output_template_materialization(
+    output_format: str, source_kind: str, tables: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """State exactly which historical *structure* the portable writer can reproduce.
+
+    The portable runtime deliberately does not receive the original result
+    file.  A schema-only CSV/XLSX writer can safely reproduce one conventional
+    table (format, header, column order and declared field metadata), but it
+    cannot honestly recreate multi-sheet workbooks or visual document layout.
+    """
+
+    base = {
+        "renderer": "portable_tabular_schema_writer",
+        "format": output_format,
+        "historical_data_policy": "structure_metadata_only_no_historical_rows",
+        "layout_fidelity": "schema_only",
+        "not_preserved": [
+            "historical business rows",
+            "cell styles",
+            "merged cells",
+            "formulas",
+            "macros",
+            "print settings",
+        ],
+    }
+
+    def blocked(reason: str, message: str, **detail: Any) -> dict[str, Any]:
+        return {
+            **base,
+            "status": "not_materializable",
+            "reason": reason,
+            "message": message,
+            **detail,
+        }
+
+    if source_kind != "tabular" or output_format not in PORTABLE_DELIVERY_TEMPLATE_FORMATS:
+        return blocked(
+            "unsupported_format_or_source",
+            "This historical result structure needs a specialised renderer; the portable runtime will not relabel another format as it.",
+            supported_formats=sorted(PORTABLE_DELIVERY_TEMPLATE_FORMATS),
+        )
+    if len(tables) != 1:
+        return blocked(
+            "multiple_or_missing_tables",
+            "A portable CSV/XLSX delivery can reproduce exactly one declared table. Multi-table or table-less historical layouts require a specialised renderer.",
+            table_count=len(tables),
+        )
+    table = tables[0]
+    columns = [item for item in table.get("columns", []) if isinstance(item, dict)]
+    if not columns:
+        return blocked(
+            "missing_columns",
+            "The historical result has no declared columns, so no result file was materialized.",
+            selected_table_id=table.get("table_id"),
+        )
+    names = [str(item.get("name", "")) for item in columns]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        return blocked(
+            "duplicate_column_names",
+            "Duplicate historical column names cannot be mapped deterministically to result fields.",
+            selected_table_id=table.get("table_id"),
+            duplicate_columns=duplicates,
+        )
+    if table.get("header_row_index") != 0:
+        return blocked(
+            "noncanonical_header_offset",
+            "The portable writer cannot reconstruct title or pre-header rows without the original layout renderer.",
+            selected_table_id=table.get("table_id"),
+            header_row_index=table.get("header_row_index"),
+        )
+    if output_format == "xlsx":
+        worksheet_name = str(table.get("worksheet_name") or "")
+        if (
+            not worksheet_name
+            or len(worksheet_name) > 31
+            or XLSX_TEMPLATE_INVALID_SHEET_TITLE.search(worksheet_name)
+            or worksheet_name != worksheet_name.strip("'")
+        ):
+            return blocked(
+                "unsupported_worksheet_name",
+                "The historical worksheet name cannot be reproduced exactly by XLSX, so a specialised renderer is required.",
+                selected_table_id=table.get("table_id"),
+                worksheet_name=worksheet_name,
+            )
+    return {
+        **base,
+        "status": "materializable_schema",
+        "reason": "single_tabular_schema",
+        "message": "The portable writer can reproduce this single table's format, worksheet/header and declared column order without using historical rows.",
+        "selected_table_id": table.get("table_id"),
+        "worksheet_name": table.get("worksheet_name"),
+        "header_row_index": table.get("header_row_index"),
+        "column_order": names,
+    }
+
+
+def declared_output_template_descriptor(template: dict[str, Any]) -> dict[str, Any]:
+    """Expose safe, data-free historical output structure to generated contracts."""
+
+    tables = [item for item in template.get("tables", []) if isinstance(item, dict)]
+    descriptor = {
+        "template_id": template.get("template_id"),
+        "name": template.get("name"),
+        "format": template.get("format"),
+        "source_kind": template.get("source_kind"),
+        "runtime_required": False,
+        "historical_data_policy": "structure_metadata_only_no_historical_rows",
+        "evidence_ids": template.get("evidence_ids", []),
+        "tables": tables,
+        "columns": template.get("output_columns", []),
+        "column_semantics": template.get("column_semantics", []),
+        "materialization": template.get("materialization", {}),
+    }
+    descriptor["structure_fingerprint"] = hashlib.sha256(
+        json.dumps(descriptor, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return descriptor
+
+
 def infer_design_time_output_templates(
     relation_path: Path, relations: dict[str, Any], operational: dict[str, Any],
 ) -> list[dict[str, Any]]:
@@ -5568,17 +5810,15 @@ def infer_design_time_output_templates(
         relative_path = str(item.get("path", ""))
         if not relative_path or relative_path not in candidate_files or relative_path in runtime_paths:
             continue
+        output_format = str(item.get("extension") or Path(relative_path).suffix).strip().casefold().lstrip(".")
         tables = []
         output_columns: list[str] = []
         column_semantics: list[dict[str, Any]] = []
-        for table in item.get("tables", []) if isinstance(item.get("tables"), list) else []:
+        for table_index, table in enumerate(item.get("tables", []) if isinstance(item.get("tables"), list) else []):
             if not isinstance(table, dict):
                 continue
-            columns = [
-                str(column.get("query_name") or column.get("name"))
-                for column in table.get("columns", [])
-                if isinstance(column, dict) and str(column.get("query_name") or column.get("name"))
-            ]
+            descriptor = _template_table_descriptor(table, table_index, output_format)
+            columns = [str(column.get("name", "")) for column in descriptor["columns"]]
             output_columns.extend(column for column in columns if column not in output_columns)
             for column in table.get("columns", []) if isinstance(table.get("columns"), list) else []:
                 if not isinstance(column, dict):
@@ -5591,26 +5831,38 @@ def infer_design_time_output_templates(
                     "kind": str(column.get("kind", "other")),
                     "semantic_role": infer_column_semantic_role(column),
                 })
-            tables.append({
-                "table": table.get("table_name") or table.get("name"),
-                "row_count": table.get("row_count"),
-                "column_count": table.get("column_count", len(columns)),
-                "columns": columns,
-            })
-        templates.append({
+            tables.append(descriptor)
+        source_kind = str(item.get("kind", "tabular") or "tabular")
+        template = {
             "template_id": "output-" + hashlib.sha256(relative_path.encode("utf-8")).hexdigest()[:12],
             "name": Path(relative_path).stem,
             "path": relative_path,
-            "format": str(item.get("extension", Path(relative_path).suffix)).lstrip("."),
-            "source_kind": item.get("kind", "tabular"),
+            "format": output_format,
+            "source_kind": source_kind,
             "runtime_required": False,
             "original_file_required_at_runtime": False,
+            "historical_data_policy": "structure_metadata_only_no_historical_rows",
             "evidence_ids": sorted(candidate_files[relative_path]),
             "tables": tables,
             "output_columns": output_columns,
             "column_semantics": column_semantics,
-            "usage": "Use this only as the final result schema and field naming contract; query current runtime sources for values.",
-        })
+            "usage": "Use this only as the final result schema and field naming contract; query current runtime sources for values and never import historical result rows as evidence.",
+        }
+        template["materialization"] = _output_template_materialization(output_format, source_kind, tables)
+        template["structure_fingerprint"] = hashlib.sha256(
+            json.dumps(
+                {
+                    "format": output_format,
+                    "source_kind": source_kind,
+                    "tables": tables,
+                    "materialization": template["materialization"],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        templates.append(template)
     return templates
 
 
@@ -5629,22 +5881,17 @@ def portable_operational_contract(claims: dict[str, Any]) -> dict[str, Any]:
     portable["design_time_output_templates"] = output_templates
     portable["output_contract"] = {
         "template_count": len(output_templates),
-        "templates": [
-            {
-                "template_id": item.get("template_id"),
-                "name": item.get("name"),
-                "format": item.get("format"),
-                "columns": item.get("output_columns", []),
-                "column_semantics": item.get("column_semantics", []),
-                "runtime_required": False,
-            }
-            for item in output_templates
-        ],
+        "templates": [declared_output_template_descriptor(item) for item in output_templates],
+        "selection_policy": {
+            "automatic": "For CSV/XLSX, automatically use the historical structure only when exactly one materializable template is compatible with the requested file format.",
+            "explicit": "When more than one compatible template exists, require delivery_template_id; do not guess from a historical file name.",
+            "unsupported": "If the selected template is multi-table, non-tabular, or otherwise not_materializable, return its blocker and do not write a lookalike file.",
+        },
         "required_result_fields": [
             "business_conclusion", "decision_reason", "scope_or_measure",
             "rule_provenance", "data_provenance", "coverage", "uncertainties",
         ],
-        "policy": "Historical result files define structure only; never use them as current business evidence.",
+        "policy": "Historical result files define structure only; never use their rows as current business evidence or runtime input.",
     }
     portable["trace_evidence"] = compact_trace_evidence(portable, include_rows=False)
     upstream = portable.get("source") if isinstance(portable.get("source"), dict) else {}
@@ -5658,7 +5905,7 @@ def portable_operational_contract(claims: dict[str, Any]) -> dict[str, Any]:
         "override_cli": "--bind <source-id>=<relative-path>",
         "content_identity": "not_required_for_runtime_inputs",
         "schema_compatibility": "required_for_each_referenced_runtime_input",
-        "design_time_templates": "schema_metadata_only; original files are not runtime dependencies",
+        "design_time_templates": "structure_metadata_only; historical rows and original files are not runtime dependencies",
         "indexes": "created_by_foundation_skills_in_runtime_writable_storage",
     }
     return portable
@@ -5727,7 +5974,7 @@ def portable_delivery_contract(
         "uncertainties",
     ]))
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "contract_kind": "portable_business_request_transaction",
         "scenario": claims.get("scenario", flow_contract.get("scenario", {})),
         "entrypoint": {
@@ -5743,8 +5990,28 @@ def portable_delivery_contract(
         },
         "runtime_input_contract": {
             "modes": input_modes,
-            "design_time_templates": "schema_metadata_only_not_runtime_inputs",
+            "design_time_templates": "structure_metadata_only_not_runtime_inputs_or_business_evidence",
             "schema_compatibility": "validate_only_sources_referenced_by_the_current_transaction",
+        },
+        "required_external_enrichment_contract": {
+            "requirements": [
+                item for item in flow_contract.get("external_requirements", [])
+                if isinstance(item, dict) and item.get("required") is True
+            ],
+            "activation": "after_complete_rule_selection",
+            "host_handoff": "invoke_declared_matching_capability_or_mcp_then_resubmit_external_evidence",
+            "evidence_fields": ["requirement_id", "status", "provider", "provider_capability", "query", "sources", "retrieved_at"],
+            "failure_policy": "block_business_decision_when_missing_unavailable_or_unprovenanced",
+            "agent_use_policy": "after_completed_gate_use_external_enrichment.records.evidence_with_its_provenance_to_assist_the_one_selected-rule_evaluation_pass",
+        },
+        "artifact_output_contract": {
+            "root_environment": "BUSINESS_ARTIFACT_ROOT",
+            "path_input_policy": "safe_relative_artifact_name_only; accept an absolute path only after a host sandbox has translated it and it resolves strictly inside BUSINESS_ARTIFACT_ROOT",
+            "legacy_host_policy": "block_legacy_out_dir_or_external_absolute_output_without_writing_an_invisible_file",
+            "public_reference_fields": [
+                "artifact_id", "relative_path", "sha256", "size_bytes", "format",
+            ],
+            "physical_path_policy": "never_return_or_embed_host_absolute_paths",
         },
         "evidence_contract": {
             "structured": "bounded_rows_with_source_and_query_provenance",
@@ -5764,6 +6031,7 @@ def portable_delivery_contract(
                 "uncertainties",
             ],
             "declared_output_templates": declared_output.get("templates", []),
+            "template_selection_policy": declared_output.get("selection_policy", {}),
             "full_result_policy": "export_only_when_explicitly_requested_and_return_the_artifact_reference_not_all_rows",
         },
         "terminal_statuses": {
@@ -5773,6 +6041,7 @@ def portable_delivery_contract(
             "blocked_rule_selection_required": "ask_the_user_to_select_or_narrow_the_complete_governing_record",
             "blocked_missing_or_incompatible_sources": "report_the_named_source_or_schema_gap",
             "blocked_ocr_required": "run_the_declared_ocr_capability_once_and_rebind_its_json_output",
+            "blocked_required_external_enrichment": "invoke_the_declared_matching_host_capability_or_mcp_once_and_resubmit_its_provenance_bearing_external_evidence",
             "blocked_uncompiled_rule_family": "report_that_no_reviewed_deterministic_recipe_covers_the_selected_rule_family",
         },
     }
@@ -5833,8 +6102,8 @@ def render_agent_prompts(
     lines = [
         "## Third-party execution contract",
         "",
-        "For each new complete business request, call the generated main executor exactly once first, with `--output`. Read its `agent_handoff` exactly once and follow `next_step`; do not manually fan out to stage skills, readers, join validators, or SQL tools.",
-        "A compact stdout response is successful when it contains an artifact handle. For `ready_for_agent_judgment`, use the handoff evidence for one business-evaluation pass and fill the delivery contract. For `completed_deterministically`, report the deterministic result without re-querying. If the user explicitly requests a file, request `delivery_output` only for a JSON/CSV/XLSX result after `recipe_execution.verified=true`; `--output` itself is always the audit evidence package.",
+        "For each new complete business request, call the generated main executor exactly once first. When persistence is needed, use a safe relative artifact name such as `--output evidence-package.json` under host-injected `BUSINESS_ARTIFACT_ROOT`; never invent `/outputs`, a drive path, or another host directory. Read its `agent_handoff` exactly once and follow `next_step`; do not manually fan out to stage skills, readers, join validators, or SQL tools.",
+        "A compact stdout response is successful when it contains an artifact handle. For `ready_for_agent_judgment`, use the handoff evidence for one business-evaluation pass and fill the delivery contract. For `completed_deterministically`, report the deterministic result without re-querying. If the user explicitly requests a file, request a safe relative `--delivery-output result.csv` only for a JSON/CSV/XLSX result after `recipe_execution.verified=true`; `--output` itself is always the audit evidence package.",
         "Use another tool only when `next_step` names a concrete missing field, relationship, or OCR recovery. Never blind-retry the same executor request. If coverage is bounded, disclose the limit and never call the preview exhaustive.",
         f"# {scenario.get('name', '')} Agent 系统提示词", "",
         f"你是“{scenario.get('name', '')}”业务 Agent。你的目标是：{scenario.get('purpose', flow.get('scenario', {}).get('business_outcome', '完成场景业务目标'))}。",
@@ -5849,19 +6118,19 @@ def render_agent_prompts(
         *stage_lines,
         *foundation_lines,
         "", "## 数据来源契约", "", *source_lines,
-        "", "所有基础 Skill 都携带 `references/operational-data-contract.json`；主执行器另携带 `references/delivery-contract.json`。运行时由调用方提供 `<data-root>`；文件名变化时只能用 `--bind <source-id>=<relative-path>` 显式绑定。`design_time_template` 只提供输出字段/类型/格式约束，缺少其历史原文件不是运行阻塞。", "",
+        "", "所有基础 Skill 都携带 `references/operational-data-contract.json`；主执行器另携带 `references/delivery-contract.json`。运行时由调用方提供 `<data-root>`；文件名变化时只能用 `--bind <source-id>=<relative-path>` 显式绑定。`design_time_template` 仅保留格式、表/工作表、表头、列顺序和字段类型等结构，不是运行时输入或本次业务证据；缺少其历史原文件不是运行阻塞。", "",
         "## 本次事务可接受的输入", "", *input_mode_lines,
         "", "## 单事务执行顺序", "",
-        "1. 对新的完整业务请求：调用主执行器 `execute --request ... --data-root ... --output ...` 一次。不要先执行 `describe`、规则搜索、文档索引、`validate-join`、`query`、总控或阶段 Skill。",
+        "1. 对新的完整业务请求：调用主执行器一次；需要持久证据时使用 `execute --request ... --data-root ... --output evidence-package.json`。`--output` 仅能是宿主注入 `BUSINESS_ARTIFACT_ROOT` 下的安全相对产物名，禁止自创 `/outputs`、盘符或其他宿主目录。不要先执行 `describe`、规则搜索、文档索引、`validate-join`、`query`、总控或阶段 Skill。",
         "2. 读取生成的 `agent_handoff` 一次，并按 `status` 行动：`completed_deterministically` 直接交付 `deterministic_result`；`ready_for_agent_judgment` 仅基于 handoff 的完整规则与证据执行一次业务判断；`blocked_rule_not_found` / `blocked_rule_selection_required` / `blocked_missing_or_incompatible_sources` 只报告具名缺口或向用户索取消歧条件。",
         "3. `blocked_ocr_required` 是唯一的文档恢复路径：调用已声明 OCR Skill 一次生成 JSON，将 JSON 绑定到同一 source_id，再作为新的恢复事务调用主执行器一次。未命中、歧义、缺字段或连接异常不是重试理由。",
-        "4. 只有 `next_step.query_allowed_only_if` 指出具体缺失字段或关系时，才做一次有界补充查询；查询必须使用已声明的来源、键组和只读入口。用户明确要求结果文件时，只有已验证的确定性结果可用 `delivery_output` 生成 JSON/CSV/XLSX；模板列必须由 recipe 直接提供。任何待 Agent 判断、OCR 阻塞或未验证结果只交付证据/阻塞说明，不能伪造结果文件。",
-        "5. 非结构化证据必须保留 source_digest、locator、chunk_id 和 text_digest；没有已验收业务键或显式关系时，不得与结构化记录强行合并。外部知识仅在完整规则或流程明确要求时调用，服务不可用/零命中时返回 `manual_intervention_required`。", "",
+        "4. 只有 `next_step.query_allowed_only_if` 指出具体缺失字段或关系时，才做一次有界补充查询；查询必须使用已声明的来源、键组和只读入口。用户明确要求结果文件时，只有已验证的确定性结果可用安全相对 `delivery_artifact_name`（CLI 为 `--delivery-output result.csv`）生成 JSON/CSV/XLSX；模板列必须由 recipe 直接提供。仅一个兼容且可物化的 CSV/XLSX 历史结构由运行时自动选择；多个结构时必须传 `delivery_template_id`，不可物化时报告返回的 blocker，禁止改用相似格式。任何待 Agent 判断、OCR 阻塞或未验证结果只交付证据/阻塞说明，不能伪造结果文件。",
+        "5. 非结构化证据必须保留 source_digest、locator、chunk_id 和 text_digest；没有已验收业务键或显式关系时，不得与结构化记录强行合并。若 `execute` 返回 `blocked_required_external_enrichment`，必须在规则选定后调用其 `next_step` 指定的宿主能力或 MCP，并携带 requirement_id、provider、provider_capability、query、sources、retrieved_at 的 `external_evidence` 重新提交；能力不可用、零结果或缺少溯源时保持阻断，不能降级为可选增强。", "",
         "## 输出要求", "",
         f"- 必填交付字段：{delivery_fields}。先给业务结论或明确阻塞原因，再给理由、范围、规则/数据证据、覆盖范围和不确定性。",
         "- 每条判定应能追溯到规则完整行或文档章节、结构化来源/查询与文档/OCR 定位（适用时）。",
         "- 明确列出未匹配、截断、OCR 不确定、连接放大、待确认项和未覆盖范围。",
-        "- `--output` 是审计证据包；JSON/CSV/XLSX 结果文件仅从 `completed_deterministically` 且 `recipe_execution.verified=true` 的输出物化。XLSX 仅写入一个无公式的数据工作表，列必须由 recipe 直接提供；历史 DOCX/PDF 模板在没有专用渲染器和已验证字段映射时仅是格式契约，不能假称已生成。",
+        "- `--output evidence-package.json` 是审计证据包；它和 `--delivery-output result.csv` 都是 `BUSINESS_ARTIFACT_ROOT` 下的安全相对名。JSON/CSV/XLSX 结果文件仅从 `completed_deterministically` 且 `recipe_execution.verified=true` 的输出物化。可物化的 XLSX 仅复刻一个已声明工作表的表头和列顺序，写入 recipe 直接提供的无公式数据；不复制历史业务行、样式、宏或多表布局。历史 DOCX/PDF 模板在没有专用渲染器和已验证字段映射时仅是格式契约，不能假称已生成。",
         "- 除非用户明确要求，不展示大段原文、全量数据或内部执行日志。", "",
         "## 已知待确认边界", "", *open_questions,
         "", "不得声称本提示词或 Skills 能消除现实数据中的全部不确定性；质量门禁失败时，正确行为是阻断并给出可修复的证据缺口。", "",

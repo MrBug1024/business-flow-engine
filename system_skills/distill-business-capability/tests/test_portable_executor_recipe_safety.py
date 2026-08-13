@@ -80,6 +80,91 @@ def recipe_catalog() -> dict:
 
 
 class PortableExecutorRecipeSafetyTests(unittest.TestCase):
+    def test_request_semantics_excludes_delivery_from_rule_lookup_and_constraint_fallback(self) -> None:
+        request = (
+            "执行审计：天麻素注射液限定支付条件：支付不超过14天，"
+            "告诉我有多少条违规数据，按照结果结构输出"
+        )
+
+        semantics = EXECUTOR.request_semantics(request)
+
+        self.assertIn("天麻素注射液", semantics["rule_locator"])
+        self.assertNotIn("多少条", semantics["rule_locator"])
+        self.assertNotIn("违规数据", semantics["rule_locator"])
+        self.assertEqual(["告诉我有多少条违规数据", "按照结果结构输出"], semantics["delivery_instructions"])
+        terms = EXECUTOR.unique_terms(semantics["rule_locator"])
+        self.assertFalse(any("违规数据" in term or "多少条" in term for term in terms))
+
+        # A numeric count directive that looks like a rule constraint must not
+        # leak into the locator fallback when no normative rule row is present.
+        count_request = "执行审计：支付不超过14天，输出不超过99条结果"
+        count_semantics = EXECUTOR.request_semantics(count_request)
+        constraints = EXECUTOR.derive_rule_constraints(None, {}, count_semantics["rule_locator"])
+        self.assertEqual([14], [item["threshold"] for item in constraints["constraints"]])
+        self.assertEqual("rule_locator_fallback", constraints["constraint_source"])
+
+    def test_required_external_enrichment_blocks_after_rule_selection_then_projects_evidence(self) -> None:
+        external_requirement = {
+            "requirement_id": "external-knowledge-1",
+            "required": True,
+            "condition_text": "如果规则有药品的违规描述，需要调用外部知识库或网络爬虫MCP辅助判断",
+            "condition_evaluation": "selected_rule_matches_condition_text",
+            "capability_kinds": ["knowledge_retrieval", "web_retrieval", "mcp"],
+            "accepted_integrations": ["declared_host_capability", "mcp"],
+            "evidence_contract": ["provider", "provider_capability", "query", "sources", "retrieved_at"],
+            "failure_policy": "block_business_decision",
+        }
+        contract = {
+            "sources": [generated_tabular_source("rules", "rules.csv", "rules_view", ["rule_id", "rule_text"])],
+            "runtime_source_ids": ["rules"],
+            "rule_source_ids": ["rules"],
+            "links": [],
+            "external_requirements": [external_requirement],
+        }
+        request = (
+            "执行审计：天麻素注射液限定支付条件：支付不超过14天，"
+            "告诉我有多少条违规数据，按照结果结构输出"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "rules.csv").write_text(
+                "rule_id,rule_text\nR-1,天麻素注射液限定支付条件：支付不超过14天\n",
+                encoding="utf-8",
+            )
+
+            blocked = EXECUTOR.execute(request, root, contract, flow_contract(), {}, 10, True)
+
+        self.assertEqual("blocked_required_external_enrichment", blocked["status"])
+        self.assertEqual("unique", blocked["rule_selection"])
+        self.assertEqual("天麻素注射液限定支付条件：支付不超过14天", blocked["selected_rule"]["row"]["rule_text"])
+        self.assertNotIn("多少条", blocked["request_semantics"]["rule_locator"])
+        self.assertEqual("host_capability_or_mcp", blocked["next_step"]["actor"])
+        self.assertEqual("required_external_evidence_not_supplied", blocked["external_enrichment"]["blockers"][0]["reason"])
+        self.assertIn(
+            "runtime.required_external_enrichment",
+            [step["stage_id"] for step in blocked["execution_steps"]],
+        )
+
+        external_evidence = {
+            "requirement_id": "external-knowledge-1",
+            "status": "success",
+            "provider": "declared-knowledge-mcp",
+            "provider_capability": "knowledge_retrieval",
+            "query": "天麻素注射液 规格",
+            "sources": [{"title": "authoritative specification", "locator": "item-1"}],
+            "retrieved_at": "2026-08-12T00:00:00Z",
+            "facts": {"specification": "example"},
+        }
+        selected = {
+            "source_id": "rules",
+            "row": {"rule_text": "天麻素注射液限定支付条件：支付不超过14天"},
+        }
+        completed = EXECUTOR.external_enrichment_gate(contract, {}, selected, external_evidence)
+        self.assertEqual("completed", completed["status"])
+        payload = {"status": "ready_for_agent_judgment", "external_enrichment": completed}
+        self.assertEqual("example", EXECUTOR.compact_stdout_payload(payload)["external_enrichment"]["records"][0]["evidence"]["facts"]["specification"])
+        self.assertEqual("declared-knowledge-mcp", EXECUTOR.agent_handoff_payload(payload)["external_enrichment"]["records"][0]["evidence"]["provider"])
+
     def test_oversized_stdout_keeps_compact_handoff_without_an_artifact(self) -> None:
         payload = {
             "status": "ready_for_agent_judgment",

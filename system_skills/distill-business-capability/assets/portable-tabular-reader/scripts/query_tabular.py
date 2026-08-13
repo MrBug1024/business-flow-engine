@@ -6,11 +6,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import sys
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Sequence
 
 
@@ -31,6 +32,7 @@ SUPPORTED_EXTENSIONS = {
 MAX_ROWS = 10_000
 MAX_CELL_CHARS = 2_000
 MAX_COMPLETE_RULE_RESPONSE_CHARS = 512_000
+ARTIFACT_ROOT_ENV = "BUSINESS_ARTIFACT_ROOT"
 READ_ONLY_SQL = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
 FORBIDDEN_SQL = re.compile(
     r"\b(insert|update|delete|drop|alter|create|replace|truncate|attach|detach|copy|export|import|install|load|call)\b",
@@ -45,6 +47,109 @@ EXTERNAL_READ_SQL = re.compile(
 
 class ReaderError(ValueError):
     pass
+
+
+class ArtifactPathError(ReaderError):
+    pass
+
+
+def artifact_root() -> Path:
+    configured = str(os.environ.get(ARTIFACT_ROOT_ENV, "")).strip()
+    if not configured:
+        raise ArtifactPathError(
+            "Persistent artifact output is blocked: the host must set BUSINESS_ARTIFACT_ROOT."
+        )
+    root = Path(configured).expanduser()
+    if not root.is_absolute():
+        raise ArtifactPathError("BUSINESS_ARTIFACT_ROOT must be an absolute host-managed directory.")
+    root = root.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    if not root.is_dir():
+        raise ArtifactPathError("BUSINESS_ARTIFACT_ROOT is not a writable artifact directory.")
+    return root
+
+
+def normalize_artifact_name(value: str | Path, label: str = "artifact name") -> str:
+    raw = str(value or "").strip()
+    normalized = raw.replace("\\", "/")
+    if not normalized:
+        raise ArtifactPathError(f"{label} must be a non-empty relative artifact name.")
+    if (
+        "\x00" in normalized
+        or normalized.startswith("/")
+        or raw.startswith("\\")
+        or re.match(r"^[A-Za-z]:", raw)
+    ):
+        raise ArtifactPathError(f"{label} must be a safe relative artifact name, not an absolute path.")
+    parts = PurePosixPath(normalized).parts
+    if not parts or any(part in {"", ".", ".."} or ":" in part for part in parts):
+        raise ArtifactPathError(f"{label} must not contain traversal or drive-qualified segments.")
+    return PurePosixPath(*parts).as_posix()
+
+
+def _absolute_artifact_input(raw: str) -> bool:
+    return (
+        Path(raw).expanduser().is_absolute()
+        or raw.replace("\\", "/").startswith("/")
+        or raw.startswith("\\")
+        or bool(re.match(r"^[A-Za-z]:", raw))
+    )
+
+
+def resolve_artifact_name(value: str | Path, label: str = "artifact name") -> tuple[Path, str]:
+    root = artifact_root()
+    raw = str(value or "").strip()
+    if _absolute_artifact_input(raw):
+        output = Path(raw).expanduser().resolve()
+        try:
+            relative_path = output.relative_to(root).as_posix()
+        except ValueError as exc:
+            raise ArtifactPathError(
+                f"{label} must be a safe relative artifact name or an already-translated path inside BUSINESS_ARTIFACT_ROOT."
+            ) from exc
+    else:
+        relative_path = normalize_artifact_name(raw, label)
+        output = (root.joinpath(*PurePosixPath(relative_path).parts)).resolve()
+    if output == root or root not in output.parents:
+        raise ArtifactPathError(f"{label} escapes BUSINESS_ARTIFACT_ROOT.")
+    return output, relative_path
+
+
+def artifact_reference(path: Path, kind: str) -> dict[str, Any]:
+    root = artifact_root()
+    resolved = path.expanduser().resolve()
+    try:
+        relative_path = resolved.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise ArtifactPathError("Artifact output must stay inside BUSINESS_ARTIFACT_ROOT.") from exc
+    if not resolved.is_file():
+        raise ArtifactPathError("Artifact file does not exist inside BUSINESS_ARTIFACT_ROOT.")
+    digest = hashlib.sha256()
+    size_bytes = 0
+    with resolved.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+            size_bytes += len(chunk)
+    sha256 = digest.hexdigest()
+    return {
+        "schema_version": 1,
+        "kind": kind,
+        "artifact_id": "artifact-" + hashlib.sha256(
+            f"{kind}\0{relative_path}\0{sha256}".encode("utf-8")
+        ).hexdigest()[:24],
+        "relative_path": relative_path,
+        "format": resolved.suffix.casefold().lstrip("."),
+        "sha256": sha256,
+        "size_bytes": size_bytes,
+    }
+
+
+def blocked_artifact_output(exc: ArtifactPathError) -> dict[str, Any]:
+    return {
+        "status": "blocked_host_artifact_sink",
+        "message": str(exc),
+        "artifact_root_environment": ARTIFACT_ROOT_ENV,
+    }
 
 
 def compact(value: Any) -> Any:
@@ -645,17 +750,20 @@ def export_contract(
     link_ids: Sequence[str] = (), *, overwrite: bool = False,
     bindings: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    try:
+        output, _relative_output = resolve_artifact_name(output_raw, "--output")
+    except ArtifactPathError as exc:
+        return blocked_artifact_output(exc)
     safe_sql = validate_sql(sql)
     used_source_ids = sql_source_ids(contract, safe_sql)
     if not used_source_ids:
         raise ReaderError("SQL does not reference any contract view")
     validations = validate_query_links(contract, data_root, safe_sql, link_ids, bindings)
-    output = Path(output_raw).expanduser().resolve()
     extension = output.suffix.casefold()
     if extension not in {".csv", ".parquet"}:
         raise ReaderError("Full result export supports only .csv or .parquet")
     if output.exists() and not overwrite:
-        raise ReaderError(f"Export target already exists; pass --overwrite to replace it: {output}")
+        raise ReaderError("Export target already exists; pass --overwrite to replace it.")
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary_handle = tempfile.NamedTemporaryFile(
         prefix=f"{output.name}.", suffix=".tmp", dir=output.parent, delete=False
@@ -678,19 +786,13 @@ def export_contract(
     finally:
         connection.close()
     temporary.replace(output)
-    digest = hashlib.sha256()
-    with output.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
+    artifact = artifact_reference(output, "exported_query_result")
     return {
         "status": "success", "mode": "complete_result_export",
-        "output": str(output), "format": extension.lstrip("."),
-        "row_count": exported_rows, "size_bytes": output.stat().st_size,
-        "output_sha256": digest.hexdigest(),
-        "artifact": {
-            "kind": "exported_query_result", "path": str(output),
-            "format": extension.lstrip("."), "sha256": digest.hexdigest(),
-        },
+        "artifact_id": artifact["artifact_id"], "relative_path": artifact["relative_path"],
+        "format": extension.lstrip("."), "row_count": exported_rows,
+        "size_bytes": artifact["size_bytes"], "output_sha256": artifact["sha256"],
+        "artifact": artifact,
         "query_digest": query_digest(safe_sql),
         "registrations": registrations, "join_validations": validations,
         "agent_context_policy": "Result rows were written to a file and were not loaded into Agent context.",
@@ -1007,7 +1109,10 @@ def build_parser() -> argparse.ArgumentParser:
         else:
             command.add_argument("--sql", required=True)
             command.add_argument("--link-id", action="append", default=[])
-            command.add_argument("--output", required=True)
+            command.add_argument(
+                "--output", required=True,
+                help="Safe relative artifact name under BUSINESS_ARTIFACT_ROOT.",
+            )
             command.add_argument("--overwrite", action="store_true")
     return parser
 

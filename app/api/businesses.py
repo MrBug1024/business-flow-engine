@@ -1673,8 +1673,14 @@ def resume_chat_stream(
         raise HTTPException(status_code=404, detail="Run not found in this chat session.") from exc
     except ResumeBlockedError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    try:
+        execution = orchestrator.claim_resume(record, preparation)
+    except ResumeBlockedError as exc:
+        # Claim before sending SSE headers so a duplicate browser retry is a
+        # normal conflict response, never a second concurrent Agent run.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return StreamingResponse(
-        _sse(orchestrator.stream_resume(record, preparation)),
+        _sse(orchestrator.stream_resume(record, preparation, execution=execution)),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
